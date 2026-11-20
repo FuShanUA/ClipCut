@@ -322,6 +322,42 @@ def run_project_stages(project_id: str, req: RunStagesRequest):
     return {"started": True, "job_id": job_id, "stages": req.stages}
 
 
+@app.post("/api/projects/{project_id}/clips/batch")
+def batch_clips(project_id: str, req: BatchClipsRequest):
+    store = _get_store(project_id)
+    manifest = store.load()
+    store.save_undo_snapshot(manifest, f"批量操作切片: {req.action}")
+
+    if req.action == "enable_all":
+        for c in manifest.clips:
+            c.enabled = True
+    elif req.action == "disable_all":
+        for c in manifest.clips:
+            c.enabled = False
+    elif req.action == "top_n":
+        sorted_indices = sorted(
+            range(len(manifest.clips)),
+            key=lambda i: getattr(manifest.clips[i], "score", 7.5),
+            reverse=True,
+        )
+        top_set = set(sorted_indices[: req.n])
+        for idx, c in enumerate(manifest.clips):
+            c.enabled = idx in top_set
+    else:
+        raise HTTPException(status_code=400, detail=f"不支持的批量操作: {req.action}")
+
+    store.save(manifest)
+    enabled_count = sum(1 for c in manifest.clips if c.enabled)
+    store.append_receipt(
+        run_id=f"human_{uuid.uuid4().hex[:6]}",
+        stage="human_edit",
+        actor="human",
+        action="batch_clips",
+        summary=f"批量更新切片状态 [{req.action}]：当前已启用 {enabled_count}/{len(manifest.clips)} 支",
+    )
+    return {"manifest": manifest.model_dump(), "enabled_count": enabled_count}
+
+
 @app.patch("/api/projects/{project_id}/clips/{clip_id}")
 def patch_clip(project_id: str, clip_id: str, req: PatchClipRequest):
     store = _get_store(project_id)
@@ -412,42 +448,6 @@ def patch_clip(project_id: str, clip_id: str, req: PatchClipRequest):
         diff={"clip_id": clip_id, "before": before, "after": after},
     )
     return {"manifest": manifest.model_dump()}
-
-
-@app.post("/api/projects/{project_id}/clips/batch")
-def batch_clips(project_id: str, req: BatchClipsRequest):
-    store = _get_store(project_id)
-    manifest = store.load()
-    store.save_undo_snapshot(manifest, f"批量操作切片: {req.action}")
-
-    if req.action == "enable_all":
-        for c in manifest.clips:
-            c.enabled = True
-    elif req.action == "disable_all":
-        for c in manifest.clips:
-            c.enabled = False
-    elif req.action == "top_n":
-        sorted_indices = sorted(
-            range(len(manifest.clips)),
-            key=lambda i: getattr(manifest.clips[i], "score", 7.5),
-            reverse=True,
-        )
-        top_set = set(sorted_indices[: req.n])
-        for idx, c in enumerate(manifest.clips):
-            c.enabled = idx in top_set
-    else:
-        raise HTTPException(status_code=400, detail=f"不支持的批量操作: {req.action}")
-
-    store.save(manifest)
-    enabled_count = sum(1 for c in manifest.clips if c.enabled)
-    store.append_receipt(
-        run_id=f"human_{uuid.uuid4().hex[:6]}",
-        stage="human_edit",
-        actor="human",
-        action="batch_clips",
-        summary=f"批量更新切片状态 [{req.action}]：当前已启用 {enabled_count}/{len(manifest.clips)} 支",
-    )
-    return {"manifest": manifest.model_dump(), "enabled_count": enabled_count}
 
 
 @app.post("/api/projects/{project_id}/clips/{clip_id}/render")
