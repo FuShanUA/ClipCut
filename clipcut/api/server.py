@@ -22,6 +22,7 @@ from ..pipeline.verify_and_plan import (
     _load_audio_envelope,
     compute_clip_render_hash,
     compute_remix_render_hash,
+    select_curated_top_clips,
     snap_bounds_with_acoustic_guard,
 )
 from ..publish import get_platforms_status, launch_platform_login, publish_to_platforms
@@ -334,15 +335,17 @@ def batch_clips(project_id: str, req: BatchClipsRequest):
     elif req.action == "disable_all":
         for c in manifest.clips:
             c.enabled = False
+            c.curation_tag = ""
     elif req.action == "top_n":
-        sorted_indices = sorted(
-            range(len(manifest.clips)),
-            key=lambda i: getattr(manifest.clips[i], "score", 7.5),
-            reverse=True,
-        )
-        top_set = set(sorted_indices[: req.n])
-        for idx, c in enumerate(manifest.clips):
-            c.enabled = idx in top_set
+        curated = select_curated_top_clips(manifest, n=req.n)
+        curated_ids = {c.clip_id: tag for c, tag in curated}
+        for c in manifest.clips:
+            if c.clip_id in curated_ids:
+                c.enabled = True
+                c.curation_tag = curated_ids[c.clip_id]
+            else:
+                c.enabled = False
+                c.curation_tag = ""
     else:
         raise HTTPException(status_code=400, detail=f"不支持的批量操作: {req.action}")
 

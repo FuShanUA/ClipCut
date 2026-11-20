@@ -1086,22 +1086,27 @@ def run_verify_and_plan_stage(
             }
         )
 
+    manifest.clips = clips
+    manifest.remix_only_pool = remix_only_pool
+
     sel_cfg = cfg.get("clip_selection", {})
     default_max = int(sel_cfg.get("default_selected_max", 6))
     if len(clips) > default_max:
-        scored_indices = sorted(
-            range(len(clips)),
-            key=lambda i: clips[i].score,
-            reverse=True,
-        )
-        selected_set = set(scored_indices[:default_max])
-        for idx, clip in enumerate(clips):
-            clip.enabled = idx in selected_set
-            if not clip.enabled:
-                clip.notes.append(f"长片候选较多（共 {len(clips)} 支）：默认预选 Top {default_max}，本切片保留策略，可在工作台按需启用")
+        curated = select_curated_top_clips(manifest, n=default_max)
+        curated_ids = {c.clip_id: tag for c, tag in curated}
+        for clip in clips:
+            if clip.clip_id in curated_ids:
+                clip.enabled = True
+                clip.curation_tag = curated_ids[clip.clip_id]
+            else:
+                clip.enabled = False
+                clip.curation_tag = ""
+                clip.notes.append(f"长片候选较多（共 {len(clips)} 支）：已智能策划预选 Top {default_max}，本切片保留策略，可在工作台按需启用")
+    else:
+        for clip in clips:
+            clip.enabled = True
+            clip.curation_tag = ""
 
-    manifest.clips = clips
-    manifest.remix_only_pool = remix_only_pool
     store.save(manifest)
     store.append_receipt(
         run_id=run_id,
@@ -1113,5 +1118,97 @@ def run_verify_and_plan_stage(
     )
 
     # 5. Plan Remix strictly after clips are finalized
+
+
+def select_curated_top_clips(
+    manifest: ProjectManifest,
+    n: int = 5,
+) -> list[tuple[ClipItem, str]]:
+    """
+    Select Top N clips covering diverse editorial pillars rather than flat chronological order:
+    1. Core Theme (最反映全片主旨/核心痛点)
+    2. Controversy & Debunking (最具争议/打破行业共识)
+    3. Exciting Dialogue (最精彩交锋/声画表现力)
+    4. Hardcore Production Use Case (硬核落地实操/量化价值)
+    5. Highest Overall (综合王牌高分)
+    """
+    clips = manifest.clips
+    if not clips:
+        return []
+    if len(clips) <= n:
+        return [(c, "⭐ 精选") for c in clips]
+
+    orig_title = manifest.metadata.original_title or ""
+
+    def _score_theme(c: ClipItem) -> float:
+        text = f"{c.title} {c.summary} {c.reason} {c.hook}"
+        s = c.score
+        # Keyword overlap with original title
+        for word in re.findall(r"[\w]+", orig_title):
+            if len(word) >= 2 and word.lower() in text.lower():
+                s += 0.4
+        # Core thematic pain points / keywords
+        if re.search(r"看不到|机密|数据|合规|隐私|看不见|无法查看|无法看到|数据室|data room", text, flags=re.IGNORECASE):
+            s += 2.0
+        if re.search(r"智能体|工作流|编排|Agent|系统架构|模拟世界", text, flags=re.IGNORECASE):
+            s += 1.0
+        return s
+
+    def _score_controversy(c: ClipItem) -> float:
+        text = f"{c.title} {c.summary} {c.reason} {c.hook} {c.key_quote}"
+        s = c.score
+        if re.search(r"初级律师|消失|计费|按小时|合伙制|不可拥有|阻碍|危机|辩论|存亡|冲击|替代|证伪|抗拒|瓶颈|收费", text, flags=re.IGNORECASE):
+            s += 2.5
+        return s
+
+    def _score_exciting(c: ClipItem) -> float:
+        s = c.score
+        if "exciting_dialogue" in c.categories:
+            s += 2.2
+        if c.multimodal_status == "pass":
+            s += 1.2
+        return s
+
+    def _score_practice(c: ClipItem) -> float:
+        s = c.score
+        if "hot_topic" in c.categories:
+            s += 1.5
+        text = f"{c.title} {c.summary} {c.reason} {c.hook}"
+        if re.search(r"FDE|前线部署|表格审查|开放权重|检索|起草|万份合同|原语|落地|实操|量化|成本|ROI|准确率", text, flags=re.IGNORECASE):
+            s += 1.5
+        return s
+
+    selected: list[tuple[ClipItem, str]] = []
+    used_ids: set[str] = set()
+
+    slots = [
+        ("🔥 核心主题", _score_theme),
+        ("⚡ 行业争议", _score_controversy),
+        ("💥 精彩交锋", _score_exciting),
+        ("🛠 硬核实操", _score_practice),
+        ("⭐ 综合王牌", lambda c: c.score),
+    ]
+
+    for label, scoring_fn in slots:
+        if len(selected) >= n:
+            break
+        available = [c for c in clips if c.clip_id not in used_ids]
+        if not available:
+            break
+        best = max(available, key=scoring_fn)
+        selected.append((best, label))
+        used_ids.add(best.clip_id)
+
+    # Fill remaining slots up to n from remaining highest scored
+    while len(selected) < n:
+        available = [c for c in clips if c.clip_id not in used_ids]
+        if not available:
+            break
+        best = max(available, key=lambda c: c.score)
+        selected.append((best, "⭐ 推荐精选"))
+        used_ids.add(best.clip_id)
+
+    return selected
+
     manifest = plan_remix_from_clips(manifest, store, cfg, run_id)
     return manifest

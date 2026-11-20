@@ -188,6 +188,7 @@ class ClipItem(BaseModel):
     snap_delta_end_ms: int = 0
     multimodal_status: str = "not_required"
     score: float = 7.5
+    curation_tag: str = ""
     render_hash: str = ""
     last_rendered_hash: str = ""
     output_file: str | None = None

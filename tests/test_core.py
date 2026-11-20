@@ -867,6 +867,48 @@ def test_format_concat_file_entry_escapes_single_quotes_and_uses_relative_path(t
     assert r"'\''" in outside_entry
 
 
+def test_select_curated_top_clips_covers_editorial_pillars(tmp_path: Path):
+    from clipcut.models import ClipItem, MediaSource, ProjectManifest, VideoMetadata
+    from clipcut.pipeline.verify_and_plan import select_curated_top_clips
+
+    clips = [
+        ClipItem(clip_id="c01", index=1, enabled=True, title="开场介绍客套", summary="团队背景介绍", score=7.8, start_utt=0, end_utt=5, start_s=0, end_s=50),
+        ClipItem(clip_id="c02", index=2, enabled=True, title="律师要可靠结果而非模型名", categories=["exciting_dialogue"], summary="激烈反驳模型选择器", score=8.9, start_utt=6, end_utt=10, start_s=50, end_s=150),
+        ClipItem(clip_id="c03", index=3, enabled=True, title="初级律师不会简单消失", summary="按小时计费与合伙制危机辩论", score=8.9, start_utt=11, end_utt=15, start_s=150, end_s=250),
+        ClipItem(clip_id="c04", index=4, enabled=True, title="看不到客户机密数据如何做AI", summary="无数据下的产品优化指标", score=9.2, start_utt=16, end_utt=20, start_s=250, end_s=350),
+        ClipItem(clip_id="c05", index=5, enabled=True, title="前线部署工程师FDE落地", categories=["hot_topic"], summary="FDE入驻客户实操落地", score=9.0, start_utt=21, end_utt=25, start_s=350, end_s=450),
+        ClipItem(clip_id="c06", index=6, enabled=True, title="常规文字校对流程", summary="转写校对小细节", score=7.6, start_utt=26, end_utt=30, start_s=450, end_s=500),
+    ]
+
+    manifest = ProjectManifest(
+        project_id="curation-test",
+        source=MediaSource(work_dir=str(tmp_path), render_video="v.mp4", analysis_video="v.mp4", output_dir=str(tmp_path / "out"), duration_s=500, width=1920, height=1080, fps=30),
+        metadata=VideoMetadata(original_title="Building Legal Agents When You Can't See the Data", description="", channel="", guest_zh="", channel_zh="", original_theme_zh="", metadata_source="manual"),
+        clips=clips,
+    )
+
+    curated = select_curated_top_clips(manifest, n=5)
+    assert len(curated) == 5
+    curated_ids = [c.clip_id for c, _ in curated]
+
+    # Verify key editorial pillars are captured:
+    # 1. c04 (Theme): 看不到客户机密数据
+    assert "c04" in curated_ids
+    # 2. c03 (Controversy): 初级律师不会消失/计费合伙制
+    assert "c03" in curated_ids
+    # 3. c02 (Exciting): 激烈交锋
+    assert "c02" in curated_ids
+    # 4. c05 (Practice/FDE): 前线部署
+    assert "c05" in curated_ids
+    # Not chronological c01-c05; low value c01 should NOT crowd out high value ones
+    tags = {c.clip_id: tag for c, tag in curated}
+    assert "核心主题" in tags["c04"]
+    assert "行业争议" in tags["c03"]
+    assert "精彩交锋" in tags["c02"]
+    assert "硬核实操" in tags["c05"]
+
+
+
 
 
 

@@ -815,8 +815,13 @@ export default function App() {
                 </button>
               </div>
               <div style={{ display: "flex", gap: 4 }}>
-                <button type="button" className="sm" onClick={() => handleBatchClips("top_n", 5)} title="按评分预选 Top 5">
-                  精选Top5
+                <button
+                  type="button"
+                  className="sm"
+                  onClick={() => handleBatchClips("top_n", 5)}
+                  title="按【核心主题、行业争议、精彩交锋、硬核实操、综合王牌】5大策展维度精准精选"
+                >
+                  策划Top5
                 </button>
                 <button type="button" className="sm" onClick={() => handleBatchClips("enable_all")} title="全部启用">
                   全选
@@ -890,6 +895,19 @@ export default function App() {
                         <span className="mono">
                           {fmtTime(c.start_s)}–{fmtTime(c.end_s)}
                         </span>
+                        {c.curation_tag && (
+                          <span
+                            className="tag highlight"
+                            style={{
+                              background: "rgba(245, 158, 11, 0.18)",
+                              color: "#f59e0b",
+                              borderColor: "rgba(245, 158, 11, 0.45)",
+                              fontWeight: 600,
+                            }}
+                          >
+                            {c.curation_tag}
+                          </span>
+                        )}
                         {typeof c.score === "number" && (
                           <span className="tag" title="AI推荐评分">
                             ⭐ {c.score.toFixed(1)}

@@ -25,7 +25,22 @@ class ProjectStore:
 
     def load(self) -> ProjectManifest:
         raw = self.manifest_path.read_text(encoding="utf-8")
-        return ProjectManifest.model_validate_json(raw)
+        manifest = ProjectManifest.model_validate_json(raw)
+        # Self-healing: if clips have flat default scores, backfill from candidates
+        if manifest.candidates and manifest.clips:
+            flat_scores = all(c.score == 7.5 for c in manifest.clips)
+            if flat_scores:
+                cands_by_title = {c.title: c for c in manifest.candidates}
+                cands_by_id = {c.candidate_id: c for c in manifest.candidates}
+                modified = False
+                for cl in manifest.clips:
+                    matched = cands_by_title.get(cl.title) or cands_by_id.get(cl.clip_id.replace("clip_", "C"))
+                    if matched and matched.score and matched.score != 7.5:
+                        cl.score = float(matched.score)
+                        modified = True
+                if modified:
+                    self.save(manifest)
+        return manifest
 
     def save(self, manifest: ProjectManifest) -> None:
         manifest.updated_at = utc_now_iso()
