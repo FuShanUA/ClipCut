@@ -65,6 +65,58 @@ def scan(path: str = typer.Argument(..., help="视频文件或目录路径")):
 
 
 @app.command()
+def plan(
+    path: str = typer.Argument(..., help="视频文件或包含视频的目录路径"),
+    subtitle: Optional[str] = typer.Option(None, "--subtitle", "-s", help="显式指定字幕文件 (.srt/.vtt)"),
+    url: Optional[str] = typer.Option(None, "--url", "-u", help="原视频链接（用于拉取标题/简介/章节）"),
+    title: Optional[str] = typer.Option(None, "--title", help="手动覆盖原视频标题"),
+    text_model: Optional[str] = typer.Option(None, "--text-model", help="文本分析模型"),
+    multimodal_model: Optional[str] = typer.Option(None, "--multimodal-model", help="多模态复核模型"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="目录含多视频时不交互提示，默认选第一个"),
+):
+    """【推荐】制定切片策略与Remix规划（不执行重型渲染，产出后供人工审阅选择）"""
+    video_path = _select_video_from_input(path, non_interactive=yes)
+    stages = ["ingest", "signals", "analyze", "verify_and_plan"]
+
+    console.print(f"目标视频: {video_path.name}", markup=False)
+    console.print(f"执行阶段: {' -> '.join(stages)} (仅规划，跳过渲染)")
+
+    manifest, store = run_pipeline(
+        video_path=video_path,
+        subtitle_path=subtitle,
+        source_url=url,
+        manual_title=title,
+        stages=stages,
+        text_model=text_model,
+        multimodal_model=multimodal_model,
+    )
+
+    table = Table(title=f"切片策略规划完成 (共 {len(manifest.clips)} 支独立切片 + {len(manifest.remix.items)} 段 Remix)")
+    table.add_column("#", justify="right")
+    table.add_column("预选")
+    table.add_column("评分")
+    table.add_column("标题")
+    table.add_column("类别")
+    table.add_column("区间")
+    table.add_column("时长")
+    for c in manifest.clips:
+        enabled_tag = "[green]✓ 预选[/green]" if c.enabled else "[dim]未启用[/dim]"
+        table.add_row(
+            f"{c.index:02d}",
+            enabled_tag,
+            f"{getattr(c, 'score', 7.5):.1f}",
+            c.title,
+            ",".join(c.categories),
+            f"{int(c.start_s // 60):02d}:{int(c.start_s % 60):02d}-{int(c.end_s // 60):02d}:{int(c.end_s % 60):02d}",
+            f"{c.end_s - c.start_s:.0f}s",
+        )
+    console.print(table)
+    console.print(f"\n[bold green]切片策略制定完成！当前未渲染任何视频。[/bold green]")
+    console.print(f"👉 推荐运行 [cyan]clipcut serve[/cyan] 打开网页工作台人工勾选、微调并按需渲染；")
+    console.print(f"👉 或直接运行 [cyan]clipcut render \"{video_path}\"[/cyan] 渲染当前预选的切片。")
+
+
+@app.command()
 def run(
     path: str = typer.Argument(..., help="视频文件或包含视频的目录路径"),
     subtitle: Optional[str] = typer.Option(None, "--subtitle", "-s", help="显式指定字幕文件 (.srt/.vtt)"),
@@ -73,7 +125,7 @@ def run(
     stage: Optional[str] = typer.Option(None, "--stage", help="仅运行指定阶段，逗号分隔，如 signals,analyze"),
     text_model: Optional[str] = typer.Option(None, "--text-model", help="文本分析模型（如 qwen4-max / dashscope:qwen3.8-max / gemini:gemini-2.5-flash）"),
     multimodal_model: Optional[str] = typer.Option(None, "--multimodal-model", help="多模态复核模型（如 qwen3.5-omni-plus / qwen3.8-omni-flash / gemini:gemini-2.5-flash）"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="仅分析与规划，跳过最终 ffmpeg 渲染"),
+    dry_run: bool = typer.Option(False, "--dry-run", "--plan-only", help="仅分析与规划，跳过最终 ffmpeg 渲染"),
     force_render: bool = typer.Option(False, "--force-render", help="忽略增量哈希缓存强制重渲"),
     yes: bool = typer.Option(False, "--yes", "-y", help="目录含多视频时不交互提示，默认选第一个"),
 ):

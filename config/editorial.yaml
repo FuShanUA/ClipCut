@@ -4,6 +4,8 @@ clip_duration:
   ideal_min_seconds: 90
   ideal_max_seconds: 210
   overlap_merge_iou: 0.35
+clip_selection:
+  default_selected_max: 6
 boundary:
   max_pre_roll_ms: 350
   max_post_roll_ms: 450

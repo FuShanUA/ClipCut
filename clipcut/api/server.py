@@ -26,7 +26,7 @@ from ..pipeline.verify_and_plan import (
 )
 from ..publish import get_platforms_status, launch_platform_login, publish_to_platforms
 from ..receipts import ProjectStore
-from ..render.renderer import refresh_single_cover
+from ..render.renderer import refresh_single_cover, render_single_clip_and_cover
 
 REGISTRY_PATH = PROJECT_ROOT / ".clipcut_registry.json"
 
@@ -109,10 +109,15 @@ class OpenProjectRequest(BaseModel):
 
 
 class RunStagesRequest(BaseModel):
-    stages: list[str] = Field(default_factory=lambda: ["signals", "analyze", "verify_and_plan", "render"])
+    stages: list[str] = Field(default_factory=lambda: ["signals", "analyze", "verify_and_plan"])
     force_render: bool = False
     text_model: str | None = None
     multimodal_model: str | None = None
+
+
+class BatchClipsRequest(BaseModel):
+    action: str  # "enable_all" | "disable_all" | "top_n"
+    n: int = 5
 
 
 class UpdateModelsRequest(BaseModel):
@@ -407,6 +412,54 @@ def patch_clip(project_id: str, clip_id: str, req: PatchClipRequest):
         diff={"clip_id": clip_id, "before": before, "after": after},
     )
     return {"manifest": manifest.model_dump()}
+
+
+@app.post("/api/projects/{project_id}/clips/batch")
+def batch_clips(project_id: str, req: BatchClipsRequest):
+    store = _get_store(project_id)
+    manifest = store.load()
+    store.save_undo_snapshot(manifest, f"批量操作切片: {req.action}")
+
+    if req.action == "enable_all":
+        for c in manifest.clips:
+            c.enabled = True
+    elif req.action == "disable_all":
+        for c in manifest.clips:
+            c.enabled = False
+    elif req.action == "top_n":
+        sorted_indices = sorted(
+            range(len(manifest.clips)),
+            key=lambda i: getattr(manifest.clips[i], "score", 7.5),
+            reverse=True,
+        )
+        top_set = set(sorted_indices[: req.n])
+        for idx, c in enumerate(manifest.clips):
+            c.enabled = idx in top_set
+    else:
+        raise HTTPException(status_code=400, detail=f"不支持的批量操作: {req.action}")
+
+    store.save(manifest)
+    enabled_count = sum(1 for c in manifest.clips if c.enabled)
+    store.append_receipt(
+        run_id=f"human_{uuid.uuid4().hex[:6]}",
+        stage="human_edit",
+        actor="human",
+        action="batch_clips",
+        summary=f"批量更新切片状态 [{req.action}]：当前已启用 {enabled_count}/{len(manifest.clips)} 支",
+    )
+    return {"manifest": manifest.model_dump(), "enabled_count": enabled_count}
+
+
+@app.post("/api/projects/{project_id}/clips/{clip_id}/render")
+def render_single_clip(project_id: str, clip_id: str, force: bool = False):
+    store = _get_store(project_id)
+    manifest = store.load()
+    cfg = load_editorial_config()
+    ok, res = render_single_clip_and_cover(manifest, store, clip_id, cfg, force=force)
+    if not ok:
+        raise HTTPException(status_code=500, detail=f"渲染切片失败: {res}")
+    manifest = store.load()
+    return {"ok": True, "output_file": res, "manifest": manifest.model_dump()}
 
 
 @app.patch("/api/projects/{project_id}/remix")

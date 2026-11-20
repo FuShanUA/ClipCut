@@ -2267,3 +2267,95 @@ def run_render_stage(
         },
     )
     return manifest
+
+
+def render_single_clip_and_cover(
+    manifest: ProjectManifest,
+    store: ProjectStore,
+    clip_id: str,
+    cfg: dict[str, Any] | None = None,
+    *,
+    force: bool = False,
+) -> tuple[bool, str]:
+    """定向渲染单个切片及其封面，更新 manifest 并返回结果"""
+    if cfg is None:
+        cfg = load_editorial_config()
+    target_pos = next((i for i, c in enumerate(manifest.clips) if c.clip_id == clip_id), None)
+    if target_pos is None:
+        return False, f"未找到切片: {clip_id}"
+
+    clip = manifest.clips[target_pos]
+    clip.enabled = True
+    src_video = Path(manifest.source.render_video)
+    clean_video = Path(manifest.source.analysis_video)
+    frame_src = clean_video if clean_video.exists() else src_video
+    output_dir = Path(manifest.source.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fade_ms = int(cfg.get("boundary", {}).get("audio_fade_ms", 25))
+    use_vt = _has_videotoolbox()
+    published_date = _ensure_published_date(manifest, store)
+    prefer_two_shot = bool(cfg.get("cover", {}).get("prefer_two_shot", True))
+    hero_pool = _build_hero_pool_for_manifest(frame_src, manifest, store, cfg, prefer_two_shot)
+
+    clip.render_hash = compute_clip_render_hash(clip, manifest.source.render_video)
+    fname = build_clip_filename(clip, manifest, published_date)
+    out_mp4 = output_dir / fname
+    cover_jpg = out_mp4.with_suffix(".jpg")
+    effective_cover_title = (clip.cover_title or clip.title).strip()
+    exp_cover_hash = compute_cover_hash(
+        key=clip.clip_id,
+        title=effective_cover_title,
+        categories=clip.categories,
+        start_s=clip.start_s,
+        end_s=clip.end_s,
+        manifest=manifest,
+        cfg=cfg,
+        published_date=published_date,
+    )
+
+    if not force and clip.render_hash == clip.last_rendered_hash and out_mp4.exists() and out_mp4.stat().st_size > 1024:
+        clip.output_file = str(out_mp4)
+        if clip.cover_hash != exp_cover_hash or not cover_jpg.exists():
+            _generate_clip_cover(
+                clean_video=frame_src,
+                fallback_video=out_mp4,
+                clip=clip,
+                manifest=manifest,
+                store=store,
+                cfg=cfg,
+                hero_pool=hero_pool,
+                fallback_index=target_pos,
+                published_date=published_date,
+                cover_path=cover_jpg,
+                reuse_cached_frame=True,
+            )
+            clip.cover_file = str(cover_jpg)
+            clip.cover_hash = exp_cover_hash
+        store.save(manifest)
+        return True, str(out_mp4)
+
+    store.log(f"[render] 单片定向渲染 {clip.clip_id}: {fname} ({clip.start_s:.2f}s → {clip.end_s:.2f}s)")
+    ok, encoder, err = _render_single_clip(src_video, clip, out_mp4, fade_ms, use_vt)
+    if not ok:
+        store.log(f"[render] 切片 {clip.clip_id} 渲染失败: {err}")
+        return False, err
+
+    clip.last_rendered_hash = clip.render_hash
+    clip.output_file = str(out_mp4)
+    _generate_clip_cover(
+        clean_video=frame_src,
+        fallback_video=out_mp4,
+        clip=clip,
+        manifest=manifest,
+        store=store,
+        cfg=cfg,
+        hero_pool=hero_pool,
+        fallback_index=target_pos,
+        published_date=published_date,
+        cover_path=cover_jpg,
+    )
+    clip.cover_file = str(cover_jpg)
+    clip.cover_hash = exp_cover_hash
+    store.save(manifest)
+    return True, str(out_mp4)
+

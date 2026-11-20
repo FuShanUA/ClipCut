@@ -114,6 +114,7 @@ export interface ClipItem {
   snap_delta_start_ms: number;
   snap_delta_end_ms: number;
   multimodal_status: string;
+  score?: number;
   render_hash: string;
   last_rendered_hash: string;
   output_file: string | null;

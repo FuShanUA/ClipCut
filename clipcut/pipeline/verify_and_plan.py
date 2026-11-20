@@ -1062,6 +1062,7 @@ def run_verify_and_plan_stage(
             snap_delta_start_ms=d_start,
             snap_delta_end_ms=d_end,
             multimodal_status=cand.multimodal.status,
+            score=float(cand.score),
         )
         clip.render_hash = compute_clip_render_hash(clip, manifest.source.render_video)
         clips.append(clip)
@@ -1084,6 +1085,20 @@ def run_verify_and_plan_stage(
                 "duration_s": round(dur, 1),
             }
         )
+
+    sel_cfg = cfg.get("clip_selection", {})
+    default_max = int(sel_cfg.get("default_selected_max", 6))
+    if len(clips) > default_max:
+        scored_indices = sorted(
+            range(len(clips)),
+            key=lambda i: clips[i].score,
+            reverse=True,
+        )
+        selected_set = set(scored_indices[:default_max])
+        for idx, clip in enumerate(clips):
+            clip.enabled = idx in selected_set
+            if not clip.enabled:
+                clip.notes.append(f"长片候选较多（共 {len(clips)} 支）：默认预选 Top {default_max}，本切片保留策略，可在工作台按需启用")
 
     manifest.clips = clips
     manifest.remix_only_pool = remix_only_pool

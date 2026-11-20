@@ -67,6 +67,20 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
+  batchClips: (projectId: string, action: "enable_all" | "disable_all" | "top_n", n = 5) =>
+    req<{ manifest: ProjectManifest; enabled_count: number }>(`/api/projects/${projectId}/clips/batch`, {
+      method: "POST",
+      body: JSON.stringify({ action, n }),
+    }),
+
+  renderClip: (projectId: string, clipId: string, force = false) =>
+    req<{ ok: boolean; output_file: string; manifest: ProjectManifest }>(
+      `/api/projects/${projectId}/clips/${clipId}/render?force=${force}`,
+      {
+        method: "POST",
+      }
+    ),
+
   patchRemix: (projectId: string, patch: Record<string, unknown>) =>
     req<{ manifest: ProjectManifest }>(`/api/projects/${projectId}/remix`, {
       method: "PATCH",

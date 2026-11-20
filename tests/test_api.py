@@ -54,3 +54,60 @@ def test_publish_status_endpoint():
     for key in ("wechat", "bilibili", "xiaohongshu"):
         assert key in platforms
 
+
+def test_batch_clips_endpoint(tmp_path: Path, monkeypatch):
+    from clipcut.models import ProjectManifest, MediaSource, VideoMetadata, ClipItem
+    from clipcut.receipts import ProjectStore
+    import clipcut.api.server as srv
+
+    store = ProjectStore(tmp_path)
+    m = ProjectManifest(
+        project_id="test-batch-01",
+        source=MediaSource(
+            work_dir=str(tmp_path),
+            render_video="fake.mp4",
+            analysis_video="fake.mp4",
+            output_dir=str(tmp_path / "out"),
+            duration_s=100.0,
+            width=1920,
+            height=1080,
+            fps=30.0,
+        ),
+        metadata=VideoMetadata(
+            original_title="test",
+            description="",
+            channel="",
+            guest_zh="",
+            channel_zh="",
+            original_theme_zh="",
+            metadata_source="manual",
+        ),
+        clips=[
+            ClipItem(clip_id="c1", index=1, enabled=True, title="t1", start_utt=0, end_utt=1, start_s=0.0, end_s=10.0, score=9.0),
+            ClipItem(clip_id="c2", index=2, enabled=True, title="t2", start_utt=1, end_utt=2, start_s=10.0, end_s=20.0, score=6.0),
+            ClipItem(clip_id="c3", index=3, enabled=True, title="t3", start_utt=2, end_utt=3, start_s=20.0, end_s=30.0, score=8.0),
+        ],
+    )
+    store.save(m)
+    monkeypatch.setattr(srv, "_get_store", lambda pid: store)
+
+    # Disable all
+    r = client.post("/api/projects/test-batch-01/clips/batch", json={"action": "disable_all"})
+    assert r.status_code == 200
+    assert r.json()["enabled_count"] == 0
+
+    # Enable all
+    r = client.post("/api/projects/test-batch-01/clips/batch", json={"action": "enable_all"})
+    assert r.status_code == 200
+    assert r.json()["enabled_count"] == 3
+
+    # Top 2 (scores are 9.0 and 8.0 -> c1 and c3)
+    r = client.post("/api/projects/test-batch-01/clips/batch", json={"action": "top_n", "n": 2})
+    assert r.status_code == 200
+    assert r.json()["enabled_count"] == 2
+    clips = r.json()["manifest"]["clips"]
+    assert clips[0]["enabled"] is True   # c1 (score 9.0)
+    assert clips[1]["enabled"] is False  # c2 (score 6.0)
+    assert clips[2]["enabled"] is True   # c3 (score 8.0)
+
+

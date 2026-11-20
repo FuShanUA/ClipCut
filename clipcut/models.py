@@ -187,6 +187,7 @@ class ClipItem(BaseModel):
     snap_delta_start_ms: int = 0
     snap_delta_end_ms: int = 0
     multimodal_status: str = "not_required"
+    score: float = 7.5
     render_hash: str = ""
     last_rendered_hash: str = ""
     output_file: str | None = None

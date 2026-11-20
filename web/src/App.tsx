@@ -117,6 +117,7 @@ export default function App() {
   const [manifest, setManifest] = useState<ProjectManifest | null>(null);
   const [jobRunning, setJobRunning] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [singleRendering, setSingleRendering] = useState(false);
 
   // Clean 2-column by default; right logs drawer hidden unless user opens it
   const [showLogs, setShowLogs] = useState(false);
@@ -385,6 +386,32 @@ export default function App() {
     }
   }
 
+  async function handleBatchClips(action: "enable_all" | "disable_all" | "top_n", n = 5) {
+    if (!manifest) return;
+    setErrorMsg(null);
+    try {
+      const res = await api.batchClips(manifest.project_id, action, n);
+      setManifest(res.manifest);
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    }
+  }
+
+  async function handleRenderSingleClip(clipId: string) {
+    if (!manifest) return;
+    setErrorMsg(null);
+    setSingleRendering(true);
+    try {
+      const res = await api.renderClip(manifest.project_id, clipId, true);
+      setManifest(res.manifest);
+      setPlayMode("rendered");
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    } finally {
+      setSingleRendering(false);
+    }
+  }
+
   async function handlePatchRemix(patch: Record<string, unknown>) {
     if (!manifest) return;
     setErrorMsg(null);
@@ -614,6 +641,10 @@ export default function App() {
     return n;
   }, [manifest]);
 
+  const enabledClipCount = useMemo(() => {
+    return manifest ? manifest.clips.filter((c) => c.enabled).length : 0;
+  }, [manifest]);
+
   const remixStats = useMemo(() => {
     if (!manifest) {
       return { themeCount: 0, segmentCount: 0, estTotalS: 0, ratioPct: "0.0" };
@@ -693,16 +724,27 @@ export default function App() {
             type="button"
             className="primary"
             disabled={!manifest || jobRunning}
-            onClick={() => handleRun(["signals", "analyze", "verify_and_plan", "render"])}
+            onClick={() => handleRun(["signals", "analyze", "verify_and_plan"])}
+            title="第一步：AI声画测绘、三类选片与Remix规划（不消耗重型算力渲染）"
           >
-            {jobRunning ? "处理中..." : "一键出片"}
+            {jobRunning ? "规划中..." : "生成切片策略"}
           </button>
           <button
             type="button"
-            disabled={!manifest || jobRunning}
+            disabled={!manifest || jobRunning || enabledClipCount === 0}
             onClick={() => handleRun(["render"])}
+            title="第二步：仅对当前勾选的切片和精选Remix执行物理渲染"
           >
-            增量渲染{dirtyCount > 0 ? ` (${dirtyCount})` : ""}
+            渲染选中 ({enabledClipCount}/{manifest ? manifest.clips.length : 0})
+          </button>
+          <button
+            type="button"
+            className="sm"
+            disabled={!manifest || jobRunning}
+            onClick={() => handleRun(["signals", "analyze", "verify_and_plan", "render"])}
+            title="全自动无人值守：全流程跑完包含全量渲染"
+          >
+            全自动跑完
           </button>
           <button type="button" onClick={handleUndo} disabled={!manifest}>
             撤销
@@ -761,15 +803,28 @@ export default function App() {
         <main className={`workbench ${showLogs ? "" : "no-right"}`}>
           {/* LEFT PANE: Compact Clips & Remix List */}
           <section className="pane">
-            <div className="pane-header">
-              <span>切片 ({manifest.clips.filter((c) => c.enabled).length}/{manifest.clips.length})</span>
-              <button
-                type="button"
-                className="sm"
-                onClick={() => api.openOutputFolder(manifest.project_id).catch((e) => setErrorMsg(e.message))}
-              >
-                打开目录
-              </button>
+            <div className="pane-header" style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "stretch" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span>切片 ({enabledClipCount}/{manifest.clips.length})</span>
+                <button
+                  type="button"
+                  className="sm"
+                  onClick={() => api.openOutputFolder(manifest.project_id).catch((e) => setErrorMsg(e.message))}
+                >
+                  打开目录
+                </button>
+              </div>
+              <div style={{ display: "flex", gap: 4 }}>
+                <button type="button" className="sm" onClick={() => handleBatchClips("top_n", 5)} title="按评分预选 Top 5">
+                  精选Top5
+                </button>
+                <button type="button" className="sm" onClick={() => handleBatchClips("enable_all")} title="全部启用">
+                  全选
+                </button>
+                <button type="button" className="sm" onClick={() => handleBatchClips("disable_all")} title="全部停用">
+                  全不选
+                </button>
+              </div>
             </div>
             <div className="pane-body scroller">
               {/* Remix Card */}
@@ -835,6 +890,11 @@ export default function App() {
                         <span className="mono">
                           {fmtTime(c.start_s)}–{fmtTime(c.end_s)}
                         </span>
+                        {typeof c.score === "number" && (
+                          <span className="tag" title="AI推荐评分">
+                            ⭐ {c.score.toFixed(1)}
+                          </span>
+                        )}
                         {c.categories.map((cat) => (
                           <span key={cat} className={`tag ${cat}`}>
                             {CAT_LABELS[cat] || cat}
@@ -1124,6 +1184,15 @@ export default function App() {
                       </button>
                     </div>
                     <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                      <button
+                        type="button"
+                        className="sm"
+                        disabled={singleRendering || jobRunning}
+                        onClick={() => handleRenderSingleClip(activeClip.clip_id)}
+                        title="只定向渲染当前这个切片及其封面"
+                      >
+                        {singleRendering ? "渲染中..." : activeClip.output_file ? "重渲此切片" : "渲染此切片"}
+                      </button>
                       <button
                         type="button"
                         className="sm primary"
