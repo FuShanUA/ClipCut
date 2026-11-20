@@ -852,6 +852,22 @@ def test_publishers_missing_local_config_is_safe(tmp_path: Path, monkeypatch):
         assert status[plat]["python_ready"] is False
 
 
+def test_format_concat_file_entry_escapes_single_quotes_and_uses_relative_path(tmp_path: Path):
+    from clipcut.render.renderer import _format_concat_file_entry
+
+    base_dir = tmp_path / "Building Legal Agents When You Can't See the Data" / "remix_tmp"
+    base_dir.mkdir(parents=True)
+    seg_file = base_dir / "seg_'01'.mp4"
+    entry = _format_concat_file_entry(seg_file, base_dir)
+    assert entry == r"file 'seg_'\''01'\''.mp4'"
+
+    outside_file = tmp_path / "other" / "it's_cool.mp4"
+    outside_file.parent.mkdir(parents=True)
+    outside_entry = _format_concat_file_entry(outside_file, base_dir)
+    assert r"'\''" in outside_entry
+
+
+
 
 
 

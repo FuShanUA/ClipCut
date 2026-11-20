@@ -1585,6 +1585,16 @@ def _create_title_card_video(
     return ok
 
 
+def _format_concat_file_entry(p: Path, base_dir: Path) -> str:
+    """Format path for ffmpeg concat demuxer file list, escaping single quotes and using relative path if possible."""
+    try:
+        rel = p.resolve().relative_to(base_dir.resolve()).as_posix()
+    except Exception:
+        rel = p.resolve().as_posix()
+    escaped = rel.replace("'", "'\\''")
+    return f"file '{escaped}'"
+
+
 def _render_remix(
     manifest: ProjectManifest,
     store: ProjectStore,
@@ -1776,7 +1786,7 @@ def _render_remix(
 
     concat_list = tmp_dir / "concat.txt"
     concat_list.write_text(
-        "\n".join(f"file '{p.resolve().as_posix()}'" for p in concat_files) + "\n",
+        "\n".join(_format_concat_file_entry(p, tmp_dir) for p in concat_files) + "\n",
         encoding="utf-8",
     )
     raw_concat = tmp_dir / "remix_raw.mp4"
@@ -1801,7 +1811,7 @@ def _render_remix(
     )
     if res_cat.returncode != 0:
         # Fallback re-encode concat if stream params differed slightly
-        subprocess.run(
+        res_fallback = subprocess.run(
             [
                 "ffmpeg",
                 "-y",
@@ -1825,10 +1835,13 @@ def _render_remix(
                 "192k",
                 str(raw_concat),
             ],
-            check=True,
             capture_output=True,
             text=True,
         )
+        if res_fallback.returncode != 0:
+            err_msg = (res_fallback.stderr or res_cat.stderr or "未知错误").strip()
+            store.log(f"[render] Remix 拼接失败: {err_msg}")
+            return None
 
     # Audio mastering pass: mix transition SFX + BGM with sidechain ducking
     r_cfg = cfg.get("remix", {})
