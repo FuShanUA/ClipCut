@@ -1,0 +1,19 @@
+# Copy to config/local.yaml (gitignored) to configure local publisher scripts and cover utils.
+# Environment variables (CLIPCUT_*, WECHAT_BROWSER_DATA_DIR) take precedence over this file.
+publishers:
+  wechat:
+    python: ""
+    script: ""
+    profile_dir: ""
+  bilibili:
+    python: ""
+    script: ""
+    login_script: ""
+    cookies_file: ""
+  xiaohongshu:
+    python: ""
+    script: ""
+    login_script: ""
+    cookies_file: ""
+cover:
+  autosub_cover_utils: ""

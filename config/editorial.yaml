@@ -1,0 +1,131 @@
+clip_duration:
+  min_seconds: 60
+  max_seconds: 300
+  ideal_min_seconds: 90
+  ideal_max_seconds: 210
+  overlap_merge_iou: 0.35
+boundary:
+  max_pre_roll_ms: 350
+  max_post_roll_ms: 450
+  short_pause_guard_ms: 40
+  audio_fade_ms: 25
+models:
+  text_provider: dashscope
+  text_model: qwen3.8-max
+  text_fallback_models:
+  - qwen4-max
+  - glm-5.3
+  - kimi-k3.1-pro
+  - deepseek-v4-pro
+  - glm-5.2
+  - qwen3.8-flash
+  - gemini:gemini-2.5-flash
+  remix_model: ''
+  multimodal_provider: dashscope
+  multimodal_model: qwen3-vl-plus
+  multimodal_fallback_models:
+  - qwen3.8-omni-flash
+  - qwen3.5-omni-plus
+  - qwen3-vl-plus
+  - gemini:gemini-2.5-flash
+  max_multimodal_checks: 8
+  vertex_project: ''
+  vertex_location: global
+hot_topics:
+  primary_topic_dedup: true
+  categories:
+  - name: 中美竞争与地缘科技
+    keywords:
+    - 中美竞争
+    - 中国
+    - China
+    - US-China
+    - 出口管制
+    - 芯片禁令
+    - 供应链脱钩
+    - 主权AI
+    note: 中美科技博弈、算力/模型追赶、地缘战略与产业链对比
+  - name: 开源模型与模型生态
+    keywords:
+    - 开源模型
+    - open source
+    - open-weight
+    - DeepSeek
+    - Qwen
+    - 千问
+    - Llama
+    - Mistral
+    - 闭源
+    note: 开源vs闭源路线之争、中国开源模型竞争力、模型商品化
+  - name: 本体与企业级AI工程
+    keywords:
+    - 本体
+    - Ontology
+    - FDE
+    - Forward Deployed Engineer
+    - 前线部署工程师
+    - Foundry
+    - AIP
+    note: Ontology架构、FDE落地范式、企业语义层与业务编排
+  - name: 核心关注公司与人物
+    keywords:
+    - Palantir
+    - Anduril
+    - 英伟达
+    - NVIDIA
+    - 黄仁勋
+    - Jensen Huang
+    - 马斯克
+    - Elon Musk
+    - Alex Karp
+    - Palmer Luckey
+    - xAI
+    - SpaceX
+    note: 高关注度科技领袖与标杆公司动态（主话题本身需去重）
+  - name: 前沿范式与AGI
+    keywords:
+    - RSI
+    - Recursive Self-Improvement
+    - 递归自我改进
+    - AGI
+    - ASI
+    - Superintelligence
+    - Scaling Law
+    - 推理时计算
+    note: 递归自我改进、AGI时间表、Scaling范式转折
+  - name: AI具体业务用例与量化价值
+    keywords:
+    - ROI
+    - 量化价值
+    - 降本
+    - 提效
+    - 收入增长
+    - 业务用例
+    - use case
+    - production
+    - 毛利
+    - 转化率
+    - 节省
+    note: 带有具体行业场景、可验证数字或真实投产效果的AI落地案例
+remix:
+  max_duration_ratio: 0.10
+  target_min_ratio: 0.065
+  min_excerpt_seconds: 8
+  max_excerpt_seconds: 90
+  max_excerpts: 12
+  max_themes: 6
+  card_mode: group
+  card_duration_s: 1.4
+  card_fade_s: 0.2
+  enable_sfx: true
+  enable_bgm: true
+  bgm_volume: 0.16
+  sfx_volume: 0.35
+  duck_threshold: 0.03
+  duck_ratio: 6.0
+  duck_attack_ms: 40
+  duck_release_ms: 350
+cover:
+  style: natural
+  prefer_two_shot: true
+  remix_card_pip: true

@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+web/node_modules/
+web/dist/
+.DS_Store
+*.log
+.clipcut/
+.clipcut_registry.json
+assets/sfx/
+assets/bgm/
+assets/clipcut_face_detect
+config/local.yaml
+.env
