@@ -21,13 +21,18 @@ from ..pipeline.orchestrator import ALL_STAGES, run_existing_project_stages
 from ..pipeline.verify_and_plan import (
     _load_audio_envelope,
     compute_clip_render_hash,
+    compute_compilation_render_hash,
     compute_remix_render_hash,
     select_curated_top_clips,
     snap_bounds_with_acoustic_guard,
 )
 from ..publish import get_platforms_status, launch_platform_login, publish_to_platforms
 from ..receipts import ProjectStore
-from ..render.renderer import refresh_single_cover, render_single_clip_and_cover
+from ..render.renderer import (
+    refresh_single_cover,
+    render_compilation_and_cover,
+    render_single_clip_and_cover,
+)
 
 REGISTRY_PATH = PROJECT_ROOT / ".clipcut_registry.json"
 
@@ -159,6 +164,14 @@ class PatchRemixRequest(BaseModel):
     bgm_volume: float | None = None
     sfx_volume: float | None = None
     items: list[PatchRemixItem] | None = None
+
+
+class PatchCompilationRequest(BaseModel):
+    enabled: bool | None = None
+    title: str | None = None
+    cover_title: str | None = None
+    card_duration_s: float | None = None
+    card_fade_s: float | None = None
 
 
 class RefreshCoverRequest(BaseModel):
@@ -552,6 +565,61 @@ def patch_remix(project_id: str, req: PatchRemixRequest):
     return {"manifest": manifest.model_dump()}
 
 
+@app.patch("/api/projects/{project_id}/compilation")
+def patch_compilation(project_id: str, req: PatchCompilationRequest):
+    store = _get_store(project_id)
+    manifest = store.load()
+    cfg = load_editorial_config()
+    store.save_undo_snapshot(manifest, "修改切片精选集设置")
+
+    c = manifest.compilation
+    if req.enabled is not None:
+        c.enabled = req.enabled
+    title_changed = False
+    if req.title is not None:
+        new_t = req.title.strip() or c.title
+        if new_t != c.title:
+            c.title = new_t
+            title_changed = True
+    cover_title_changed = False
+    if req.cover_title is not None:
+        new_ct = req.cover_title.strip()
+        if new_ct != c.cover_title:
+            c.cover_title = new_ct
+            cover_title_changed = True
+    if req.card_duration_s is not None:
+        c.card_duration_s = max(0.5, min(5.0, float(req.card_duration_s)))
+    if req.card_fade_s is not None:
+        c.card_fade_s = max(0.05, min(1.0, float(req.card_fade_s)))
+
+    c.render_hash = compute_compilation_render_hash(manifest)
+    store.save(manifest)
+    if (cover_title_changed or (title_changed and not c.cover_title)) and c.cover_file:
+        refresh_single_cover(manifest, store, cfg, "compilation")
+        manifest = store.load()
+    store.append_receipt(
+        run_id=f"human_{uuid.uuid4().hex[:6]}",
+        stage="human_edit",
+        actor="human",
+        action="edit_compilation",
+        summary=f"人工更新切片精选集设置（启用:{c.enabled}，片头卡片停留:{c.card_duration_s:.1f}s）",
+    )
+    return {"manifest": manifest.model_dump()}
+
+
+@app.post("/api/projects/{project_id}/compilation/render")
+def render_compilation_endpoint(project_id: str, force: bool = False):
+    store = _get_store(project_id)
+    manifest = store.load()
+    cfg = load_editorial_config()
+    ok, res = render_compilation_and_cover(manifest, store, cfg, force=force)
+    if not ok:
+        raise HTTPException(status_code=500, detail=f"渲染精选集失败: {res}")
+    manifest = store.load()
+    return {"ok": True, "output_file": res, "manifest": manifest.model_dump()}
+
+
+
 @app.post("/api/projects/{project_id}/covers/refresh")
 def api_refresh_cover(project_id: str, req: RefreshCoverRequest):
     store = _get_store(project_id)
@@ -716,6 +784,14 @@ def stream_media(project_id: str, kind: str, request: Request, clip_id: str | No
         if not manifest.remix.cover_file:
             raise HTTPException(status_code=404, detail="混剪封面不存在")
         return FileResponse(manifest.remix.cover_file, media_type="image/jpeg")
+    if kind == "compilation":
+        if not manifest.compilation.output_file:
+            raise HTTPException(status_code=404, detail="精选集尚未渲染")
+        return _stream_file_range(Path(manifest.compilation.output_file), request)
+    if kind == "compilation_cover":
+        if not manifest.compilation.cover_file:
+            raise HTTPException(status_code=404, detail="精选集封面不存在")
+        return FileResponse(manifest.compilation.cover_file, media_type="image/jpeg")
     raise HTTPException(status_code=400, detail=f"未知媒体类型: {kind}")
 
 

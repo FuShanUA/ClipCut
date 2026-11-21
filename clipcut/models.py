@@ -239,6 +239,20 @@ class RemixConfig(BaseModel):
     publish_records: list[PublishRecord] = Field(default_factory=list)
 
 
+class CompilationConfig(BaseModel):
+    enabled: bool = True
+    title: str = "切片精选集"
+    cover_title: str = ""
+    card_duration_s: float = 1.8
+    card_fade_s: float = 0.2
+    render_hash: str = ""
+    last_rendered_hash: str = ""
+    output_file: str | None = None
+    cover_file: str | None = None
+    cover_hash: str = ""
+    publish_records: list[PublishRecord] = Field(default_factory=list)
+
+
 class StageStatus(BaseModel):
     status: Literal["idle", "running", "completed", "error"] = "idle"
     started_at: str | None = None
@@ -273,6 +287,7 @@ class ProjectManifest(BaseModel):
     clips: list[ClipItem] = Field(default_factory=list)
     remix_only_pool: list[Candidate] = Field(default_factory=list)
     remix: RemixConfig = Field(default_factory=RemixConfig)
+    compilation: CompilationConfig = Field(default_factory=CompilationConfig)
 
 
 class Receipt(BaseModel):

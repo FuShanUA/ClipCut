@@ -164,6 +164,20 @@ export interface RemixConfig {
   publish_records?: PublishRecord[];
 }
 
+export interface CompilationConfig {
+  enabled: boolean;
+  title: string;
+  cover_title?: string;
+  card_duration_s: number;
+  card_fade_s: number;
+  render_hash: string;
+  last_rendered_hash: string;
+  output_file: string | null;
+  cover_file?: string | null;
+  cover_hash?: string;
+  publish_records?: PublishRecord[];
+}
+
 export interface ProjectManifest {
   project_id: string;
   revision: number;
@@ -197,6 +211,7 @@ export interface ProjectManifest {
   suppressed_hot_topics: SuppressedHotTopic[];
   clips: ClipItem[];
   remix: RemixConfig;
+  compilation?: CompilationConfig;
 }
 
 export interface Receipt {

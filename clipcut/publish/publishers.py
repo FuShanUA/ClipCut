@@ -250,6 +250,17 @@ def _default_target_metadata(manifest: ProjectManifest, target: str) -> tuple[Pa
         tags = list(dict.fromkeys(manifest.primary_topics + ["AI", "深度访谈"]))[:6]
         return vpath, title, cover_title, desc, tags, rmx.publish_records
 
+    if target == "compilation":
+        cmp = manifest.compilation
+        vpath = Path(cmp.output_file) if cmp.output_file else None
+        title = (cmp.title or manifest.metadata.original_theme_zh or cmp.cover_title or "切片精选集").strip()
+        cover_title = (cmp.cover_title or title).strip()
+        enabled_clips = [c for c in manifest.clips if c.enabled]
+        summary = " | ".join(c.title for c in enabled_clips[:4])
+        desc = f"{manifest.metadata.guest_zh or ''} · {manifest.metadata.channel_zh or manifest.metadata.channel or ''}\n精选 {len(enabled_clips)} 支独立切片：\n{summary}".strip()
+        tags = list(dict.fromkeys(manifest.primary_topics + ["AI", "深度访谈", "合集"]))[:6]
+        return vpath, title, cover_title, desc, tags, cmp.publish_records
+
     for c in manifest.clips:
         if c.clip_id == target:
             vpath = Path(c.output_file) if c.output_file else None

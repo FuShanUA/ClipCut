@@ -19,7 +19,11 @@ from ..adapters.ingest import _find_best_info_json, extract_published_date
 from ..assets_gen import ensure_default_assets
 from ..config import load_local_config
 from ..models import ClipItem, ProjectManifest
-from ..pipeline.verify_and_plan import compute_clip_render_hash, compute_remix_render_hash
+from ..pipeline.verify_and_plan import (
+    compute_clip_render_hash,
+    compute_compilation_render_hash,
+    compute_remix_render_hash,
+)
 from ..receipts import ProjectStore
 from .frame_selector import (
     FaceBox,
@@ -114,6 +118,19 @@ def build_remix_filename(manifest: ProjectManifest, published_date: str = "", du
     dt = _clean_file_token(published_date or manifest.metadata.published_date or "", 12)
     dur_val = duration_s if (duration_s is not None and duration_s > 0) else _estimate_remix_duration_s(manifest)
     parts = ["00", "Remix"] + [p for p in (ch, title, dt, _fmt_ts_token(dur_val)) if p]
+    return "_".join(parts) + ".mp4"
+
+
+def build_compilation_filename(manifest: ProjectManifest, published_date: str = "", duration_s: float | None = None) -> str:
+    ch = _clean_file_token(manifest.metadata.channel_zh or manifest.metadata.channel or "", 24)
+    title = _clean_file_token(manifest.compilation.title or "切片精选集", 36)
+    dt = _clean_file_token(published_date or manifest.metadata.published_date or "", 12)
+    enabled_clips = [c for c in manifest.clips if c.enabled]
+    card_dur = float(manifest.compilation.card_duration_s or 1.8)
+    dur_val = duration_s if (duration_s is not None and duration_s > 0) else (
+        sum(max(0.0, c.end_s - c.start_s) for c in enabled_clips) + len(enabled_clips) * card_dur
+    )
+    parts = ["00", "Compilation"] + [p for p in (ch, title, dt, _fmt_ts_token(dur_val)) if p]
     return "_".join(parts) + ".mp4"
 
 
@@ -1287,6 +1304,69 @@ def _generate_remix_cover(
     return True
 
 
+def _generate_compilation_cover(
+    *,
+    manifest: ProjectManifest,
+    store: ProjectStore,
+    cfg: dict[str, Any],
+    hero_pool: list[SelectedFrame],
+    published_date: str,
+    cover_path: Path,
+    total_duration_s: float | None = None,
+) -> bool:
+    """Render cover JPEG for Compilation video."""
+    c_cfg = cfg.get("cover", {})
+    style = str(c_cfg.get("style", "natural")).lower()
+    prefer_two_shot = bool(c_cfg.get("prefer_two_shot", True))
+    picked = _resolve_remix_selected_frame(
+        manifest=manifest,
+        store=store,
+        hero_pool=hero_pool,
+        prefer_two_shot=prefer_two_shot,
+    )
+    if picked is None or not picked.image_path.exists():
+        return False
+
+    enabled_clips = [c for c in manifest.clips if c.enabled]
+    dur_s = total_duration_s if (total_duration_s is not None and total_duration_s > 0) else sum(c.end_s - c.start_s for c in enabled_clips)
+    dur_text = _fmt_dur(dur_s)
+    meta_parts = _build_cover_meta_parts(manifest, published_date)
+    comp_title = (manifest.compilation.cover_title or manifest.compilation.title or "切片精选集").strip()
+    badge_text = "COMPILATION  ·  精选合辑"
+    left_meta = [f"总长 {dur_text}", f"精选 {len(enabled_clips)} 支切片"]
+
+    out_img = _render_cover_image_at_size(
+        selected=picked,
+        clean_img_path=picked.image_path,
+        badge_text=badge_text,
+        title_text=comp_title,
+        meta_parts=meta_parts,
+        left_meta_lines=left_meta,
+        target_size=(1920, 1080),
+        cfg=cfg,
+        is_remix=True,
+    )
+    if out_img:
+        _save_cover_jpeg(out_img, cover_path)
+        sync_existing_platform_covers(
+            selected=picked,
+            cover_path=cover_path,
+            badge_text=badge_text,
+            dur_text=dur_text,
+            title=comp_title,
+            meta_parts=meta_parts,
+            style=style,
+            index_text="合辑",
+            group_label="精选合辑",
+            left_meta_lines=left_meta,
+            published_date=published_date,
+            hero_pool=hero_pool,
+        )
+        return True
+    return False
+
+
+
 def sync_platform_covers_for_target(
     manifest: ProjectManifest,
     store: ProjectStore,
@@ -1338,6 +1418,30 @@ def sync_platform_covers_for_target(
         index_text = "REMIX"
         group_label = "高光集锦"
         left_meta_lines = [f"总长 {dur_text}", f"共 {len(enabled_items)} 段精华"]
+    elif target == "compilation":
+        enabled_clips = [c for c in manifest.clips if c.enabled]
+        if not enabled_clips:
+            return []
+        est_dur_s = sum(max(0.0, c.end_s - c.start_s) for c in enabled_clips) + len(enabled_clips) * float(
+            manifest.compilation.card_duration_s or 1.8
+        )
+        target_mp4 = (
+            Path(manifest.compilation.output_file)
+            if manifest.compilation.output_file
+            else (output_dir / build_compilation_filename(manifest, published_date, duration_s=est_dur_s))
+        )
+        selected = _resolve_remix_selected_frame(
+            manifest=manifest,
+            store=store,
+            hero_pool=hero_pool,
+            prefer_two_shot=prefer_two_shot,
+        )
+        stored_title = (manifest.compilation.cover_title or manifest.compilation.title or "切片精选集").strip()
+        dur_text = _fmt_dur(est_dur_s)
+        badge_text = "COMPILATION  ·  精选合辑"
+        index_text = "合辑"
+        group_label = "精选合辑"
+        left_meta_lines = [f"总长 {dur_text}", f"精选 {len(enabled_clips)} 支切片"]
     else:
         for pos, clip in enumerate(manifest.clips):
             if clip.clip_id != target:
@@ -1469,6 +1573,46 @@ def refresh_single_cover(
         if ok:
             manifest.remix.cover_file = str(cover_jpg)
             manifest.remix.cover_hash = exp_hash
+            store.save(manifest)
+            return cover_jpg
+        return None
+
+    if target == "compilation":
+        enabled_clips = [c for c in manifest.clips if c.enabled]
+        if not enabled_clips:
+            return None
+        est_dur_s = sum(max(0.0, c.end_s - c.start_s) for c in enabled_clips) + len(enabled_clips) * float(
+            manifest.compilation.card_duration_s or 1.8
+        )
+        target_mp4 = (
+            Path(manifest.compilation.output_file)
+            if manifest.compilation.output_file
+            else (output_dir / build_compilation_filename(manifest, published_date, duration_s=est_dur_s))
+        )
+        cover_jpg = target_mp4.with_suffix(".jpg")
+        effective_title = (manifest.compilation.cover_title or manifest.compilation.title or "切片精选集").strip()
+        exp_hash = compute_cover_hash(
+            key="compilation",
+            title=effective_title,
+            categories=["compilation"],
+            start_s=enabled_clips[0].start_s,
+            end_s=enabled_clips[-1].end_s,
+            manifest=manifest,
+            cfg=cfg,
+            published_date=published_date,
+        )
+        ok = _generate_compilation_cover(
+            manifest=manifest,
+            store=store,
+            cfg=cfg,
+            hero_pool=hero_pool,
+            published_date=published_date,
+            cover_path=cover_jpg,
+            total_duration_s=est_dur_s,
+        )
+        if ok:
+            manifest.compilation.cover_file = str(cover_jpg)
+            manifest.compilation.cover_hash = exp_hash
             store.save(manifest)
             return cover_jpg
         return None
@@ -1967,6 +2111,226 @@ def _render_remix(
     return out_mp4
 
 
+def _render_compilation(
+    manifest: ProjectManifest,
+    store: ProjectStore,
+    cfg: dict[str, Any],
+    use_vt: bool,
+    run_id: str,
+    hero_pool: list[SelectedFrame] | None = None,
+    published_date: str = "",
+) -> Path | None:
+    """Render Selected Clips Compilation (sequential concatenation of enabled clips with title cards)."""
+    t0 = time.monotonic()
+    comp = manifest.compilation
+    enabled_clips = [c for c in manifest.clips if c.enabled]
+    if not comp.enabled or not enabled_clips:
+        return None
+
+    c_cfg = cfg.get("cover", {})
+    prefer_two_shot = bool(c_cfg.get("prefer_two_shot", True))
+    if not published_date:
+        published_date = _ensure_published_date(manifest, store)
+    if hero_pool is None:
+        clean_src = Path(manifest.source.analysis_video)
+        hero_src = clean_src if clean_src.exists() else Path(manifest.source.render_video)
+        hero_pool = _build_hero_pool_for_manifest(hero_src, manifest, store, cfg, prefer_two_shot)
+
+    output_dir = Path(manifest.source.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    card_dur = float(comp.card_duration_s or 1.8)
+    card_fade = float(comp.card_fade_s or 0.2)
+    est_dur_s = sum(max(0.0, c.end_s - c.start_s) for c in enabled_clips) + len(enabled_clips) * card_dur
+    out_mp4 = output_dir / build_compilation_filename(manifest, published_date, duration_s=est_dur_s)
+    cover_jpg = out_mp4.with_suffix(".jpg")
+
+    comp.render_hash = compute_compilation_render_hash(manifest)
+    effective_title = (comp.cover_title or comp.title or "切片精选集").strip()
+    exp_cover_hash = compute_cover_hash(
+        key="compilation",
+        title=effective_title,
+        categories=["compilation"],
+        start_s=enabled_clips[0].start_s,
+        end_s=enabled_clips[-1].end_s,
+        manifest=manifest,
+        cfg=cfg,
+        published_date=published_date,
+    )
+
+    if comp.render_hash == comp.last_rendered_hash:
+        if not (out_mp4.exists() and out_mp4.stat().st_size > 1024):
+            _migrate_cached_media(comp.output_file, out_mp4, cover_jpg)
+        if out_mp4.exists() and out_mp4.stat().st_size > 1024:
+            comp.output_file = str(out_mp4)
+            if comp.cover_hash != exp_cover_hash or not cover_jpg.exists():
+                if _generate_compilation_cover(
+                    manifest=manifest,
+                    store=store,
+                    cfg=cfg,
+                    hero_pool=hero_pool,
+                    published_date=published_date,
+                    cover_path=cover_jpg,
+                    total_duration_s=est_dur_s,
+                ):
+                    comp.cover_file = str(cover_jpg)
+                    comp.cover_hash = exp_cover_hash
+            else:
+                comp.cover_file = str(cover_jpg)
+            store.save(manifest)
+            return out_mp4
+
+    tmp_dir = store.work_dir / "compilation_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    meta_parts = _build_cover_meta_parts(manifest, published_date)
+    src_video = Path(manifest.source.render_video)
+    w = manifest.source.width or 1920
+    h = manifest.source.height or 1080
+    fps = manifest.source.fps or 30.0
+
+    concat_files: list[Path] = []
+    store.log(f"[render] 开始合成切片精选集 ({len(enabled_clips)} 支已选切片，预估总长 {est_dur_s:.1f}s)")
+
+    for idx, clip in enumerate(enabled_clips, 1):
+        # 1. Chapter title card
+        card_mp4 = tmp_dir / f"card_{idx:02d}.mp4"
+        card_title = (clip.cover_title or clip.title).strip()
+        part_tag = f"Part {idx:02d}"
+        if clip.categories:
+            part_tag += f" · {clip.categories[0]}"
+        portrait = _pick_portrait_frame(hero_pool, clip.start_s, clip.end_s)
+        _create_title_card_video(
+            width=w,
+            height=h,
+            fps=fps,
+            duration_s=card_dur,
+            fade_s=card_fade,
+            group_label=part_tag,
+            card_title=card_title,
+            card_index=idx,
+            out_mp4=card_mp4,
+            use_vt=use_vt,
+            meta_parts=meta_parts,
+            portrait_frame=portrait,
+            enable_pip=True,
+        )
+        concat_files.append(card_mp4)
+
+        # 2. Clip segment
+        clip_mp4 = Path(clip.output_file) if (clip.output_file and Path(clip.output_file).exists() and Path(clip.output_file).stat().st_size > 1024) else None
+        if clip_mp4:
+            concat_files.append(clip_mp4)
+        else:
+            seg_mp4 = tmp_dir / f"seg_{idx:02d}.mp4"
+            fade_ms = int(cfg.get("boundary", {}).get("audio_fade_ms", 25))
+            ok, enc, err = _render_single_clip(src_video, clip, seg_mp4, fade_ms, use_vt)
+            if ok and seg_mp4.exists():
+                concat_files.append(seg_mp4)
+            else:
+                store.log(f"[render] 精选集分段 {clip.clip_id} 截取失败: {err}")
+
+    if not concat_files:
+        store.log("[render] 精选集无有效拼接分段")
+        return None
+
+    concat_txt = tmp_dir / "concat.txt"
+    concat_txt.write_text(
+        "\n".join(_format_concat_file_entry(p, tmp_dir) for p in concat_files) + "\n",
+        encoding="utf-8",
+    )
+    raw_mp4 = tmp_dir / "compilation_raw.mp4"
+    res_cat = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_txt),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(raw_mp4),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if res_cat.returncode != 0:
+        res_fb = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_txt),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "18",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+                str(raw_mp4),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if res_fb.returncode != 0:
+            store.log(f"[render] 精选集 ffmpeg concat 失败: {res_fb.stderr}")
+            return None
+
+    if raw_mp4.exists() and raw_mp4.stat().st_size > 1024:
+        raw_mp4.replace(out_mp4)
+        comp.output_file = str(out_mp4)
+        comp.last_rendered_hash = comp.render_hash
+        _generate_compilation_cover(
+            manifest=manifest,
+            store=store,
+            cfg=cfg,
+            hero_pool=hero_pool,
+            published_date=published_date,
+            cover_path=cover_jpg,
+            total_duration_s=est_dur_s,
+        )
+        comp.cover_file = str(cover_jpg)
+        comp.cover_hash = exp_cover_hash
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        store.append_receipt(
+            run_id=run_id,
+            stage="render",
+            actor="system",
+            action="render_compilation",
+            elapsed_ms=elapsed_ms,
+            summary=f"切片精选集完成: {out_mp4.name}（包含 {len(enabled_clips)} 支已选切片，插入片头卡片 {len(enabled_clips)} 张，总长 {est_dur_s:.1f}s）",
+            details={
+                "output_file": str(out_mp4),
+                "cover_file": comp.cover_file,
+                "duration_s": round(est_dur_s, 1),
+                "clips_count": len(enabled_clips),
+                "render_hash": comp.render_hash,
+            },
+        )
+        store.save(manifest)
+        store.log(f"[render] 切片精选集渲染完成: {out_mp4.name}")
+        return out_mp4
+    return None
+
+
+
 def _write_markdown_deliverables(manifest: ProjectManifest, output_dir: Path) -> None:
     date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     title = manifest.metadata.original_theme_zh or manifest.metadata.original_title
@@ -2235,17 +2599,31 @@ def run_render_stage(
                 error=err,
             )
 
-    if force:
-        manifest.remix.last_rendered_hash = ""
-    _render_remix(
-        manifest,
-        store,
-        cfg,
-        use_vt,
-        run_id,
-        hero_pool=hero_pool,
-        published_date=published_date,
-    )
+    if manifest.remix.enabled and any(x.enabled for x in manifest.remix.items):
+        if force:
+            manifest.remix.last_rendered_hash = ""
+        _render_remix(
+            manifest,
+            store,
+            cfg,
+            use_vt,
+            run_id,
+            hero_pool=hero_pool,
+            published_date=published_date,
+        )
+
+    if manifest.compilation.enabled and any(c.enabled for c in manifest.clips):
+        if force:
+            manifest.compilation.last_rendered_hash = ""
+        _render_compilation(
+            manifest,
+            store,
+            cfg,
+            use_vt,
+            run_id,
+            hero_pool=hero_pool,
+            published_date=published_date,
+        )
     _write_markdown_deliverables(manifest, output_dir)
 
     store.save(manifest)
@@ -2358,4 +2736,38 @@ def render_single_clip_and_cover(
     clip.cover_hash = exp_cover_hash
     store.save(manifest)
     return True, str(out_mp4)
+
+
+def render_compilation_and_cover(
+    manifest: ProjectManifest,
+    store: ProjectStore,
+    cfg: dict[str, Any] | None = None,
+    *,
+    force: bool = False,
+) -> tuple[bool, str]:
+    """定向渲染切片精选集及其封面，更新 manifest 并返回结果"""
+    if cfg is None:
+        cfg = load_editorial_config()
+    enabled_clips = [c for c in manifest.clips if c.enabled]
+    if not enabled_clips:
+        return False, "未选择任何切片，无法合成精选集"
+
+    manifest.compilation.enabled = True
+    use_vt = _has_videotoolbox()
+    published_date = _ensure_published_date(manifest, store)
+    run_id = f"comp_{uuid.uuid4().hex[:6]}"
+    if force:
+        manifest.compilation.last_rendered_hash = ""
+    res = _render_compilation(
+        manifest=manifest,
+        store=store,
+        cfg=cfg,
+        use_vt=use_vt,
+        run_id=run_id,
+        published_date=published_date,
+    )
+    if res and res.exists():
+        return True, str(res)
+    return False, "精选集渲染失败，请查看日志"
+
 

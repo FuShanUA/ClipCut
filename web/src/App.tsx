@@ -264,7 +264,7 @@ export default function App() {
   }, [stageFilter, showLogs]);
 
   const activeClip: ClipItem | null = useMemo(() => {
-    if (!manifest || !selectedId || selectedId === "REMIX") return null;
+    if (!manifest || !selectedId || selectedId === "REMIX" || selectedId === "COMPILATION") return null;
     return manifest.clips.find((c) => c.clip_id === selectedId) || null;
   }, [manifest, selectedId]);
 
@@ -272,6 +272,9 @@ export default function App() {
     if (selectedId === "REMIX" && manifest) {
       setTitleDraft(manifest.remix.title || "");
       setCoverTitleDraft(manifest.remix.cover_title || "");
+    } else if (selectedId === "COMPILATION" && manifest) {
+      setTitleDraft(manifest.compilation?.title || "切片精选集");
+      setCoverTitleDraft(manifest.compilation?.cover_title || "");
     } else if (activeClip) {
       setTitleDraft(activeClip.title || "");
       setCoverTitleDraft(activeClip.cover_title || "");
@@ -283,6 +286,8 @@ export default function App() {
     activeClip?.cover_title,
     manifest?.remix.title,
     manifest?.remix.cover_title,
+    manifest?.compilation?.title,
+    manifest?.compilation?.cover_title,
   ]);
 
   useEffect(() => {
@@ -423,6 +428,32 @@ export default function App() {
     }
   }
 
+  async function handlePatchCompilation(patch: Record<string, unknown>) {
+    if (!manifest) return;
+    setErrorMsg(null);
+    try {
+      const res = await api.patchCompilation(manifest.project_id, patch);
+      setManifest(res.manifest);
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    }
+  }
+
+  async function handleRenderCompilation() {
+    if (!manifest) return;
+    setErrorMsg(null);
+    setSingleRendering(true);
+    try {
+      const res = await api.renderCompilation(manifest.project_id, true);
+      setManifest(res.manifest);
+      setPlayMode("rendered");
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    } finally {
+      setSingleRendering(false);
+    }
+  }
+
   async function handleSaveCoverTitleAndRefresh() {
     if (!manifest || !selectedId) return;
     setErrorMsg(null);
@@ -433,6 +464,14 @@ export default function App() {
         const res = await api.patchRemix(manifest.project_id, { cover_title: nextText });
         if (!res.manifest.remix.cover_file) {
           const r2 = await api.refreshCover(manifest.project_id, "remix");
+          setManifest(r2.manifest);
+        } else {
+          setManifest(res.manifest);
+        }
+      } else if (selectedId === "COMPILATION") {
+        const res = await api.patchCompilation(manifest.project_id, { cover_title: nextText });
+        if (!res.manifest.compilation?.cover_file) {
+          const r2 = await api.refreshCover(manifest.project_id, "compilation");
           setManifest(r2.manifest);
         } else {
           setManifest(res.manifest);
@@ -547,6 +586,21 @@ export default function App() {
         [manifest.metadata.guest_zh, manifest.metadata.channel_zh, bullets].filter(Boolean).join(" · ")
       );
       setPubTags([...(manifest.primary_topics || []), "AI", "深度访谈"].slice(0, 6).join(", "));
+    } else if (selectedId === "COMPILATION") {
+      const cmp = manifest.compilation;
+      const baseTitle = (titleDraft.trim() || cmp?.title || "切片精选集").trim();
+      const baseCover = (coverTitleDraft.trim() || cmp?.cover_title || baseTitle).trim();
+      setPubTitle(baseTitle);
+      setPubCoverTitle(baseCover);
+      const enabledClips = manifest.clips.filter((c) => c.enabled);
+      const summary = enabledClips
+        .slice(0, 4)
+        .map((c) => c.title)
+        .join(" | ");
+      setPubDesc(
+        `精选 ${enabledClips.length} 支独立切片：\n` + summary
+      );
+      setPubTags([...(manifest.primary_topics || []), "AI", "深度访谈", "合集"].slice(0, 6).join(", "));
     } else if (activeClip) {
       const baseTitle = (titleDraft.trim() || activeClip.title || activeClip.cover_title || "").trim();
       const baseCover = (coverTitleDraft.trim() || activeClip.cover_title || baseTitle).trim();
@@ -590,7 +644,7 @@ export default function App() {
         .map((x) => x.trim())
         .filter(Boolean);
       await api.publishTarget(manifest.project_id, {
-        target: selectedId === "REMIX" ? "remix" : selectedId,
+        target: selectedId === "REMIX" ? "remix" : selectedId === "COMPILATION" ? "compilation" : selectedId,
         platforms: chosen,
         title: pubTitle.trim(),
         cover_title: pubCoverTitle.trim(),
@@ -622,6 +676,12 @@ export default function App() {
       }
       return `/api/projects/${manifest.project_id}/media/source`;
     }
+    if (selectedId === "COMPILATION") {
+      if (playMode === "rendered" && manifest.compilation?.output_file) {
+        return `/api/projects/${manifest.project_id}/media/compilation?v=${manifest.compilation.last_rendered_hash}`;
+      }
+      return `/api/projects/${manifest.project_id}/media/source`;
+    }
     if (playMode === "rendered" && activeClip?.output_file) {
       return `/api/projects/${manifest.project_id}/media/clip?clip_id=${activeClip.clip_id}&v=${activeClip.last_rendered_hash}`;
     }
@@ -638,12 +698,35 @@ export default function App() {
     ) {
       n += 1;
     }
+    if (
+      manifest.compilation?.enabled &&
+      manifest.clips.some((c) => c.enabled) &&
+      manifest.compilation.render_hash !== manifest.compilation.last_rendered_hash
+    ) {
+      n += 1;
+    }
     return n;
   }, [manifest]);
 
   const enabledClipCount = useMemo(() => {
     return manifest ? manifest.clips.filter((c) => c.enabled).length : 0;
   }, [manifest]);
+
+  const compilationTotalS = useMemo(() => {
+    if (!manifest) return 0;
+    const enabledClips = manifest.clips.filter((c) => c.enabled);
+    const cardDur = manifest.compilation?.card_duration_s ?? 1.8;
+    return enabledClips.reduce((acc, c) => acc + (c.end_s - c.start_s), 0) + enabledClips.length * cardDur;
+  }, [manifest]);
+
+  const renderTargetSummary = useMemo(() => {
+    if (!manifest) return "0 项";
+    const parts: string[] = [];
+    if (enabledClipCount > 0) parts.push(`${enabledClipCount}切片`);
+    if (manifest.remix.enabled) parts.push("AI混剪");
+    if (manifest.compilation?.enabled) parts.push("精选集");
+    return parts.join(" + ") || "0 项";
+  }, [manifest, enabledClipCount]);
 
   const remixStats = useMemo(() => {
     if (!manifest) {
@@ -677,6 +760,11 @@ export default function App() {
     if (selectedId === "REMIX" && manifest.remix.cover_file) {
       return `/api/projects/${manifest.project_id}/media/remix_cover?v=${encodeURIComponent(
         manifest.remix.cover_hash || manifest.remix.last_rendered_hash || "1"
+      )}`;
+    }
+    if (selectedId === "COMPILATION" && manifest.compilation?.cover_file) {
+      return `/api/projects/${manifest.project_id}/media/compilation_cover?v=${encodeURIComponent(
+        manifest.compilation.cover_hash || manifest.compilation.last_rendered_hash || "1"
       )}`;
     }
     if (activeClip?.cover_file) {
@@ -731,11 +819,11 @@ export default function App() {
           </button>
           <button
             type="button"
-            disabled={!manifest || jobRunning || enabledClipCount === 0}
+            disabled={!manifest || jobRunning || (enabledClipCount === 0 && !manifest.remix.enabled && !manifest.compilation?.enabled)}
             onClick={() => handleRun(["render"])}
-            title="第二步：仅对当前勾选的切片和精选Remix执行物理渲染"
+            title="第二步：仅对当前勾选的切片、AI混剪与切片精选集执行物理渲染"
           >
-            渲染选中 ({enabledClipCount}/{manifest ? manifest.clips.length : 0})
+            渲染选中 ({renderTargetSummary})
           </button>
           <button
             type="button"
@@ -832,16 +920,23 @@ export default function App() {
               </div>
             </div>
             <div className="pane-body scroller">
-              {/* Remix Card */}
+              {/* 1. Remix Card */}
               <div
-                className={`clip-card ${selectedId === "REMIX" ? "active" : ""}`}
+                className={`clip-card ${selectedId === "REMIX" ? "active" : ""} ${!manifest.remix.enabled ? "disabled" : ""}`}
                 onClick={() => {
                   setSelectedId("REMIX");
                   setPlayMode(manifest.remix.output_file ? "rendered" : "source");
                 }}
               >
                 <div className="clip-card-head">
-                  <span className="tag hot_topic">REMIX</span>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(manifest.remix.enabled)}
+                    aria-label="启用AI混剪"
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => handlePatchRemix({ enabled: e.target.checked })}
+                  />
+                  <span className="tag hot_topic">AI 混剪</span>
                   <div className="clip-title">{manifest.remix.title || "高光混剪集锦"}</div>
                 </div>
                 <div className="clip-meta">
@@ -859,6 +954,45 @@ export default function App() {
                       : "待渲染"}
                   </span>
                   {renderPubBadges(manifest.remix.publish_records)}
+                </div>
+              </div>
+
+              {/* 2. Compilation Card (Selected Clips Sequential with Title Cards) */}
+              <div
+                className={`clip-card ${selectedId === "COMPILATION" ? "active" : ""} ${!manifest.compilation?.enabled ? "disabled" : ""}`}
+                onClick={() => {
+                  setSelectedId("COMPILATION");
+                  setPlayMode(manifest.compilation?.output_file ? "rendered" : "source");
+                }}
+              >
+                <div className="clip-card-head">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(manifest.compilation?.enabled)}
+                    aria-label="启用切片精选集"
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => handlePatchCompilation({ enabled: e.target.checked })}
+                  />
+                  <span className="tag highlight" style={{ background: "rgba(59, 130, 246, 0.18)", color: "#60a5fa", borderColor: "rgba(59, 130, 246, 0.45)" }}>
+                    精选集
+                  </span>
+                  <div className="clip-title">{manifest.compilation?.title || "切片精选集"}</div>
+                </div>
+                <div className="clip-meta">
+                  <span>顺序串联 {enabledClipCount} 个切片</span>
+                  <span className="mono">{fmtTime(compilationTotalS)}</span>
+                  <span
+                    className={`tag ${
+                      manifest.compilation?.output_file && manifest.compilation.render_hash === manifest.compilation.last_rendered_hash
+                        ? "cached"
+                        : "dirty"
+                    }`}
+                  >
+                    {manifest.compilation?.output_file && manifest.compilation.render_hash === manifest.compilation.last_rendered_hash
+                      ? "已渲染"
+                      : "待渲染"}
+                  </span>
+                  {renderPubBadges(manifest.compilation?.publish_records)}
                 </div>
               </div>
 
@@ -954,7 +1088,13 @@ export default function App() {
                   <button
                     type="button"
                     className={`sm ${playMode === "rendered" ? "primary" : ""}`}
-                    disabled={selectedId === "REMIX" ? !manifest.remix.output_file : !activeClip?.output_file}
+                    disabled={
+                      selectedId === "REMIX"
+                        ? !manifest.remix.output_file
+                        : selectedId === "COMPILATION"
+                        ? !manifest.compilation?.output_file
+                        : !activeClip?.output_file
+                    }
                     onClick={() => setPlayMode("rendered")}
                   >
                     播成品
@@ -1161,6 +1301,215 @@ export default function App() {
                         </div>
                       </div>
                     ))}
+                </div>
+              </>
+            ) : selectedId === "COMPILATION" ? (
+              <>
+                {/* Unified Compilation Cover Title & Publish Card */}
+                <div className="clip-inspector-bar" style={{ flexDirection: "row", gap: 14, alignItems: "center" }}>
+                  <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 7 }}>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <span style={{ color: "var(--text-2)", fontSize: 12, width: 56 }}>精选集名</span>
+                      <input
+                        type="text"
+                        style={{ flex: 1, fontWeight: 600 }}
+                        value={titleDraft}
+                        onChange={(e) => setTitleDraft(e.target.value)}
+                        onBlur={() =>
+                          titleDraft.trim() &&
+                          titleDraft !== (manifest.compilation?.title || "切片精选集") &&
+                          handlePatchCompilation({ title: titleDraft.trim() })
+                        }
+                      />
+                    </div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <span style={{ color: "var(--text-2)", fontSize: 12, width: 56 }}>封面标题</span>
+                      <input
+                        type="text"
+                        style={{ flex: 1 }}
+                        placeholder={`留空则跟随精选集名（${titleDraft || manifest.compilation?.title || "切片精选集"}）`}
+                        value={coverTitleDraft}
+                        onChange={(e) => setCoverTitleDraft(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && handleSaveCoverTitleAndRefresh()}
+                      />
+                      <button
+                        type="button"
+                        className="sm"
+                        disabled={coverRefreshing || jobRunning || enabledClipCount === 0}
+                        onClick={handleSaveCoverTitleAndRefresh}
+                      >
+                        {coverRefreshing ? "生成中..." : "更新封面"}
+                      </button>
+                    </div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                      <button
+                        type="button"
+                        className="sm"
+                        disabled={singleRendering || jobRunning || enabledClipCount === 0}
+                        onClick={handleRenderCompilation}
+                        title="按顺序串联所有勾选切片，并在每个切片前自动插入磨砂玻璃章节片头卡"
+                      >
+                        {singleRendering ? "渲染中..." : manifest.compilation?.output_file ? "重渲精选集" : "渲染精选集"}
+                      </button>
+                      <button
+                        type="button"
+                        className="sm primary"
+                        disabled={!manifest.compilation?.output_file || jobRunning}
+                        onClick={openPublishModal}
+                      >
+                        发布到 视频号 / B站 / 小红书…
+                      </button>
+                      {renderPubBadges(manifest.compilation?.publish_records)}
+                    </div>
+                  </div>
+                  {currentCoverUrl && (
+                    <a
+                      href={currentCoverUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      title="点击查看高清封面"
+                      style={{ flexShrink: 0, display: "block" }}
+                    >
+                      <img
+                        src={currentCoverUrl}
+                        alt="精选集封面"
+                        style={{
+                          width: 160,
+                          height: 90,
+                          objectFit: "cover",
+                          borderRadius: 6,
+                          border: "1px solid var(--border)",
+                          display: "block",
+                        }}
+                      />
+                    </a>
+                  )}
+                </div>
+
+                {/* Compilation Title Card Settings */}
+                <details className="fold" open>
+                  <summary>
+                    ▸ 精选集串联与片头卡设置（顺序串联 {enabledClipCount} 个启用切片 · 预估总长 {fmtTime(compilationTotalS)}）
+                  </summary>
+                  <div className="fold-body" style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" }}>
+                    <label>
+                      章节片头卡时长：
+                      <select
+                        value={String(manifest.compilation?.card_duration_s ?? 1.8)}
+                        onChange={(e) => handlePatchCompilation({ card_duration_s: Number(e.target.value) })}
+                        style={{ marginLeft: 4 }}
+                      >
+                        <option value="1.2">1.2s</option>
+                        <option value="1.8">1.8s</option>
+                        <option value="2.5">2.5s</option>
+                      </select>
+                    </label>
+                    <span style={{ color: "var(--text-2)", fontSize: 12 }}>
+                      每个启用切片前自动插入磨砂玻璃章节片头卡（Part 01, Part 02...），按时间顺序无缝串联。
+                    </span>
+                  </div>
+                </details>
+
+                {/* Compilation Sequential Clips List */}
+                <div className="subtitle-list scroller">
+                  {enabledClipCount === 0 ? (
+                    <div className="empty-state" style={{ padding: 24 }}>
+                      当前未勾选任何切片。请在左侧列表勾选切片，或点击「策划Top5」后返回此处渲染精选集。
+                    </div>
+                  ) : (
+                    manifest.clips
+                      .filter((c) => c.enabled)
+                      .map((c, idx) => {
+                        const partNum = String(idx + 1).padStart(2, "0");
+                        const cardSec = (manifest.compilation?.card_duration_s ?? 1.8).toFixed(1);
+                        const durSec = Math.max(0, c.end_s - c.start_s);
+                        return (
+                          <div
+                            key={c.clip_id}
+                            className="remix-row"
+                            style={{ alignItems: "center", cursor: "pointer" }}
+                            onClick={() => {
+                              setPlayMode("source");
+                              seekTo(c.start_s);
+                            }}
+                          >
+                            <span
+                              className="mono"
+                              style={{
+                                fontSize: 13,
+                                fontWeight: 700,
+                                color: "#60a5fa",
+                                minWidth: 28,
+                                textAlign: "center",
+                              }}
+                            >
+                              {partNum}
+                            </span>
+                            <div style={{ minWidth: 0 }}>
+                              <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                                <span
+                                  className="tag highlight"
+                                  style={{
+                                    background: "rgba(59, 130, 246, 0.18)",
+                                    color: "#60a5fa",
+                                    borderColor: "rgba(59, 130, 246, 0.45)",
+                                  }}
+                                >
+                                  片头卡 Part {partNum} ({cardSec}s)
+                                </span>
+                                <span style={{ color: "var(--text-2)", fontSize: 12 }}>
+                                  {c.cover_title || c.title}
+                                </span>
+                              </div>
+                              <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 6, flexWrap: "wrap" }}>
+                                <span style={{ fontWeight: 600 }}>
+                                  #{String(c.index).padStart(2, "0")} {c.title}
+                                </span>
+                                <span className="utt-time">
+                                  {fmtTime(c.start_s)}–{fmtTime(c.end_s)} ({fmtTime(durSec)})
+                                </span>
+                                {c.curation_tag && (
+                                  <span
+                                    className="tag highlight"
+                                    style={{
+                                      background: "rgba(245, 158, 11, 0.18)",
+                                      color: "#f59e0b",
+                                      borderColor: "rgba(245, 158, 11, 0.45)",
+                                    }}
+                                  >
+                                    {c.curation_tag}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            <div style={{ display: "flex", gap: 6 }}>
+                              <button
+                                type="button"
+                                className="sm"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSelectedId(c.clip_id);
+                                  setPlayMode("source");
+                                }}
+                              >
+                                编辑切片
+                              </button>
+                              <button
+                                type="button"
+                                className="sm"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handlePatchClip(c.clip_id, { enabled: false });
+                                }}
+                                title="取消勾选（移出精选集）"
+                              >
+                                移出
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                  )}
                 </div>
               </>
             ) : activeClip ? (

@@ -197,6 +197,29 @@ def compute_remix_render_hash(manifest: ProjectManifest) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
+def compute_compilation_render_hash(manifest: ProjectManifest) -> str:
+    comp = manifest.compilation
+    payload = {
+        "video": manifest.source.render_video,
+        "title": comp.title,
+        "cover_title": comp.cover_title,
+        "card_duration_s": comp.card_duration_s,
+        "card_fade_s": comp.card_fade_s,
+        "clips": [
+            {
+                "id": c.clip_id,
+                "title": c.title,
+                "cover_title": c.cover_title,
+                "start_s": round(c.start_s, 3),
+                "end_s": round(c.end_s, 3),
+            }
+            for c in manifest.clips
+            if c.enabled
+        ],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
 def _extract_verify_preview(video_path: Path, start_s: float, end_s: float, out_path: Path) -> bool:
     """Cut a tiny 480p 2fps + 64k mono clip (capped at 75s around peak) for cheap multimodal verification."""
     out_path.parent.mkdir(parents=True, exist_ok=True)

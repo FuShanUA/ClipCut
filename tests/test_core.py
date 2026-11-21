@@ -908,6 +908,55 @@ def test_select_curated_top_clips_covers_editorial_pillars(tmp_path: Path):
     assert "硬核实操" in tags["c05"]
 
 
+def test_compilation_render_hash_tracks_enabled_clips_and_cards(tmp_path: Path):
+    from clipcut.models import ClipItem, CompilationConfig, MediaSource, ProjectManifest, VideoMetadata
+    from clipcut.pipeline.verify_and_plan import compute_compilation_render_hash
+
+    manifest = ProjectManifest(
+        project_id="comp-hash-test",
+        source=MediaSource(
+            work_dir=str(tmp_path),
+            render_video="v.mp4",
+            analysis_video="v.mp4",
+            output_dir=str(tmp_path / "out"),
+            duration_s=100.0,
+            width=1920,
+            height=1080,
+            fps=30.0,
+        ),
+        metadata=VideoMetadata(
+            original_title="Test",
+            description="",
+            channel="",
+            guest_zh="",
+            channel_zh="",
+            original_theme_zh="",
+            metadata_source="manual",
+        ),
+        clips=[
+            ClipItem(clip_id="c1", index=1, enabled=True, title="Part A", start_utt=0, end_utt=1, start_s=0.0, end_s=10.0),
+            ClipItem(clip_id="c2", index=2, enabled=True, title="Part B", start_utt=1, end_utt=2, start_s=10.0, end_s=20.0),
+        ],
+        compilation=CompilationConfig(enabled=True, title="精选集", card_duration_s=1.8),
+    )
+
+    h1 = compute_compilation_render_hash(manifest)
+    manifest.clips[1].enabled = False
+    h2 = compute_compilation_render_hash(manifest)
+    assert h1 != h2
+
+    manifest.clips[1].enabled = True
+    manifest.compilation.card_duration_s = 2.5
+    h3 = compute_compilation_render_hash(manifest)
+    assert h3 != h1
+
+    manifest.compilation.card_duration_s = 1.8
+    manifest.clips[0].title = "Part A Edited"
+    h4 = compute_compilation_render_hash(manifest)
+    assert h4 != h1
+
+
+
 
 
 

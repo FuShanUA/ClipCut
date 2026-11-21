@@ -87,6 +87,20 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
+  patchCompilation: (projectId: string, patch: Record<string, unknown>) =>
+    req<{ manifest: ProjectManifest }>(`/api/projects/${projectId}/compilation`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+
+  renderCompilation: (projectId: string, force = false) =>
+    req<{ ok: boolean; output_file: string; manifest: ProjectManifest }>(
+      `/api/projects/${projectId}/compilation/render?force=${force}`,
+      {
+        method: "POST",
+      }
+    ),
+
   refreshCover: (projectId: string, target: string) =>
     req<{ refreshed: string; manifest: ProjectManifest }>(`/api/projects/${projectId}/covers/refresh`, {
       method: "POST",
