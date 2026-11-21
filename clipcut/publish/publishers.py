@@ -329,6 +329,8 @@ def _parse_publish_progress(
             )
         ):
             return max(floor, 85.0), "等封面", clean.lstrip("> ")
+        if "已有草稿缺失封面" in clean or "开始自动补修" in clean:
+            return max(floor, 88.0), "补封面", clean.lstrip("> ")
         if "封面与分享卡片生成完成" in clean or "封面编辑器已可编辑" in clean:
             return max(floor, 88.0), "设封面", clean.lstrip("> ")
         if "封面未生效，关闭弹层等待" in clean:
@@ -754,6 +756,11 @@ def publish_to_platforms(
                 summary_msg = f"{label}{'已发布' if is_public else '已存草稿/仅自己可见'}" + (
                     f" ({bv_m.group(1)})" if bv_m else ""
                 )
+                if plat == "wechat" and (
+                    "分享卡片可能仍是微信自动封面" in combined
+                    or "分享卡片封面未确认生效" in combined
+                ):
+                    summary_msg += "（⚠️ 分享卡片封面未确认）"
                 _update_target_record(
                     store,
                     target,

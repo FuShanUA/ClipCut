@@ -8,8 +8,10 @@ import numpy as np
 from clipcut.adapters.ingest import (
     extract_published_date,
     extract_youtube_id,
+    resolve_work_dir,
     parse_chapters_from_description,
     parse_subtitle_file,
+    sha256_file,
     scan_input_path,
 )
 from clipcut.assets_gen import ensure_default_assets
@@ -22,9 +24,11 @@ from clipcut.models import (
     ProjectManifest,
     RemixConfig,
     RemixItem,
+    StageStatus,
     TopicMapItem,
     Utterance,
     VideoMetadata,
+    utc_now_iso,
 )
 from clipcut.pipeline.analyze import _is_primary_topic_match
 from clipcut.pipeline.verify_and_plan import (
@@ -76,6 +80,68 @@ def test_editorial_config_loads():
     assert cfg["clip_duration"]["max_seconds"] == 300
     assert cfg["hot_topics"]["primary_topic_dedup"] is True
     assert len(cfg["hot_topics"]["categories"]) >= 5
+
+
+def test_find_existing_plan_reuses_only_completed_matching_media(tmp_path: Path):
+    from clipcut.pipeline.orchestrator import find_existing_plan
+
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    subtitle = tmp_path / "video.bi.srt"
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:02,000\n测试字幕\n",
+        encoding="utf-8",
+    )
+    work_dir = resolve_work_dir(video)
+    manifest = ProjectManifest(
+        project_id="reuse-test",
+        source=MediaSource(
+            render_video=str(video),
+            analysis_video=str(video),
+            subtitle_path=str(subtitle),
+            subtitle_sha256="",
+            work_dir=str(work_dir),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        metadata=VideoMetadata(original_title="Test Video", metadata_source="manual"),
+        topic_map=[
+            TopicMapItem(
+                topic_id="T01",
+                start_utt=0,
+                end_utt=0,
+                title="核心话题",
+                summary="完整论证",
+            )
+        ],
+        clips=[
+            ClipItem(
+                clip_id="clip_01",
+                index=1,
+                title="核心切片",
+                start_utt=0,
+                end_utt=0,
+                start_s=0.0,
+                end_s=2.0,
+            )
+        ],
+    )
+    for stage_name in ("signals", "verify_and_plan"):
+        manifest.stages[stage_name] = StageStatus(status="completed")
+    manifest.stages["analyze"] = StageStatus(
+        status="completed",
+        finished_at=utc_now_iso(),
+    )
+
+    store = ProjectStore(work_dir)
+    store.save(manifest)
+    assert find_existing_plan(video, subtitle_path=subtitle, expected_title="Test Video") is not None
+    assert ProjectStore(work_dir).load().source.subtitle_sha256 == sha256_file(subtitle)
+
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:02,000\n变更后的字幕\n",
+        encoding="utf-8",
+    )
+    assert find_existing_plan(video, subtitle_path=subtitle, expected_title="Test Video") is None
 
 
 def test_default_assets_generated():
@@ -1567,6 +1633,59 @@ def test_plan_remix_user_filtered_excludes_pool_and_preserves_custom_order(tmp_p
     assert [it.source_clip_id for it in planned.remix.items] == ["c2", "c1"]
     assert [it.order for it in planned.remix.items] == [1, 2]
     assert [it.remix_id for it in planned.remix.items] == ["rmx_01", "rmx_02"]
+
+
+def test_wechat_publish_records_share_cover_unverified_warning(tmp_path, monkeypatch):
+    from clipcut.publish.publishers import publish_to_platforms
+    from clipcut.receipts import ProjectStore
+
+    store = ProjectStore(tmp_path / "work")
+    vid = tmp_path / "clips" / "c1.mp4"
+    vid.parent.mkdir(parents=True, exist_ok=True)
+    vid.write_bytes(b"dummy")
+    wx_script = tmp_path / "wechat_upload.py"
+    wx_script.write_text("#!/usr/bin/env python3")
+
+    m = ProjectManifest(
+        project_id="test-wechat-share-warning",
+        source=MediaSource(
+            analysis_video=str(vid),
+            render_video=str(vid),
+            duration_s=60.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        clips=[
+            ClipItem(clip_id="c1", index=1, enabled=True, title="切片1", start_utt=0, end_utt=1, output_file=str(vid), start_s=0.0, end_s=10.0),
+        ],
+    )
+    store.save(m)
+
+    def mock_run_proc(cmd, env, timeout_s, on_line):
+        on_line(">>> ⚠️ 警告：分享卡片封面未确认生效，请用 --repair-covers 补修或目视确认")
+        on_line(">>> 存草稿完成！")
+        return 0, [
+            ">>> ⚠️ 警告：分享卡片封面未确认生效，请用 --repair-covers 补修或目视确认",
+            ">>> 存草稿完成！",
+        ]
+
+    monkeypatch.setattr("clipcut.publish.publishers._run_publish_process", mock_run_proc)
+    monkeypatch.setattr("clipcut.publish.publishers.sync_platform_covers_for_target", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "clipcut.publish.publishers._get_paths",
+        lambda: {"wechat": {"label": "微信视频号", "python": sys.executable, "script": wx_script}},
+    )
+
+    updated = publish_to_platforms(
+        store=store,
+        target="c1",
+        platforms=["wechat"],
+        is_public=False,
+    )
+    rec = updated.clips[0].publish_records[0]
+    assert rec.status == "draft"
+    assert "分享卡片封面未确认" in rec.message
+
 
 
 
