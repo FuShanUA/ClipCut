@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import codecs
+import concurrent.futures
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..config import load_editorial_config, load_local_config
 from ..models import ProjectManifest, PublishRecord, utc_now_iso
@@ -21,6 +25,7 @@ PLATFORM_LABELS = {
 }
 
 _UNCONFIGURED_HINT = "未配置本地上传脚本（请在 config/local.yaml 或环境变量中配置）"
+_ORIG_SUBPROCESS_RUN = subprocess.run
 
 
 def _opt_path(raw: Any) -> Path | None:
@@ -239,6 +244,225 @@ def _upsert_record(records: list[PublishRecord], rec: PublishRecord) -> None:
     records.append(rec)
 
 
+def _update_target_record(store: ProjectStore, target: str, record: PublishRecord) -> None:
+    """Thread-safely update a platform's PublishRecord inside project.json."""
+    def _mutate(m: ProjectManifest) -> None:
+        _, _, _, _, _, rec_list = _default_target_metadata(m, target)
+        _upsert_record(rec_list, record)
+
+    store.update_manifest(_mutate)
+
+
+def _parse_publish_progress(
+    plat: str,
+    line: str,
+    prev_pct: float | None,
+    prev_stage: str,
+) -> tuple[float | None, str, str] | None:
+    """Parse platform uploader stdout/stderr line into (pct, short_stage, detail_message)."""
+    clean = line.strip()
+    if not clean:
+        return None
+    floor = prev_pct or 0.0
+
+    if plat == "bilibili":
+        m = re.search(r"(?:上传进度|Progress):\s*([\d.]+)%", clean)
+        if m:
+            raw = max(0.0, min(100.0, float(m.group(1))))
+            if raw >= 99.0 and prev_stage in ("提交分P", "处理封面", "传封面", "封面完成", "提交发布"):
+                return None
+            return min(95.0, round(raw, 1)), "上传中", f"B站视频上传中 {raw:.1f}%"
+        if "分块传输完成" in clean or "提交分P元数据" in clean:
+            return max(floor, 95.0), "提交分P", "分块传输完成，提交分P元数据..."
+        if "分块上传完成" in clean or "进入封面" in clean:
+            return max(floor, 96.0), "处理封面", "分块上传完成，准备上传封面..."
+        if "正在上传B站封面" in clean:
+            return max(floor, 97.0), "传封面", "正在上传B站封面..."
+        if "B站封面上传完成" in clean:
+            return max(floor, 98.0), "封面完成", "B站封面上传完成"
+        if "正在提交B站发布请求" in clean or "B站发布请求已返回" in clean:
+            return max(floor, 99.0), "提交发布", clean.lstrip("> ")
+        if any(k in clean for k in ("线路探测", "封面已选择", "获取合集", "获取到")):
+            return max(floor, 5.0), "准备中", clean.lstrip("> ")
+        return None
+
+    if plat == "wechat":
+        if "另一个微信上传/登录进程正在使用浏览器 profile" in clean:
+            return max(floor, 2.0), "排队锁", "另一个微信上传进程占用浏览器 profile，排队等待中..."
+        m_wait = re.search(r"仍在等待微信浏览器 profile 锁[（(](\d+)\s*秒", clean)
+        if m_wait:
+            secs = m_wait.group(1)
+            return max(floor, 2.0), f"排队锁{secs}s", f"排队等待微信浏览器 profile 锁（已等 {secs} 秒）"
+        if "已获得微信浏览器 profile 锁" in clean:
+            return max(floor, 5.0), "启浏览器", "已获得浏览器锁，启动微信创作者页面..."
+        m_open = re.search(r"打开发布页面\s*\(尝试\s*(\d+)/(\d+)\)", clean)
+        if m_open:
+            attempt = int(m_open.group(1))
+            stage = "打开页面" if attempt == 1 else f"重试{m_open.group(1)}/{m_open.group(2)}"
+            return (10.0 if attempt == 1 else max(floor, 10.0)), stage, clean.lstrip("> ")
+        if "等待页面加载" in clean:
+            return max(floor, 12.0), "加载页面", "等待视频号发布页加载..."
+        if "选择视频文件" in clean or "视频文件已选择" in clean:
+            return max(floor, 15.0), "开始上传", clean.lstrip("> ")
+        m_pct = re.search(r">>>\s*([^:\r\n]+?):\s*(\d+(?:\.\d+)?)%", clean)
+        if m_pct:
+            raw_stage = m_pct.group(1).strip()
+            raw = max(0.0, min(100.0, float(m_pct.group(2))))
+            if "转码" in raw_stage or "处理" in raw_stage:
+                pct = round(75.0 + raw * 0.12, 1)
+                return max(floor, pct), "转码中", f"微信视频{raw_stage} {raw:.0f}%"
+            pct = round(15.0 + raw * 0.60, 1)
+            return max(floor, pct), "上传中", f"微信视频{raw_stage} {raw:.0f}%"
+        if "上传完成！" in clean or "上传应已完成" in clean:
+            return max(floor, 76.0), "填信息", "视频上传完成，正在填写标题与描述..."
+        if any(k in clean for k in ("已填写标题", "已填写描述")) or re.search(r"已添加\s*\d+\s*个标签", clean):
+            return max(floor, 80.0), "填信息", clean.lstrip("> ")
+        if "微信位置、视频标注、原创标志均已设置" in clean:
+            return max(floor, 83.0), "发布设置", clean.lstrip("> ")
+        if any(
+            k in clean
+            for k in (
+                "等待封面与分享卡片生成",
+                "待生成资源",
+                "封面编辑器仍在处理",
+                "等待封面编辑器",
+            )
+        ):
+            return max(floor, 85.0), "等封面", clean.lstrip("> ")
+        if "封面与分享卡片生成完成" in clean or "封面编辑器已可编辑" in clean:
+            return max(floor, 88.0), "设封面", clean.lstrip("> ")
+        if "封面未生效，关闭弹层等待" in clean:
+            return max(floor, 89.0), "重试封面", clean.lstrip("> ")
+        if "横竖双封面均已回读确认" in clean:
+            return max(floor, 94.0), "封面完成", clean.lstrip("> ")
+        if any(k in clean for k in ("点击存草稿按钮", "点击发表按钮", "点击发布按钮")):
+            return max(floor, 96.0), "提交中", clean.lstrip("> ")
+        if "等待发布完成" in clean or "正在到草稿箱核验" in clean:
+            return max(floor, 98.0), "核验中", clean.lstrip("> ")
+        if re.search(r"尝试\s*\d+\s*失败", clean):
+            return prev_pct if prev_pct is not None else 10.0, "重试中", clean.lstrip("> ")
+        return None
+
+    if plat == "xiaohongshu":
+        if "正在启动" in clean or "成功接管真实 Chrome" in clean:
+            return max(floor, 8.0), "启浏览器", clean
+        if "正在打开小红书视频发布页面" in clean:
+            return max(floor, 15.0), "打开页面", clean
+        if "正在上传视频文件" in clean or "视频已选择" in clean:
+            return max(floor, 25.0), "上传视频", clean
+        if "填写标题" in clean:
+            return max(floor, 35.0), "填标题", clean
+        if "填写描述" in clean or "描述填写成功" in clean:
+            return max(floor, 42.0), "填描述", clean
+        if "正在等待视频上传与分析完成" in clean:
+            return max(floor, 50.0), "上传分析", clean
+        m_wait = re.search(r"已等待\s*(\d+)\s*秒", clean)
+        if m_wait:
+            secs = int(m_wait.group(1))
+            pct = min(82.0, round(50.0 + secs * 0.4, 1))
+            return max(floor, pct), f"分析{secs}s", f"小红书视频上传与分析中（已等待 {secs} 秒）"
+        if "视频上传成功" in clean:
+            return max(floor, 85.0), "上传完成", clean
+        if "正在上传配套封面" in clean:
+            return max(floor, 88.0), "传封面", clean
+        if "封面上传成功" in clean:
+            return max(floor, 92.0), "封面完成", clean
+        if "正在设置加入合集" in clean or "正在设置【原创声明】" in clean:
+            return max(floor, 94.0), "发布设置", clean
+        if "正在提交【公开正式发布】" in clean or "正在保存至【草稿箱】" in clean:
+            return max(floor, 97.0), "提交中", clean
+        if "Keeping browser open" in clean:
+            return max(floor, 99.0), "收尾中", "小红书已提交，等待浏览器收尾..."
+        return None
+
+    return None
+
+
+def _run_publish_process(
+    cmd: list[str],
+    env: dict[str, str],
+    timeout_s: float,
+    on_line: Callable[[str], None],
+) -> tuple[int, list[str]]:
+    """Run uploader subprocess while streaming both CR (\r) and LF (\n) progress lines."""
+    if subprocess.run is not _ORIG_SUBPROCESS_RUN:
+        res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout_s)
+        combined = f"{res.stdout or ''}\n{res.stderr or ''}"
+        out_lines: list[str] = []
+        for seg in re.split(r"[\r\n]", combined):
+            s = seg.strip()
+            if s:
+                out_lines.append(s)
+                on_line(s)
+        return res.returncode, out_lines
+
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+    assert proc.stdout is not None
+    fd = proc.stdout.fileno()
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    buf = ""
+    lines: list[str] = []
+    start = time.monotonic()
+
+    def _emit_segment(seg: str) -> None:
+        s = seg.strip()
+        if s:
+            lines.append(s)
+            on_line(s)
+
+    try:
+        while True:
+            elapsed = time.monotonic() - start
+            remaining = timeout_s - elapsed
+            if remaining <= 0:
+                proc.kill()
+                proc.wait(timeout=5)
+                raise subprocess.TimeoutExpired(cmd, timeout_s)
+
+            ready, _, _ = select.select([fd], [], [], min(1.0, remaining))
+            if ready:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    buf += decoder.decode(b"", final=True)
+                    if buf:
+                        for seg in re.split(r"[\r\n]", buf):
+                            _emit_segment(seg)
+                        buf = ""
+                    break
+                buf += decoder.decode(chunk)
+                if "\r" in buf or "\n" in buf:
+                    parts = re.split(r"[\r\n]", buf)
+                    for seg in parts[:-1]:
+                        _emit_segment(seg)
+                    buf = parts[-1]
+            elif proc.poll() is not None:
+                # Drain any buffered bytes after child exits
+                while True:
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        break
+                    buf += decoder.decode(chunk)
+                buf += decoder.decode(b"", final=True)
+                if buf:
+                    for seg in re.split(r"[\r\n]", buf):
+                        _emit_segment(seg)
+                    buf = ""
+                break
+        rc = proc.wait(timeout=10)
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+    return rc, lines
+
+
 def _default_target_metadata(manifest: ProjectManifest, target: str) -> tuple[Path | None, str, str, str, list[str], list[PublishRecord]]:
     if target == "remix":
         rmx = manifest.remix
@@ -329,42 +553,66 @@ def publish_to_platforms(
 
     paths = _get_paths()
     caff_prefix = ["/usr/bin/caffeinate", "-i"] if Path("/usr/bin/caffeinate").exists() else []
+    selected_platforms = list(dict.fromkeys(p for p in platforms if p in paths))
+    if not selected_platforms:
+        return store.load()
 
-    for plat in platforms:
-        if plat not in paths:
-            continue
+    started_at = utc_now_iso()
+
+    def _init_running_records(m: ProjectManifest) -> None:
+        _, _, _, _, _, target_recs = _default_target_metadata(m, target)
+        for plat in selected_platforms:
+            label = PLATFORM_LABELS.get(plat, plat)
+            _upsert_record(
+                target_recs,
+                PublishRecord(
+                    platform=plat,  # type: ignore[arg-type]
+                    status="running",
+                    mode=mode_str,  # type: ignore[arg-type]
+                    title=final_title,
+                    started_at=started_at,
+                    updated_at=started_at,
+                    progress_pct=0.0,
+                    progress_stage="准备中",
+                    message=f"正在准备上传到{label}...",
+                ),
+            )
+
+    store.update_manifest(_init_running_records)
+    store.log(
+        f"[publish] 并行发布 {target} -> {', '.join(PLATFORM_LABELS.get(p, p) for p in selected_platforms)} ({vpath.name})"
+    )
+
+    try:
+        publish_timeout_s = float(os.environ.get("CLIPCUT_PUBLISH_TIMEOUT_SECONDS", "1800"))
+    except ValueError:
+        publish_timeout_s = 1800.0
+
+    def _publish_one_platform(plat: str) -> None:
         pinfo = paths[plat]
         py = pinfo.get("python")
         raw_script = pinfo.get("script")
         script = Path(raw_script) if raw_script else None
         label = PLATFORM_LABELS.get(plat, plat)
 
-        _upsert_record(
-            rec_list,
-            PublishRecord(
-                platform=plat,  # type: ignore[arg-type]
-                status="running",
-                mode=mode_str,  # type: ignore[arg-type]
-                title=final_title,
-                message=f"正在上传到{label}...",
-            ),
-        )
-        store.save(manifest)
-
         if not py or script is None or not script.is_file():
             err_msg = f"缺少{label}上传脚本或 Python 环境 ({script or '未在 config/local.yaml 配置'})"
-            _upsert_record(
-                rec_list,
+            _update_target_record(
+                store,
+                target,
                 PublishRecord(
                     platform=plat,  # type: ignore[arg-type]
                     status="error",
                     mode=mode_str,  # type: ignore[arg-type]
                     title=final_title,
+                    started_at=started_at,
+                    updated_at=utc_now_iso(),
+                    progress_pct=None,
+                    progress_stage="",
                     error=err_msg,
                     message=err_msg,
                 ),
             )
-            store.save(manifest)
             store.append_receipt(
                 run_id=rid,
                 stage="publish",
@@ -373,7 +621,7 @@ def publish_to_platforms(
                 summary=err_msg,
                 error=err_msg,
             )
-            continue
+            return
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
@@ -433,29 +681,87 @@ def publish_to_platforms(
                 "1" if is_public else "0",
             ]
 
-        store.log(f"[publish] 开始发布 {target} -> {label} ({vpath.name})")
+        store.log(f"[publish/{plat}] 开始发布 {target} -> {label} ({vpath.name})")
+        state: dict[str, Any] = {"pct": 0.0, "stage": "准备中", "last_save": 0.0}
+
+        def _on_line(line: str) -> None:
+            parsed = _parse_publish_progress(plat, line, state["pct"], state["stage"])
+            important = any(
+                k in line
+                for k in ("错误", "失败", "异常", "超时", "❌", "⚠️", "BV", "profile", "锁", "重试")
+            )
+            if parsed is None:
+                if important:
+                    store.log(f"[publish/{plat}] {line[:220]}")
+                return
+
+            pct, stage, detail_msg = parsed
+            stage_changed = stage != state["stage"]
+            prev_pct = state["pct"]
+            pct_moved = pct is not None and (prev_pct is None or pct != prev_pct)
+            now = time.monotonic()
+
+            if stage_changed or important:
+                pct_tag = f"{pct:.0f}% " if pct is not None else ""
+                store.log(f"[publish/{plat}] {pct_tag}[{stage}] {detail_msg[:180]}")
+
+            should_persist = stage_changed or (
+                pct_moved
+                and (
+                    (now - state["last_save"]) >= 0.8
+                    or prev_pct is None
+                    or (pct is not None and (pct - prev_pct) >= 5.0)
+                )
+            )
+            if not should_persist:
+                return
+
+            state["pct"] = pct
+            state["stage"] = stage
+            state["last_save"] = now
+            _update_target_record(
+                store,
+                target,
+                PublishRecord(
+                    platform=plat,  # type: ignore[arg-type]
+                    status="running",
+                    mode=mode_str,  # type: ignore[arg-type]
+                    title=final_title,
+                    started_at=started_at,
+                    updated_at=utc_now_iso(),
+                    progress_pct=pct,
+                    progress_stage=stage,
+                    message=detail_msg[:200],
+                ),
+            )
+
         try:
-            res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=1800)
-            combined = f"{res.stdout or ''}\n{res.stderr or ''}".strip()
-            tail = combined.splitlines()[-8:] if combined else []
-            if res.returncode == 0:
+            rc, out_lines = _run_publish_process(cmd, env, publish_timeout_s, _on_line)
+            combined = "\n".join(out_lines).strip()
+            tail = out_lines[-8:] if out_lines else []
+            if rc == 0:
                 bv_m = re.search(r"(BV[0-9A-Za-z]{10})", combined) if plat == "bilibili" else None
                 url_id = f"https://www.bilibili.com/video/{bv_m.group(1)}" if bv_m else ""
                 done_status = "published" if is_public else "draft"
-                summary_msg = f"{label}{'已发布' if is_public else '已存草稿/仅自己可见'}" + (f" ({bv_m.group(1)})" if bv_m else "")
-                _upsert_record(
-                    rec_list,
+                summary_msg = f"{label}{'已发布' if is_public else '已存草稿/仅自己可见'}" + (
+                    f" ({bv_m.group(1)})" if bv_m else ""
+                )
+                _update_target_record(
+                    store,
+                    target,
                     PublishRecord(
                         platform=plat,  # type: ignore[arg-type]
                         status=done_status,  # type: ignore[arg-type]
                         mode=mode_str,  # type: ignore[arg-type]
                         title=final_title,
                         url_or_id=url_id,
+                        started_at=started_at,
                         updated_at=utc_now_iso(),
+                        progress_pct=100.0,
+                        progress_stage="完成",
                         message=summary_msg,
                     ),
                 )
-                store.save(manifest)
                 store.append_receipt(
                     run_id=rid,
                     stage="publish",
@@ -472,20 +778,23 @@ def publish_to_platforms(
                     },
                 )
             else:
-                err_tail = " | ".join(tail[-3:]) or f"退出码 {res.returncode}"
-                _upsert_record(
-                    rec_list,
+                err_tail = " | ".join(tail[-3:]) or f"退出码 {rc}"
+                _update_target_record(
+                    store,
+                    target,
                     PublishRecord(
                         platform=plat,  # type: ignore[arg-type]
                         status="error",
                         mode=mode_str,  # type: ignore[arg-type]
                         title=final_title,
+                        started_at=started_at,
                         updated_at=utc_now_iso(),
+                        progress_pct=None,
+                        progress_stage="",
                         message=f"{label}发布失败",
                         error=err_tail[:300],
                     ),
                 )
-                store.save(manifest)
                 store.append_receipt(
                     run_id=rid,
                     stage="publish",
@@ -495,19 +804,22 @@ def publish_to_platforms(
                     error=err_tail[:400],
                 )
         except Exception as exc:
-            _upsert_record(
-                rec_list,
+            _update_target_record(
+                store,
+                target,
                 PublishRecord(
                     platform=plat,  # type: ignore[arg-type]
                     status="error",
                     mode=mode_str,  # type: ignore[arg-type]
                     title=final_title,
+                    started_at=started_at,
                     updated_at=utc_now_iso(),
+                    progress_pct=None,
+                    progress_stage="",
                     message=f"{label}发布异常",
                     error=str(exc)[:300],
                 ),
             )
-            store.save(manifest)
             store.append_receipt(
                 run_id=rid,
                 stage="publish",
@@ -516,5 +828,10 @@ def publish_to_platforms(
                 summary=f"{label}发布异常",
                 error=str(exc),
             )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(selected_platforms)) as executor:
+        futures = {plat: executor.submit(_publish_one_platform, plat) for plat in selected_platforms}
+        for fut in futures.values():
+            fut.result()
 
     return store.load()

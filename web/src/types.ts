@@ -77,7 +77,10 @@ export interface PublishRecord {
   mode: "draft" | "public";
   title: string;
   url_or_id: string;
+  started_at?: string;
   updated_at: string;
+  progress_pct?: number | null;
+  progress_stage?: string;
   message: string;
   error: string | null;
 }

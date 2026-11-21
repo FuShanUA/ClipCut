@@ -956,6 +956,159 @@ def test_compilation_render_hash_tracks_enabled_clips_and_cards(tmp_path: Path):
     assert h4 != h1
 
 
+def test_parse_publish_progress_all_platforms():
+    from clipcut.publish.publishers import _parse_publish_progress
+
+    # Bilibili
+    assert _parse_publish_progress("bilibili", "Progress: 42.5%", 0.0, "准备中")[:2] == (42.5, "上传中")
+    assert _parse_publish_progress("bilibili", ">>> 正在上传B站封面...", 96.0, "处理封面")[:2] == (97.0, "传封面")
+    # Ignore 99.0% downgrade once cover upload stage started
+    assert _parse_publish_progress("bilibili", "Progress: 99.0%", 97.0, "传封面") is None
+
+    # WeChat (lock wait, upload %, transcode %, cover editor)
+    assert _parse_publish_progress("wechat", ">>> 仍在等待微信浏览器 profile 锁（30 秒）...", 2.0, "排队锁")[:2] == (
+        2.0,
+        "排队锁30s",
+    )
+    assert _parse_publish_progress("wechat", ">>> 上传中: 50% (dom)", 15.0, "开始上传")[:2] == (45.0, "上传中")
+    assert _parse_publish_progress("wechat", ">>> 转码中: 50% (dom)", 75.0, "上传中")[:2] == (81.0, "转码中")
+    assert _parse_publish_progress("wechat", ">>> 横竖双封面均已回读确认", 88.0, "设封面")[:2] == (94.0, "封面完成")
+
+    # Xiaohongshu
+    assert _parse_publish_progress("xiaohongshu", "   ... 已等待 20 秒，持续检测中 ...", 50.0, "上传分析")[:2] == (
+        58.0,
+        "分析20s",
+    )
+    assert _parse_publish_progress("xiaohongshu", ">>> 正在上传配套封面...", 85.0, "上传完成")[:2] == (88.0, "传封面")
+
+
+def test_publish_to_platforms_runs_in_parallel_and_streams_cr_progress(tmp_path: Path, monkeypatch):
+    import sys
+    import time
+    import clipcut.publish.publishers as pub_mod
+
+    vfile = tmp_path / "demo.mp4"
+    vfile.write_bytes(b"0" * 2048)
+
+    timings_file = tmp_path / "timings.jsonl"
+    wx_script = tmp_path / "wx_dummy.py"
+    wx_script.write_text(
+        f"""
+import json, sys, time
+t0 = time.monotonic()
+sys.stdout.write(">>> 已获得微信浏览器 profile 锁: /tmp/lock\\n")
+sys.stdout.write("\\r>>> 上传中: 40% (dom)\\r")
+sys.stdout.flush()
+time.sleep(0.5)
+sys.stdout.write("\\r>>> 转码中: 50% (dom)\\r")
+sys.stdout.write("\\n>>> 存草稿完成！\\n")
+sys.stdout.flush()
+with open({str(timings_file)!r}, "a") as f:
+    f.write(json.dumps({{"plat": "wechat", "t0": t0, "t1": time.monotonic()}}) + "\\n")
+""",
+        encoding="utf-8",
+    )
+    bili_script = tmp_path / "bili_dummy.py"
+    bili_script.write_text(
+        f"""
+import json, sys, time
+t0 = time.monotonic()
+sys.stdout.write("Progress: 60.0%\\n")
+sys.stdout.flush()
+time.sleep(0.5)
+sys.stdout.write(">>> B站API返回: {{'bvid': 'BV1234567890'}}\\n")
+sys.stdout.flush()
+with open({str(timings_file)!r}, "a") as f:
+    f.write(json.dumps({{"plat": "bilibili", "t0": t0, "t1": time.monotonic()}}) + "\\n")
+""",
+        encoding="utf-8",
+    )
+
+    store = ProjectStore(tmp_path)
+    manifest = ProjectManifest(
+        project_id="parallel-pub-test",
+        source=MediaSource(
+            work_dir=str(tmp_path),
+            render_video=str(vfile),
+            analysis_video=str(vfile),
+            output_dir=str(tmp_path),
+            duration_s=15.0,
+            width=1920,
+            height=1080,
+            fps=30.0,
+        ),
+        metadata=VideoMetadata(
+            original_title="Parallel Test",
+            description="",
+            channel="",
+            guest_zh="",
+            channel_zh="",
+            original_theme_zh="",
+            metadata_source="manual",
+        ),
+        clips=[
+            ClipItem(
+                clip_id="c1",
+                index=1,
+                enabled=True,
+                title="Clip One",
+                start_utt=0,
+                end_utt=1,
+                start_s=0.0,
+                end_s=10.0,
+                output_file=str(vfile),
+            )
+        ],
+    )
+    store.save(manifest)
+
+    monkeypatch.setattr(pub_mod, "sync_platform_covers_for_target", lambda **kwargs: [])
+    monkeypatch.setattr(
+        pub_mod,
+        "_get_paths",
+        lambda: {
+            "wechat": {"label": "微信视频号", "python": sys.executable, "script": wx_script, "profile_dir": None},
+            "bilibili": {"label": "B站", "python": sys.executable, "script": bili_script},
+        },
+    )
+
+    t_start = time.monotonic()
+    out_manifest = pub_mod.publish_to_platforms(
+        store=store,
+        target="c1",
+        platforms=["wechat", "bilibili"],
+        title="Parallel Test",
+        cover_title="Parallel Cover",
+        desc="desc",
+        tags=["AI"],
+        is_public=False,
+        ui_schema=2,
+    )
+    elapsed = time.monotonic() - t_start
+
+    # Both scripts sleep 0.5s: serial would take >= 1.0s; parallel finishes in < 0.90s
+    assert elapsed < 0.90
+
+    rows = [json.loads(line) for line in timings_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 2
+    by_plat = {r["plat"]: r for r in rows}
+    assert max(by_plat["wechat"]["t0"], by_plat["bilibili"]["t0"]) < min(
+        by_plat["wechat"]["t1"], by_plat["bilibili"]["t1"]
+    )
+
+    recs = {r.platform: r for r in out_manifest.clips[0].publish_records}
+    assert recs["wechat"].status == "draft"
+    assert recs["wechat"].progress_pct == 100.0
+    assert recs["bilibili"].status == "draft"
+    assert recs["bilibili"].progress_pct == 100.0
+    assert recs["bilibili"].url_or_id == "https://www.bilibili.com/video/BV1234567890"
+
+    logs_text = "\n".join(store.read_logs(tail=100))
+    assert "[上传中]" in logs_text or "[转码中]" in logs_text
+    assert "[并行发布" in logs_text or "并行发布" in logs_text
+
+
+
 
 
 

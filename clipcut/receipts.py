@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .models import ProjectManifest, Receipt, utc_now_iso
+
+
+_STORE_LOCKS_GUARD = threading.Lock()
+_STORE_LOCKS: dict[Path, threading.RLock] = {}
+
+
+def _get_store_lock(work_dir: Path) -> threading.RLock:
+    resolved = Path(work_dir).resolve()
+    with _STORE_LOCKS_GUARD:
+        lock = _STORE_LOCKS.get(resolved)
+        if lock is None:
+            lock = threading.RLock()
+            _STORE_LOCKS[resolved] = lock
+        return lock
 
 
 class ProjectStore:
@@ -14,6 +29,7 @@ class ProjectStore:
     def __init__(self, work_dir: Path):
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = _get_store_lock(self.work_dir)
         self.manifest_path = self.work_dir / "project.json"
         self.receipts_path = self.work_dir / "receipts.jsonl"
         self.log_path = self.work_dir / "pipeline.log"
@@ -24,41 +40,53 @@ class ProjectStore:
         return self.manifest_path.exists()
 
     def load(self) -> ProjectManifest:
-        raw = self.manifest_path.read_text(encoding="utf-8")
-        manifest = ProjectManifest.model_validate_json(raw)
-        # Self-healing: if clips have flat default scores, backfill from candidates
-        if manifest.candidates and manifest.clips:
-            flat_scores = all(c.score == 7.5 for c in manifest.clips)
-            if flat_scores:
-                cands_by_title = {c.title: c for c in manifest.candidates}
-                cands_by_id = {c.candidate_id: c for c in manifest.candidates}
-                modified = False
-                for cl in manifest.clips:
-                    matched = cands_by_title.get(cl.title) or cands_by_id.get(cl.clip_id.replace("clip_", "C"))
-                    if matched and matched.score and matched.score != 7.5:
-                        cl.score = float(matched.score)
-                        modified = True
-                if modified:
-                    self.save(manifest)
-        return manifest
+        with self._lock:
+            raw = self.manifest_path.read_text(encoding="utf-8")
+            manifest = ProjectManifest.model_validate_json(raw)
+            # Self-healing: if clips have flat default scores, backfill from candidates
+            if manifest.candidates and manifest.clips:
+                flat_scores = all(c.score == 7.5 for c in manifest.clips)
+                if flat_scores:
+                    cands_by_title = {c.title: c for c in manifest.candidates}
+                    cands_by_id = {c.candidate_id: c for c in manifest.candidates}
+                    modified = False
+                    for cl in manifest.clips:
+                        matched = cands_by_title.get(cl.title) or cands_by_id.get(cl.clip_id.replace("clip_", "C"))
+                        if matched and matched.score and matched.score != 7.5:
+                            cl.score = float(matched.score)
+                            modified = True
+                    if modified:
+                        self.save(manifest)
+            return manifest
 
     def save(self, manifest: ProjectManifest) -> None:
-        manifest.updated_at = utc_now_iso()
-        manifest.revision += 1
-        tmp = self.manifest_path.with_suffix(".json.tmp")
-        tmp.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
-        tmp.replace(self.manifest_path)
+        with self._lock:
+            manifest.updated_at = utc_now_iso()
+            manifest.revision += 1
+            tmp = self.work_dir / f".project.{uuid.uuid4().hex[:8]}.json.tmp"
+            tmp.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+            tmp.replace(self.manifest_path)
+
+    def update_manifest(self, mutator: Callable[[ProjectManifest], None]) -> ProjectManifest:
+        """Atomically read-modify-write project.json under per-project RLock."""
+        with self._lock:
+            manifest = self.load()
+            mutator(manifest)
+            self.save(manifest)
+            return manifest
 
     def log(self, message: str) -> None:
         line = f"[{utc_now_iso()}] {message}\n"
-        with self.log_path.open("a", encoding="utf-8") as f:
-            f.write(line)
+        with self._lock:
+            with self.log_path.open("a", encoding="utf-8") as f:
+                f.write(line)
 
     def read_logs(self, tail: int = 200) -> list[str]:
-        if not self.log_path.exists():
-            return []
-        lines = self.log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        return lines[-tail:]
+        with self._lock:
+            if not self.log_path.exists():
+                return []
+            lines = self.log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            return lines[-tail:]
 
     def append_receipt(
         self,
@@ -91,9 +119,10 @@ class ProjectStore:
             diff=diff or {},
             error=error,
         )
-        with self.receipts_path.open("a", encoding="utf-8") as f:
-            f.write(receipt.model_dump_json() + "\n")
-        self.log(f"[{stage}/{actor}] {action}: {summary}" + (f" | ERROR: {error}" if error else ""))
+        with self._lock:
+            with self.receipts_path.open("a", encoding="utf-8") as f:
+                f.write(receipt.model_dump_json() + "\n")
+            self.log(f"[{stage}/{actor}] {action}: {summary}" + (f" | ERROR: {error}" if error else ""))
         return receipt
 
     def list_receipts(self, stage: str | None = None, limit: int = 200) -> list[Receipt]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import mimetypes
 import subprocess
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field
 from ..adapters.ingest import ingest_source, resolve_work_dir, scan_input_path
 from ..config import PROJECT_ROOT, load_editorial_config, load_editorial_raw, save_editorial_config, save_editorial_raw
 from ..llm import MODEL_CATALOG, parse_provider_model
+from ..models import ProjectManifest, PublishRecord, utc_now_iso
 from ..pipeline.orchestrator import ALL_STAGES, run_existing_project_stages
 from ..pipeline.verify_and_plan import (
     _load_audio_envelope,
@@ -56,6 +58,61 @@ async def _no_cache_html(request: Request, call_next):
 # Background job state per project_id
 _ACTIVE_JOBS: dict[str, dict[str, Any]] = {}
 _JOBS_LOCK = threading.Lock()
+_SERVER_STARTED_AT = utc_now_iso()
+
+
+def _is_before_server_start(ts: str) -> bool:
+    if not ts:
+        return True
+    try:
+        t_rec = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        t_srv = datetime.fromisoformat(_SERVER_STARTED_AT.replace("Z", "+00:00"))
+        if t_rec.tzinfo is None:
+            t_rec = t_rec.replace(tzinfo=timezone.utc)
+        if t_srv.tzinfo is None:
+            t_srv = t_srv.replace(tzinfo=timezone.utc)
+        return t_rec < t_srv
+    except Exception:
+        return ts < _SERVER_STARTED_AT
+
+
+def _has_stale_running_record(manifest: ProjectManifest) -> bool:
+    all_lists = [
+        manifest.remix.publish_records,
+        manifest.compilation.publish_records,
+        *[c.publish_records for c in manifest.clips],
+    ]
+    return any(
+        rec.status == "running" and _is_before_server_start(rec.updated_at)
+        for recs in all_lists
+        for rec in recs
+    )
+
+
+def _cleanup_stale_running_publish_records(store: ProjectStore, job_running: bool) -> ProjectManifest:
+    manifest = store.load()
+    if job_running or not _has_stale_running_record(manifest):
+        return manifest
+
+    now_iso = utc_now_iso()
+
+    def _mutate(m: ProjectManifest) -> None:
+        all_lists = [
+            m.remix.publish_records,
+            m.compilation.publish_records,
+            *[c.publish_records for c in m.clips],
+        ]
+        for recs in all_lists:
+            for rec in recs:
+                if rec.status == "running" and _is_before_server_start(rec.updated_at):
+                    rec.status = "error"
+                    rec.progress_pct = None
+                    rec.progress_stage = ""
+                    rec.message = "上传因服务重启中断"
+                    rec.error = "上次上传未完成（服务已重启），请重新发布"
+                    rec.updated_at = now_iso
+
+    return store.update_manifest(_mutate)
 
 
 def _load_registry() -> dict[str, dict[str, Any]]:
@@ -293,9 +350,9 @@ def open_project(req: OpenProjectRequest):
 @app.get("/api/projects/{project_id}")
 def get_project(project_id: str):
     store = _get_store(project_id)
-    manifest = store.load()
     with _JOBS_LOCK:
         job = _ACTIVE_JOBS.get(project_id, {"running": False})
+    manifest = _cleanup_stale_running_publish_records(store, bool(job.get("running")))
     return {
         "manifest": manifest.model_dump(),
         "job": job,

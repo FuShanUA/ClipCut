@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import type {
   ClipItem,
@@ -79,13 +79,20 @@ function renderPubBadges(records?: PublishRecord[]) {
   if (!records || records.length === 0) return null;
   return records.map((rec) => {
     const label = PLAT_LABELS[rec.platform] || rec.platform;
+    const pct =
+      rec.status === "running" && typeof rec.progress_pct === "number"
+        ? Math.max(0, Math.min(100, Math.round(rec.progress_pct)))
+        : null;
+    const runningStage = (rec.progress_stage || "上传中").trim();
     const statusText =
       rec.status === "published"
         ? "已发"
         : rec.status === "draft"
           ? "草稿"
           : rec.status === "running"
-            ? "上传中"
+            ? pct !== null
+              ? `${runningStage} ${pct}%`
+              : runningStage
             : "失败";
     if (rec.url_or_id) {
       return (
@@ -102,8 +109,17 @@ function renderPubBadges(records?: PublishRecord[]) {
         </a>
       );
     }
+    const badgeStyle =
+      rec.status === "running" && pct !== null
+        ? ({ "--pub-pct": `${pct}%` } as CSSProperties)
+        : undefined;
     return (
-      <span key={rec.platform} className={`pub-badge ${rec.status}`} title={rec.message || rec.error || ""}>
+      <span
+        key={rec.platform}
+        className={`pub-badge ${rec.status}`}
+        style={badgeStyle}
+        title={rec.message || rec.error || ""}
+      >
         {label}:{statusText}
       </span>
     );
@@ -253,7 +269,7 @@ export default function App() {
       } catch {
         // ignore transient errors
       }
-    }, 2000);
+    }, 1000);
     return () => window.clearInterval(timer);
   }, [manifest?.project_id, jobRunning, stageFilter, showLogs]);
 
@@ -655,6 +671,10 @@ export default function App() {
       });
       publishDialogRef.current?.close();
       setJobRunning(true);
+      api
+        .getProject(manifest.project_id)
+        .then((d) => setManifest(d.manifest))
+        .catch(() => {});
     } catch (err) {
       setErrorMsg((err as Error).message);
     }

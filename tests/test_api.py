@@ -178,4 +178,68 @@ def test_dual_remix_and_compilation_endpoints(tmp_path: Path, monkeypatch):
     assert comp3["render_hash"] != hash_before
 
 
+def test_stale_running_publish_record_recovered_on_get_project(tmp_path: Path, monkeypatch):
+    from clipcut.models import ProjectManifest, MediaSource, VideoMetadata, ClipItem, PublishRecord
+    from clipcut.receipts import ProjectStore
+    import clipcut.api.server as srv
+
+    store = ProjectStore(tmp_path)
+    m = ProjectManifest(
+        project_id="test-stale-pub-01",
+        source=MediaSource(
+            work_dir=str(tmp_path),
+            render_video="fake.mp4",
+            analysis_video="fake.mp4",
+            output_dir=str(tmp_path / "out"),
+            duration_s=60.0,
+            width=1920,
+            height=1080,
+            fps=30.0,
+        ),
+        metadata=VideoMetadata(
+            original_title="test stale",
+            description="",
+            channel="",
+            guest_zh="",
+            channel_zh="",
+            original_theme_zh="",
+            metadata_source="manual",
+        ),
+        clips=[
+            ClipItem(
+                clip_id="c1",
+                index=1,
+                enabled=True,
+                title="t1",
+                start_utt=0,
+                end_utt=1,
+                start_s=0.0,
+                end_s=10.0,
+                publish_records=[
+                    PublishRecord(
+                        platform="wechat",
+                        status="running",
+                        mode="draft",
+                        title="t1",
+                        updated_at="2020-01-01T00:00:00+00:00",
+                        progress_pct=42.0,
+                        progress_stage="上传中",
+                        message="微信视频上传中 42%",
+                    )
+                ],
+            )
+        ],
+    )
+    store.save(m)
+    monkeypatch.setattr(srv, "_get_store", lambda pid: store)
+
+    r = client.get("/api/projects/test-stale-pub-01")
+    assert r.status_code == 200
+    rec = r.json()["manifest"]["clips"][0]["publish_records"][0]
+    assert rec["status"] == "error"
+    assert rec["progress_pct"] is None
+    assert "服务重启" in rec["message"]
+
+
+
 

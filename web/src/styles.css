@@ -668,9 +668,14 @@ details.fold > summary:hover {
 }
 
 .pub-badge.running {
-  background: var(--accent-dim);
+  background: linear-gradient(
+    90deg,
+    rgba(245, 158, 11, 0.34) var(--pub-pct, 0%),
+    var(--accent-dim) var(--pub-pct, 0%)
+  );
   color: #fcd34d;
-  border-color: rgba(245, 158, 11, 0.4);
+  border-color: rgba(245, 158, 11, 0.45);
+  font-variant-numeric: tabular-nums;
 }
 
 .pub-badge.error {

@@ -159,7 +159,10 @@ class PublishRecord(BaseModel):
     mode: Literal["draft", "public"] = "draft"
     title: str = ""
     url_or_id: str = ""
+    started_at: str = ""
     updated_at: str = Field(default_factory=utc_now_iso)
+    progress_pct: float | None = None
+    progress_stage: str = ""
     message: str = ""
     error: str | None = None
 
