@@ -15,6 +15,7 @@ from clipcut.adapters.ingest import (
 from clipcut.assets_gen import ensure_default_assets
 from clipcut.config import load_editorial_config
 from clipcut.models import (
+    Candidate,
     Chapter,
     ClipItem,
     MediaSource,
@@ -1234,6 +1235,339 @@ def test_wechat_publish_passes_collection_argument(tmp_path, monkeypatch):
     assert "--collection" in wx_cmd
     col_idx = wx_cmd.index("--collection")
     assert wx_cmd[col_idx + 1] == "不可见数据法律AI"[:10]
+
+
+def test_run_verify_and_plan_stage_calls_plan_remix(tmp_path, monkeypatch):
+    from clipcut.pipeline.verify_and_plan import run_verify_and_plan_stage
+    from clipcut.receipts import ProjectStore
+
+    vid = tmp_path / "vid.mp4"
+    vid.write_bytes(b"dummy")
+    store = ProjectStore(tmp_path / "work")
+    m = ProjectManifest(
+        project_id="test-verify-plan-returns-manifest",
+        source=MediaSource(
+            analysis_video=str(vid),
+            render_video=str(vid),
+            duration_s=120.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        utterances=[
+            Utterance(id=0, start_s=0.0, end_s=20.0, zh="这是第一句完整观点。"),
+            Utterance(id=1, start_s=20.5, end_s=45.0, zh="这是第二句论据展开。"),
+            Utterance(id=2, start_s=45.5, end_s=70.0, zh="这是第三句总结陈词。"),
+        ],
+        candidates=[
+            Candidate(
+                candidate_id="cand_01",
+                categories=["key_dialogue"],
+                title="完整论证测试",
+                start_utt=0,
+                end_utt=2,
+                score=8.5,
+                needs_multimodal_verify=False,
+            )
+        ],
+    )
+    store.save(m)
+
+    class MockLLMResult:
+        parsed = {
+            "remix_title": "全片高光集锦",
+            "editorial_thesis": "直奔核心结论",
+            "themes": [
+                {
+                    "theme_id": "TH01",
+                    "group_label": "核心观点",
+                    "card_title": "AI自动规划混剪",
+                    "segments": [
+                        {
+                            "source_clip_id": "clip_01",
+                            "start_utt": 0,
+                            "end_utt": 2,
+                            "quote": "这是第一句...总结陈词。",
+                            "beat_type": "punchline",
+                        }
+                    ],
+                }
+            ],
+        }
+        provider = "dashscope"
+        model = "qwen3.8-max"
+        prompt_tokens = 50
+        output_tokens = 60
+        elapsed_ms = 20
+
+    monkeypatch.setattr(
+        "clipcut.pipeline.verify_and_plan.ClipCutLLM.generate_json",
+        lambda *args, **kwargs: MockLLMResult(),
+    )
+
+    out = run_verify_and_plan_stage(m, store, {}, run_id="test_vp")
+    assert isinstance(out, ProjectManifest)
+    assert len(out.clips) == 1
+    assert len(out.remix.items) == 1
+    assert out.remix.items[0].card_title == "AI自动规划混剪"
+    assert out.remix.planned_source_signature != ""
+
+
+def test_run_render_stage_auto_plans_and_renders_remix_when_zero_clips_enabled(tmp_path, monkeypatch):
+    from clipcut.pipeline.verify_and_plan import compute_remix_source_signature
+    from clipcut.receipts import ProjectStore
+    from clipcut.render.renderer import run_render_stage
+
+    vid = tmp_path / "vid.mp4"
+    vid.write_bytes(b"dummy")
+    store = ProjectStore(tmp_path / "work")
+    m = ProjectManifest(
+        project_id="test-zero-clips-render-remix",
+        source=MediaSource(
+            analysis_video=str(vid),
+            render_video=str(vid),
+            duration_s=300.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        utterances=[
+            Utterance(id=0, start_s=0.0, end_s=8.0, zh="开场第一句。"),
+            Utterance(id=1, start_s=9.0, end_s=18.0, zh="核心反直觉金句。"),
+            Utterance(id=2, start_s=40.0, end_s=55.0, zh="第二部分结论。"),
+        ],
+        clips=[
+            ClipItem(clip_id="clip_01", index=1, enabled=False, title="切片1", start_utt=0, end_utt=1, start_s=0.0, end_s=18.0),
+            ClipItem(clip_id="clip_02", index=2, enabled=False, title="切片2", start_utt=2, end_utt=2, start_s=40.0, end_s=55.0),
+        ],
+        remix=RemixConfig(enabled=True, items=[], planned_source_signature=""),
+    )
+    store.save(m)
+
+    class MockLLMResult:
+        parsed = {
+            "remix_title": "零勾选全片精选混剪",
+            "themes": [
+                {
+                    "theme_id": "TH01",
+                    "group_label": "全片洞察",
+                    "card_title": "反直觉核心判断",
+                    "segments": [
+                        {
+                            "source_clip_id": "clip_01",
+                            "start_utt": 0,
+                            "end_utt": 1,
+                            "quote": "开场第一句...核心反直觉金句。",
+                            "beat_type": "punchline",
+                        }
+                    ],
+                }
+            ],
+        }
+        provider = "dashscope"
+        model = "qwen3.8-max"
+        prompt_tokens = 40
+        output_tokens = 50
+        elapsed_ms = 10
+
+    monkeypatch.setattr("clipcut.pipeline.verify_and_plan.ClipCutLLM.generate_json", lambda *args, **kwargs: MockLLMResult())
+    monkeypatch.setattr("clipcut.render.renderer._has_videotoolbox", lambda: False)
+    monkeypatch.setattr("clipcut.render.renderer._build_hero_pool_for_manifest", lambda *args, **kwargs: [])
+
+    render_remix_called: list[int] = []
+
+    def fake_render_remix(manifest, store, cfg, use_vt, run_id, **kwargs):
+        render_remix_called.append(len(manifest.remix.items))
+        out_p = Path(manifest.source.output_dir) / "00_Remix_test.mp4"
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_bytes(b"remix-video")
+        manifest.remix.output_file = str(out_p)
+        manifest.remix.last_rendered_hash = manifest.remix.render_hash
+        return out_p
+
+    monkeypatch.setattr("clipcut.render.renderer._render_remix", fake_render_remix)
+
+    res = run_render_stage(m, store, {}, run_id="render_zero")
+    assert render_remix_called == [1]
+    assert len(res.remix.items) == 1
+    assert res.remix.output_file and Path(res.remix.output_file).exists()
+    assert res.remix.planned_source_signature == compute_remix_source_signature(res)
+
+
+def test_run_render_stage_replans_stale_remix_after_selection_change(tmp_path, monkeypatch):
+    from clipcut.pipeline.verify_and_plan import compute_remix_source_signature
+    from clipcut.receipts import ProjectStore
+    from clipcut.render.renderer import run_render_stage
+
+    vid = tmp_path / "vid.mp4"
+    vid.write_bytes(b"dummy")
+    store = ProjectStore(tmp_path / "work")
+    m = ProjectManifest(
+        project_id="test-stale-replan",
+        source=MediaSource(
+            analysis_video=str(vid),
+            render_video=str(vid),
+            duration_s=300.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        utterances=[
+            Utterance(id=0, start_s=0.0, end_s=10.0, zh="第一句。"),
+            Utterance(id=1, start_s=10.0, end_s=20.0, zh="第二句。"),
+            Utterance(id=2, start_s=30.0, end_s=45.0, zh="第三句。"),
+        ],
+        clips=[
+            ClipItem(clip_id="clip_01", index=1, enabled=True, title="切片1", start_utt=0, end_utt=1, start_s=0.0, end_s=20.0),
+            ClipItem(clip_id="clip_02", index=2, enabled=True, title="切片2", start_utt=2, end_utt=2, start_s=30.0, end_s=45.0),
+        ],
+        remix=RemixConfig(
+            enabled=True,
+            items=[
+                RemixItem(remix_id="rmx_01", order=1, source_clip_id="clip_01", card_title="旧段", start_utt=0, end_utt=0, start_s=0.0, end_s=10.0),
+            ],
+        ),
+    )
+    m.remix.planned_source_signature = compute_remix_source_signature(m)
+    # Now uncheck all clips so signature becomes stale
+    for c in m.clips:
+        c.enabled = False
+    store.save(m)
+
+    class MockLLMResult:
+        parsed = {
+            "remix_title": "重新规划的全片混剪",
+            "themes": [
+                {
+                    "theme_id": "TH01",
+                    "group_label": "新板块",
+                    "card_title": "重新策展卡片",
+                    "segments": [
+                        {
+                            "source_clip_id": "clip_02",
+                            "start_utt": 2,
+                            "end_utt": 2,
+                            "quote": "第三句。",
+                            "beat_type": "punchline",
+                        }
+                    ],
+                }
+            ],
+        }
+        provider = "dashscope"
+        model = "qwen3.8-max"
+        prompt_tokens = 30
+        output_tokens = 30
+        elapsed_ms = 10
+
+    monkeypatch.setattr("clipcut.pipeline.verify_and_plan.ClipCutLLM.generate_json", lambda *args, **kwargs: MockLLMResult())
+    monkeypatch.setattr("clipcut.render.renderer._has_videotoolbox", lambda: False)
+    monkeypatch.setattr("clipcut.render.renderer._build_hero_pool_for_manifest", lambda *args, **kwargs: [])
+
+    rendered_titles: list[str] = []
+
+    def fake_render_remix(manifest, store, cfg, use_vt, run_id, **kwargs):
+        rendered_titles.extend(it.card_title for it in manifest.remix.items)
+        out_p = Path(manifest.source.output_dir) / "00_Remix_replan.mp4"
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_bytes(b"remix-video-2")
+        manifest.remix.output_file = str(out_p)
+        manifest.remix.last_rendered_hash = manifest.remix.render_hash
+        return out_p
+
+    monkeypatch.setattr("clipcut.render.renderer._render_remix", fake_render_remix)
+
+    res = run_render_stage(m, store, {}, run_id="render_replan")
+    assert rendered_titles == ["重新策展卡片"]
+    assert res.remix.planned_source_signature == compute_remix_source_signature(res)
+
+
+def test_plan_remix_user_filtered_excludes_pool_and_preserves_custom_order(tmp_path, monkeypatch):
+    from clipcut.pipeline.verify_and_plan import plan_remix_from_clips
+    from clipcut.receipts import ProjectStore
+
+    store = ProjectStore(tmp_path / "work")
+    # User put c2 before c1, left c3 disabled, and there is a remix_only_pool candidate
+    m = ProjectManifest(
+        project_id="test-custom-order",
+        source=MediaSource(
+            analysis_video=str(tmp_path / "vid.mp4"),
+            render_video=str(tmp_path / "vid.mp4"),
+            duration_s=600.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        utterances=[
+            Utterance(id=0, start_s=0.0, end_s=8.0, zh="C1内容。"),
+            Utterance(id=1, start_s=10.0, end_s=18.0, zh="C3未选内容。"),
+            Utterance(id=2, start_s=20.0, end_s=28.0, zh="Pool短高光。"),
+            Utterance(id=3, start_s=30.0, end_s=38.0, zh="C2重点内容。"),
+        ],
+        clips=[
+            ClipItem(clip_id="c2", index=1, enabled=True, title="切片C2", start_utt=3, end_utt=3, start_s=30.0, end_s=38.0),
+            ClipItem(clip_id="c1", index=2, enabled=True, title="切片C1", start_utt=0, end_utt=0, start_s=0.0, end_s=8.0),
+            ClipItem(clip_id="c3", index=3, enabled=False, title="切片C3", start_utt=1, end_utt=1, start_s=10.0, end_s=18.0),
+        ],
+        remix_only_pool=[
+            Candidate(candidate_id="p_pool", title="短高光Pool", start_utt=2, end_utt=2, summary="不应进入已选Remix")
+        ],
+    )
+    store.save(m)
+
+    seen_prompts: list[str] = []
+
+    class MockLLMResult:
+        # Intentionally return c1 before c2 plus unauthorized c3 and p_pool
+        parsed = {
+            "remix_title": "自定义顺序混剪",
+            "themes": [
+                {
+                    "theme_id": "TH01",
+                    "group_label": "组1",
+                    "card_title": "先放了C1",
+                    "segments": [
+                        {"source_clip_id": "c1", "start_utt": 0, "end_utt": 0, "quote": "C1内容。", "beat_type": "punchline"},
+                    ],
+                },
+                {
+                    "theme_id": "TH02",
+                    "group_label": "组2",
+                    "card_title": "未选与Pool混入",
+                    "segments": [
+                        {"source_clip_id": "c3", "start_utt": 1, "end_utt": 1, "quote": "C3未选内容。", "beat_type": "punchline"},
+                        {"source_clip_id": "p_pool", "start_utt": 2, "end_utt": 2, "quote": "Pool短高光。", "beat_type": "punchline"},
+                    ],
+                },
+                {
+                    "theme_id": "TH03",
+                    "group_label": "组3",
+                    "card_title": "后放了C2",
+                    "segments": [
+                        {"source_clip_id": "c2", "start_utt": 3, "end_utt": 3, "quote": "C2重点内容。", "beat_type": "punchline"},
+                    ],
+                },
+            ],
+        }
+        provider = "dashscope"
+        model = "qwen3.8-max"
+        prompt_tokens = 20
+        output_tokens = 20
+        elapsed_ms = 10
+
+    def fake_gen(*args, **kwargs):
+        seen_prompts.append(kwargs.get("prompt", ""))
+        return MockLLMResult()
+
+    monkeypatch.setattr("clipcut.pipeline.verify_and_plan.ClipCutLLM.generate_json", fake_gen)
+
+    planned = plan_remix_from_clips(m, store, {}, run_id="test_order")
+    assert len(seen_prompts) == 1
+    p = seen_prompts[0]
+    assert "ShortHighlight p_pool" not in p
+    assert "Clip c3" not in p
+    assert p.index("Clip c2") < p.index("Clip c1")
+
+    assert [it.source_clip_id for it in planned.remix.items] == ["c2", "c1"]
+    assert [it.order for it in planned.remix.items] == [1, 2]
+    assert [it.remix_id for it in planned.remix.items] == ["rmx_01", "rmx_02"]
+
 
 
 

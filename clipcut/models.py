@@ -234,6 +234,7 @@ class RemixConfig(BaseModel):
     bgm_path: str | None = None
     sfx_path: str | None = None
     items: list[RemixItem] = Field(default_factory=list)
+    planned_source_signature: str = ""
     render_hash: str = ""
     last_rendered_hash: str = ""
     output_file: str | None = None

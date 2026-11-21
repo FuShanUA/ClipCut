@@ -104,7 +104,9 @@ def run_pipeline(
         _mark_stage(manifest, store, st_name, "running", "执行中...")
         t0 = time.monotonic()
         try:
-            manifest = stage_runners[st_name](manifest)
+            next_manifest = stage_runners[st_name](manifest)
+            if next_manifest is not None:
+                manifest = next_manifest
             elapsed = int((time.monotonic() - t0) * 1000)
             _mark_stage(manifest, store, st_name, "completed", "完成", elapsed)
         except Exception as exc:
@@ -162,7 +164,9 @@ def run_existing_project_stages(
         _mark_stage(manifest, store, stage_key, "running", "执行中...")
         t0 = time.monotonic()
         try:
-            manifest = stage_runners[st_name](manifest)
+            next_manifest = stage_runners[st_name](manifest)
+            if next_manifest is not None:
+                manifest = next_manifest
             elapsed = int((time.monotonic() - t0) * 1000)
             _mark_stage(manifest, store, stage_key, "completed", "完成", elapsed)
         except Exception as exc:

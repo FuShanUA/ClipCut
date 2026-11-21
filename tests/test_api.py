@@ -280,5 +280,83 @@ def test_reorder_and_reset_clips(tmp_path, monkeypatch):
     assert [c["index"] for c in reset_clips] == [1, 2, 3]
 
 
+def test_reorder_reset_and_batch_sync_remix_hashes(tmp_path, monkeypatch):
+    from clipcut.api import server as srv
+    from clipcut.models import ClipItem, MediaSource, ProjectManifest, RemixConfig, RemixItem
+    from clipcut.pipeline.verify_and_plan import (
+        compute_compilation_render_hash,
+        compute_remix_render_hash,
+        compute_remix_source_signature,
+    )
+    from clipcut.receipts import ProjectStore
+
+    store = ProjectStore(tmp_path / "work")
+    m = ProjectManifest(
+        project_id="test-sync-hashes-01",
+        source=MediaSource(
+            analysis_video=str(tmp_path / "source.mp4"),
+            render_video=str(tmp_path / "source.mp4"),
+            duration_s=100.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+            metadata_source="manual",
+        ),
+        clips=[
+            ClipItem(clip_id="c1", index=1, enabled=True, title="t1", start_utt=0, end_utt=5, start_s=0.0, end_s=10.0),
+            ClipItem(clip_id="c2", index=2, enabled=True, title="t2", start_utt=6, end_utt=10, start_s=12.0, end_s=25.0),
+            ClipItem(clip_id="c3", index=3, enabled=True, title="t3", start_utt=11, end_utt=15, start_s=30.0, end_s=50.0),
+        ],
+        remix=RemixConfig(
+            enabled=True,
+            items=[
+                RemixItem(remix_id="rmx_01", order=1, source_clip_id="c1", card_title="段1", start_utt=0, end_utt=2, start_s=0.0, end_s=5.0),
+                RemixItem(remix_id="rmx_02", order=2, source_clip_id="c2", card_title="段2", start_utt=6, end_utt=8, start_s=12.0, end_s=18.0),
+                RemixItem(remix_id="rmx_03", order=3, source_clip_id="c3", card_title="段3", start_utt=11, end_utt=13, start_s=30.0, end_s=36.0),
+            ],
+        ),
+    )
+    m.remix.planned_source_signature = compute_remix_source_signature(m)
+    m.remix.render_hash = compute_remix_render_hash(m)
+    m.remix.last_rendered_hash = m.remix.render_hash
+    m.compilation.render_hash = compute_compilation_render_hash(m)
+    store.save(m)
+    monkeypatch.setattr(srv, "_get_store", lambda pid: store)
+
+    orig_rmx_hash = m.remix.render_hash
+    orig_cmp_hash = m.compilation.render_hash
+
+    # Reorder c3 -> c1 -> c2: remix.items should follow [c3, c1, c2]
+    r_reorder = client.post("/api/projects/test-sync-hashes-01/clips/reorder", json={"clip_ids": ["c3", "c1", "c2"]})
+    assert r_reorder.status_code == 200
+    rm1 = r_reorder.json()["manifest"]
+    assert [it["source_clip_id"] for it in rm1["remix"]["items"]] == ["c3", "c1", "c2"]
+    assert [it["order"] for it in rm1["remix"]["items"]] == [1, 2, 3]
+    assert rm1["remix"]["render_hash"] != orig_rmx_hash
+    assert rm1["compilation"]["render_hash"] != orig_cmp_hash
+
+    # Reset order: remix.items should restore to [c1, c2, c3]
+    r_reset = client.post("/api/projects/test-sync-hashes-01/clips/reset-order")
+    assert r_reset.status_code == 200
+    rm2 = r_reset.json()["manifest"]
+    assert [it["source_clip_id"] for it in rm2["remix"]["items"]] == ["c1", "c2", "c3"]
+    assert [it["order"] for it in rm2["remix"]["items"]] == [1, 2, 3]
+
+    # Simulate legacy project with empty planned_source_signature, then batch disable_all
+    loaded = store.load()
+    loaded.remix.planned_source_signature = ""
+    loaded.remix.render_hash = compute_remix_render_hash(loaded)
+    loaded.remix.last_rendered_hash = loaded.remix.render_hash
+    old_comp_hash = loaded.compilation.render_hash
+    store.save(loaded)
+
+    r_batch = client.post("/api/projects/test-sync-hashes-01/clips/batch", json={"action": "disable_all"})
+    assert r_batch.status_code == 200
+    rm3 = r_batch.json()["manifest"]
+    assert rm3["remix"]["planned_source_signature"] == "__stale__"
+    assert rm3["remix"]["render_hash"] != rm3["remix"]["last_rendered_hash"]
+    assert rm3["compilation"]["render_hash"] != old_comp_hash
+
+
+
 
 

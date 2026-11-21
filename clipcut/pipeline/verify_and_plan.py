@@ -165,9 +165,24 @@ def compute_clip_render_hash(clip: ClipItem, render_video: str) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
+def compute_remix_source_signature(manifest: ProjectManifest) -> str:
+    enabled_clips = [c for c in manifest.clips if c.enabled]
+    mode = "selected" if enabled_clips else "auto_all"
+    source_clips = enabled_clips if enabled_clips else list(manifest.clips)
+    payload = {
+        "mode": mode,
+        "clips": [
+            {"id": c.clip_id, "start_utt": c.start_utt, "end_utt": c.end_utt}
+            for c in source_clips
+        ],
+        "pool_ids": [] if enabled_clips else [p.candidate_id for p in manifest.remix_only_pool],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
 def compute_remix_render_hash(manifest: ProjectManifest) -> str:
     r = manifest.remix
-    payload = {
+    payload: dict[str, Any] = {
         "video": manifest.source.render_video,
         "card_template": "v2-vision-pip",
         "published_date": manifest.metadata.published_date,
@@ -194,6 +209,10 @@ def compute_remix_render_hash(manifest: ProjectManifest) -> str:
             if it.enabled
         ],
     }
+    if r.planned_source_signature:
+        cur_sig = compute_remix_source_signature(manifest)
+        if r.planned_source_signature != cur_sig:
+            payload["pending_replan_for"] = cur_sig
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
@@ -647,20 +666,21 @@ def _build_remix_macro_prompt(
             + "\n".join(lines)
         )
 
-    for p in manifest.remix_only_pool:
-        lines = []
-        for uid in range(p.start_utt, p.end_utt + 1):
-            u = utts[uid]
-            dur_u = max(0.5, u.end_s - u.start_s)
-            lines.append(f"  [句号={u.id} | 单句长{dur_u:.1f}s] {u.zh or u.en}")
-        blocks.append(
-            f"### ShortHighlight {p.candidate_id} (可用句号 {p.start_utt}..{p.end_utt} | 分类: {','.join(p.categories)}) | {p.title}\n"
-            f"- 简介: {p.summary}\n"
-            + "\n".join(lines)
-        )
+    if not user_filtered:
+        for p in manifest.remix_only_pool:
+            lines = []
+            for uid in range(p.start_utt, p.end_utt + 1):
+                u = utts[uid]
+                dur_u = max(0.5, u.end_s - u.start_s)
+                lines.append(f"  [句号={u.id} | 单句长{dur_u:.1f}s] {u.zh or u.en}")
+            blocks.append(
+                f"### ShortHighlight {p.candidate_id} (可用句号 {p.start_utt}..{p.end_utt} | 分类: {','.join(p.categories)}) | {p.title}\n"
+                f"- 简介: {p.summary}\n"
+                + "\n".join(lines)
+            )
 
     source_note = (
-        f"【策展切片来源】：用户已选定以下 {len(enabled_clips)} 支切片，请优先参照切片先后排列顺序与核心命题进行高光重组策划。"
+        f"【策展切片来源】：用户已勾选以下 {len(enabled_clips)} 支切片；严格只从这几支已勾选切片（及其同章前情铺垫）中选择高光片段，并严格按下方切片从上到下的先后顺序编排主题板块顺序。"
         if user_filtered
         else "【策展切片来源】：用户当前未手动限定切片，请以首席总编视角，自主从以下全部候选切片中遴选最反映全片主旨、最具争议反直觉或最精彩的片段组合，总时长严格精选控制在目标区间内。"
     )
@@ -743,10 +763,13 @@ def plan_remix_from_clips(
     """Plan curated macro-context Remix AFTER clips are finalized (also callable after human edits)."""
     utts = manifest.utterances
     enabled_clips = [c for c in manifest.clips if c.enabled]
-    candidate_clips = enabled_clips if enabled_clips else list(manifest.clips)
-    if not candidate_clips and not manifest.remix_only_pool:
+    user_filtered = bool(enabled_clips)
+    candidate_clips = enabled_clips if user_filtered else list(manifest.clips)
+    candidate_pool = [] if user_filtered else list(manifest.remix_only_pool)
+    if not candidate_clips and not candidate_pool:
         manifest.remix.items = []
         manifest.remix.editorial_thesis = ""
+        manifest.remix.planned_source_signature = compute_remix_source_signature(manifest)
         manifest.remix.render_hash = compute_remix_render_hash(manifest)
         store.save(manifest)
         return manifest
@@ -758,11 +781,11 @@ def plan_remix_from_clips(
         bridge_lo = _compute_clip_bridge_window(c, manifest.clips, manifest.topic_map, manifest.metadata.chapters, utts)
         allowed_lo = bridge_lo if (c.start_utt - bridge_lo >= 2) else c.start_utt
         clip_bounds[c.clip_id] = (allowed_lo, c.end_utt)
-    for p in manifest.remix_only_pool:
+    for p in candidate_pool:
         clip_bounds[p.candidate_id] = (p.start_utt, p.end_utt)
 
     prompt, _, _, hard_cap_s = _build_remix_macro_prompt(
-        manifest, cfg, candidate_clips, clip_bounds, user_filtered=bool(enabled_clips)
+        manifest, cfg, candidate_clips, clip_bounds, user_filtered=user_filtered
     )
 
     models_cfg = cfg.get("models", {})
@@ -838,12 +861,27 @@ def plan_remix_from_clips(
     for raw_it in flat_raw_items:
         src_cid = str(raw_it.get("source_clip_id") or "").strip()
         quote_raw = str(raw_it.get("quote") or "").strip()
-        allowed_lo, allowed_hi = clip_bounds.get(src_cid, (0, n_utts - 1))
 
         su = _parse_utt_int(raw_it.get("start_utt"), -1)
         eu = _parse_utt_int(raw_it.get("end_utt"), su)
         if eu < su:
             su, eu = eu, su
+
+        if src_cid not in clip_bounds:
+            inferred_cid = ""
+            if su >= 0:
+                best_overlap = 0
+                for cid, (clo, chi) in clip_bounds.items():
+                    ov = max(0, min(eu, chi) - max(su, clo) + 1)
+                    if ov > best_overlap:
+                        best_overlap = ov
+                        inferred_cid = cid
+            if inferred_cid:
+                src_cid = inferred_cid
+            elif user_filtered:
+                continue
+
+        allowed_lo, allowed_hi = clip_bounds.get(src_cid, (0, n_utts - 1))
 
         in_bounds = allowed_lo <= su <= allowed_hi and allowed_lo <= eu <= allowed_hi
         raw_dur = (utts[eu].end_s - utts[su].start_s) if in_bounds else 0.0
@@ -958,6 +996,24 @@ def plan_remix_from_clips(
             )
         )
 
+    is_custom_order = any(
+        manifest.clips[i].start_s > manifest.clips[i + 1].start_s
+        for i in range(len(manifest.clips) - 1)
+    )
+    if items and (user_filtered or is_custom_order):
+        clip_pos = {c.clip_id: i for i, c in enumerate(manifest.clips)}
+        fallback_pos = len(manifest.clips)
+        items = [
+            it
+            for _, it in sorted(
+                enumerate(items),
+                key=lambda pair: (clip_pos.get(pair[1].source_clip_id or "", fallback_pos), pair[0]),
+            )
+        ]
+        for idx, it in enumerate(items, 1):
+            it.order = idx
+            it.remix_id = f"rmx_{idx:02d}"
+
     manifest.remix.title = str(data.get("remix_title") or f"{manifest.metadata.original_theme_zh or '全片'} · 高光混剪")
     manifest.remix.editorial_thesis = str(data.get("editorial_thesis") or "").strip()
     manifest.remix.card_mode = r_cfg.get("card_mode", manifest.remix.card_mode)
@@ -968,6 +1024,7 @@ def plan_remix_from_clips(
     manifest.remix.bgm_volume = float(r_cfg.get("bgm_volume", manifest.remix.bgm_volume))
     manifest.remix.sfx_volume = float(r_cfg.get("sfx_volume", manifest.remix.sfx_volume))
     manifest.remix.items = items
+    manifest.remix.planned_source_signature = compute_remix_source_signature(manifest)
     manifest.remix.render_hash = compute_remix_render_hash(manifest)
 
     total_speech_s = sum(max(0.0, it.end_s - it.start_s) for it in items)
@@ -1152,6 +1209,8 @@ def run_verify_and_plan_stage(
     )
 
     # 5. Plan Remix strictly after clips are finalized
+    manifest = plan_remix_from_clips(manifest, store, cfg, run_id)
+    return manifest
 
 
 def select_curated_top_clips(
@@ -1243,6 +1302,3 @@ def select_curated_top_clips(
         used_ids.add(best.clip_id)
 
     return selected
-
-    manifest = plan_remix_from_clips(manifest, store, cfg, run_id)
-    return manifest

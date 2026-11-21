@@ -25,6 +25,7 @@ from ..pipeline.verify_and_plan import (
     compute_clip_render_hash,
     compute_compilation_render_hash,
     compute_remix_render_hash,
+    compute_remix_source_signature,
     select_curated_top_clips,
     snap_bounds_with_acoustic_guard,
 )
@@ -398,6 +399,38 @@ def run_project_stages(project_id: str, req: RunStagesRequest):
     return {"started": True, "job_id": job_id, "stages": req.stages}
 
 
+def _sync_derived_hashes_after_clip_change(manifest: ProjectManifest, *, mark_remix_stale: bool = True) -> None:
+    manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
+    if mark_remix_stale and not manifest.remix.planned_source_signature:
+        manifest.remix.planned_source_signature = "__stale__"
+    manifest.remix.render_hash = compute_remix_render_hash(manifest)
+
+
+def _apply_reordered_clips(manifest: ProjectManifest, ordered_clips: list[Any]) -> None:
+    old_sig = compute_remix_source_signature(manifest)
+    for idx, c in enumerate(ordered_clips, 1):
+        c.index = idx
+    manifest.clips = ordered_clips
+    new_sig = compute_remix_source_signature(manifest)
+    if manifest.remix.items and manifest.remix.planned_source_signature in ("", old_sig):
+        clip_pos = {c.clip_id: i for i, c in enumerate(manifest.clips)}
+        fallback_pos = len(manifest.clips)
+        reordered_items = [
+            it
+            for _, it in sorted(
+                enumerate(manifest.remix.items),
+                key=lambda pair: (clip_pos.get(pair[1].source_clip_id or "", fallback_pos), pair[0]),
+            )
+        ]
+        for idx, it in enumerate(reordered_items, 1):
+            it.order = idx
+        manifest.remix.items = reordered_items
+        if manifest.remix.planned_source_signature == old_sig:
+            manifest.remix.planned_source_signature = new_sig
+    manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
+    manifest.remix.render_hash = compute_remix_render_hash(manifest)
+
+
 @app.post("/api/projects/{project_id}/clips/batch")
 def batch_clips(project_id: str, req: BatchClipsRequest):
     store = _get_store(project_id)
@@ -424,6 +457,7 @@ def batch_clips(project_id: str, req: BatchClipsRequest):
     else:
         raise HTTPException(status_code=400, detail=f"不支持的批量操作: {req.action}")
 
+    _sync_derived_hashes_after_clip_change(manifest, mark_remix_stale=True)
     store.save(manifest)
     enabled_count = sum(1 for c in manifest.clips if c.enabled)
     store.append_receipt(
@@ -446,11 +480,7 @@ def reorder_clips(project_id: str, req: ReorderClipsRequest):
 
     store.save_undo_snapshot(manifest, "手动调整切片顺序")
     new_clips = [existing_map[cid] for cid in req.clip_ids]
-    for idx, c in enumerate(new_clips, 1):
-        c.index = idx
-    manifest.clips = new_clips
-    manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
-    manifest.remix.render_hash = compute_remix_render_hash(manifest)
+    _apply_reordered_clips(manifest, new_clips)
     store.save(manifest)
     store.append_receipt(
         run_id=f"human_{uuid.uuid4().hex[:6]}",
@@ -468,11 +498,7 @@ def reset_clip_order(project_id: str):
     manifest = store.load()
     store.save_undo_snapshot(manifest, "复原原片时间轴切片顺序")
     sorted_clips = sorted(manifest.clips, key=lambda c: (c.start_s, c.start_utt))
-    for idx, c in enumerate(sorted_clips, 1):
-        c.index = idx
-    manifest.clips = sorted_clips
-    manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
-    manifest.remix.render_hash = compute_remix_render_hash(manifest)
+    _apply_reordered_clips(manifest, sorted_clips)
     store.save(manifest)
     store.append_receipt(
         run_id=f"human_{uuid.uuid4().hex[:6]}",
@@ -550,6 +576,8 @@ def patch_clip(project_id: str, clip_id: str, req: PatchClipRequest):
         target.hook = manifest.utterances[target.start_utt].zh or manifest.utterances[target.start_utt].en
 
     target.render_hash = compute_clip_render_hash(target, manifest.source.render_video)
+    enabled_changed = req.enabled is not None and target.enabled != before["enabled"]
+    _sync_derived_hashes_after_clip_change(manifest, mark_remix_stale=(enabled_changed or bounds_changed))
     store.save(manifest)
     if (cover_title_changed or (title_changed and not target.cover_title)) and target.cover_file:
         refresh_single_cover(manifest, store, cfg, clip_id)

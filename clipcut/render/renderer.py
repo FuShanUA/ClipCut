@@ -23,6 +23,8 @@ from ..pipeline.verify_and_plan import (
     compute_clip_render_hash,
     compute_compilation_render_hash,
     compute_remix_render_hash,
+    compute_remix_source_signature,
+    plan_remix_from_clips,
 )
 from ..receipts import ProjectStore
 from .frame_selector import (
@@ -2607,23 +2609,50 @@ def run_render_stage(
                 error=err,
             )
 
-    if manifest.remix.enabled and any(x.enabled for x in manifest.remix.items):
-        if force:
-            manifest.remix.last_rendered_hash = ""
-        _render_remix(
-            manifest,
-            store,
-            cfg,
-            use_vt,
-            run_id,
-            hero_pool=hero_pool,
-            published_date=published_date,
+    remix_status = ""
+    comp_status = ""
+
+    if manifest.remix.enabled:
+        has_remix_sources = bool(manifest.clips or manifest.remix_only_pool)
+        cur_sig = compute_remix_source_signature(manifest)
+        need_replan = has_remix_sources and (
+            len(manifest.remix.items) == 0
+            or (
+                bool(manifest.remix.planned_source_signature)
+                and manifest.remix.planned_source_signature != cur_sig
+            )
         )
+        if need_replan:
+            mode_desc = "已选切片" if any(c.enabled for c in manifest.clips) else "全片自主精选"
+            store.log(f"[render] AI 混剪需策展规划（模式：{mode_desc}），自动调用 AI 规划脚本...")
+            if "render" in manifest.stages:
+                manifest.stages["render"].message = f"AI 混剪策展中（{mode_desc}）..."
+            store.save(manifest)
+            manifest = plan_remix_from_clips(manifest, store, cfg, run_id)
+            if "render" in manifest.stages:
+                manifest.stages["render"].message = "合成 AI 混剪成片中..."
+            store.save(manifest)
+
+        if any(x.enabled for x in manifest.remix.items):
+            if force:
+                manifest.remix.last_rendered_hash = ""
+            res_rmx = _render_remix(
+                manifest,
+                store,
+                cfg,
+                use_vt,
+                run_id,
+                hero_pool=hero_pool,
+                published_date=published_date,
+            )
+            remix_status = "，AI混剪已输出" if (res_rmx and res_rmx.exists()) else "，AI混剪失败"
+        elif has_remix_sources and need_replan:
+            raise RuntimeError("AI 混剪未能规划出有效高光片段，请查看日志或检查模型配置")
 
     if manifest.compilation.enabled and any(c.enabled for c in manifest.clips):
         if force:
             manifest.compilation.last_rendered_hash = ""
-        _render_compilation(
+        res_comp = _render_compilation(
             manifest,
             store,
             cfg,
@@ -2632,6 +2661,7 @@ def run_render_stage(
             hero_pool=hero_pool,
             published_date=published_date,
         )
+        comp_status = "，精选集已输出" if (res_comp and res_comp.exists()) else "，精选集失败"
     _write_markdown_deliverables(manifest, output_dir)
 
     store.save(manifest)
@@ -2642,7 +2672,7 @@ def run_render_stage(
         actor="system",
         action="render_complete",
         elapsed_ms=total_ms,
-        summary=f"渲染完成：新切 {rendered_count} 支，命中缓存 {cached_count} 支，刷新封面 {cover_refreshed} 张，失败 {failed_count} 支；输出目录 {output_dir}",
+        summary=f"渲染完成：新切 {rendered_count} 支，命中缓存 {cached_count} 支，刷新封面 {cover_refreshed} 张，失败 {failed_count} 支{remix_status}{comp_status}；输出目录 {output_dir}",
         details={
             "rendered": rendered_count,
             "cached": cached_count,

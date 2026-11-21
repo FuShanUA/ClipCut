@@ -780,6 +780,8 @@ export default function App() {
     return parts.join(" + ") || "0 项";
   }, [manifest, enabledClipCount]);
 
+  const isRendering = Boolean(jobRunning && manifest?.stages?.render?.status === "running");
+
   const remixStats = useMemo(() => {
     if (!manifest) {
       return { themeCount: 0, segmentCount: 0, estTotalS: 0, ratioPct: "0.0" };
@@ -867,7 +869,7 @@ export default function App() {
             onClick={() => handleRun(["signals", "analyze", "verify_and_plan"])}
             title="第一步：AI声画测绘、三类选片与Remix规划（不消耗重型算力渲染）"
           >
-            {jobRunning ? "规划中..." : "生成切片策略"}
+            {jobRunning && !isRendering ? "规划中..." : "生成切片策略"}
           </button>
           <button
             type="button"
@@ -875,7 +877,7 @@ export default function App() {
             onClick={() => handleRun(["render"])}
             title="第二步：仅对当前勾选的切片、AI混剪与切片精选集执行物理渲染"
           >
-            渲染选中 ({renderTargetSummary})
+            {isRendering ? "渲染中..." : `渲染选中 (${renderTargetSummary})`}
           </button>
           <button
             type="button"
@@ -1000,7 +1002,13 @@ export default function App() {
                   <div className="clip-title">{manifest.remix.title || "高光混剪集锦"}</div>
                 </div>
                 <div className="clip-meta">
-                  <span>{remixStats.themeCount}板块 · {remixStats.segmentCount}段</span>
+                  <span>
+                    {remixStats.segmentCount === 0 && manifest.clips.length > 0
+                      ? enabledClipCount > 0
+                        ? `待AI按已选${enabledClipCount}切片策展`
+                        : "待AI全片自主策展"
+                      : `${remixStats.themeCount}板块 · ${remixStats.segmentCount}段`}
+                  </span>
                   <span className="mono">{fmtTime(remixStats.estTotalS)}</span>
                   <span
                     className={`tag ${
