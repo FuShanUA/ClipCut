@@ -241,5 +241,44 @@ def test_stale_running_publish_record_recovered_on_get_project(tmp_path: Path, m
     assert "服务重启" in rec["message"]
 
 
+def test_reorder_and_reset_clips(tmp_path, monkeypatch):
+    from clipcut.api import server as srv
+    from clipcut.models import ClipItem, MediaSource, ProjectManifest
+    from clipcut.receipts import ProjectStore
+    store = ProjectStore(tmp_path / "work")
+    m = ProjectManifest(
+        project_id="test-reorder-01",
+        source=MediaSource(
+            analysis_video=str(tmp_path / "source.mp4"),
+            render_video=str(tmp_path / "source.mp4"),
+            duration_s=100.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+            metadata_source="manual",
+        ),
+        clips=[
+            ClipItem(clip_id="c1", index=1, enabled=True, title="t1", start_utt=0, end_utt=5, start_s=0.0, end_s=10.0),
+            ClipItem(clip_id="c2", index=2, enabled=True, title="t2", start_utt=6, end_utt=10, start_s=12.0, end_s=25.0),
+            ClipItem(clip_id="c3", index=3, enabled=True, title="t3", start_utt=11, end_utt=15, start_s=30.0, end_s=50.0),
+        ],
+    )
+    store.save(m)
+    monkeypatch.setattr(srv, "_get_store", lambda pid: store)
+
+    # Reorder c3 -> c1 -> c2
+    r_reorder = client.post("/api/projects/test-reorder-01/clips/reorder", json={"clip_ids": ["c3", "c1", "c2"]})
+    assert r_reorder.status_code == 200
+    clips = r_reorder.json()["manifest"]["clips"]
+    assert [c["clip_id"] for c in clips] == ["c3", "c1", "c2"]
+    assert [c["index"] for c in clips] == [1, 2, 3]
+
+    # Reset back to timeline order
+    r_reset = client.post("/api/projects/test-reorder-01/clips/reset-order")
+    assert r_reset.status_code == 200
+    reset_clips = r_reset.json()["manifest"]["clips"]
+    assert [c["clip_id"] for c in reset_clips] == ["c1", "c2", "c3"]
+    assert [c["index"] for c in reset_clips] == [1, 2, 3]
+
+
 
 

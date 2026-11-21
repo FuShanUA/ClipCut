@@ -235,6 +235,10 @@ class RefreshCoverRequest(BaseModel):
     target: str = "remix"
 
 
+class ReorderClipsRequest(BaseModel):
+    clip_ids: list[str]
+
+
 class PublishRequest(BaseModel):
     target: str
     platforms: list[str]
@@ -243,6 +247,7 @@ class PublishRequest(BaseModel):
     desc: str | None = None
     tags: list[str] | None = None
     is_public: bool = False
+    collection: str | None = None
     tid: int | None = None
     ui_schema: int | None = None
 
@@ -429,6 +434,54 @@ def batch_clips(project_id: str, req: BatchClipsRequest):
         summary=f"批量更新切片状态 [{req.action}]：当前已启用 {enabled_count}/{len(manifest.clips)} 支",
     )
     return {"manifest": manifest.model_dump(), "enabled_count": enabled_count}
+
+
+@app.post("/api/projects/{project_id}/clips/reorder")
+def reorder_clips(project_id: str, req: ReorderClipsRequest):
+    store = _get_store(project_id)
+    manifest = store.load()
+    existing_map = {c.clip_id: c for c in manifest.clips}
+    if set(req.clip_ids) != set(existing_map.keys()):
+        raise HTTPException(status_code=400, detail="切片列表ID与现有切片不一致")
+
+    store.save_undo_snapshot(manifest, "手动调整切片顺序")
+    new_clips = [existing_map[cid] for cid in req.clip_ids]
+    for idx, c in enumerate(new_clips, 1):
+        c.index = idx
+    manifest.clips = new_clips
+    manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
+    manifest.remix.render_hash = compute_remix_render_hash(manifest)
+    store.save(manifest)
+    store.append_receipt(
+        run_id=f"human_{uuid.uuid4().hex[:6]}",
+        stage="human_edit",
+        actor="human",
+        action="reorder_clips",
+        summary=f"手动重排切片顺序（共 {len(manifest.clips)} 支）",
+    )
+    return {"manifest": manifest.model_dump()}
+
+
+@app.post("/api/projects/{project_id}/clips/reset-order")
+def reset_clip_order(project_id: str):
+    store = _get_store(project_id)
+    manifest = store.load()
+    store.save_undo_snapshot(manifest, "复原原片时间轴切片顺序")
+    sorted_clips = sorted(manifest.clips, key=lambda c: (c.start_s, c.start_utt))
+    for idx, c in enumerate(sorted_clips, 1):
+        c.index = idx
+    manifest.clips = sorted_clips
+    manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
+    manifest.remix.render_hash = compute_remix_render_hash(manifest)
+    store.save(manifest)
+    store.append_receipt(
+        run_id=f"human_{uuid.uuid4().hex[:6]}",
+        stage="human_edit",
+        actor="human",
+        action="reset_clip_order",
+        summary="按原片时间轴顺序一键复原切片排序",
+    )
+    return {"manifest": manifest.model_dump()}
 
 
 @app.patch("/api/projects/{project_id}/clips/{clip_id}")
@@ -731,6 +784,7 @@ def api_publish_project(project_id: str, req: PublishRequest):
                 desc=req.desc,
                 tags=req.tags,
                 is_public=req.is_public,
+                collection=req.collection,
                 tid=req.tid,
                 ui_schema=req.ui_schema,
             )

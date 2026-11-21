@@ -73,6 +73,17 @@ export const api = {
       body: JSON.stringify({ action, n }),
     }),
 
+  reorderClips: (projectId: string, clipIds: string[]) =>
+    req<{ manifest: ProjectManifest }>(`/api/projects/${projectId}/clips/reorder`, {
+      method: "POST",
+      body: JSON.stringify({ clip_ids: clipIds }),
+    }),
+
+  resetClipOrder: (projectId: string) =>
+    req<{ manifest: ProjectManifest }>(`/api/projects/${projectId}/clips/reset-order`, {
+      method: "POST",
+    }),
+
   renderClip: (projectId: string, clipId: string, force = false) =>
     req<{ ok: boolean; output_file: string; manifest: ProjectManifest }>(
       `/api/projects/${projectId}/clips/${clipId}/render?force=${force}`,
@@ -125,6 +136,7 @@ export const api = {
       desc?: string;
       tags?: string[];
       is_public?: boolean;
+      collection?: string;
       ui_schema?: number;
     }
   ) =>

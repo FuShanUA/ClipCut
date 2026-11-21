@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 import numpy as np
 
 from clipcut.adapters.ingest import (
@@ -1106,6 +1107,133 @@ with open({str(timings_file)!r}, "a") as f:
     logs_text = "\n".join(store.read_logs(tail=100))
     assert "[上传中]" in logs_text or "[转码中]" in logs_text
     assert "[并行发布" in logs_text or "并行发布" in logs_text
+
+
+def test_plan_remix_fallback_when_no_clips_enabled(tmp_path, monkeypatch):
+    from clipcut.pipeline.verify_and_plan import plan_remix_from_clips
+    from clipcut.receipts import ProjectStore
+
+    store = ProjectStore(tmp_path / "work")
+    m = ProjectManifest(
+        project_id="test-remix-fallback",
+        source=MediaSource(
+            analysis_video=str(tmp_path / "vid.mp4"),
+            render_video=str(tmp_path / "vid.mp4"),
+            duration_s=600.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+            metadata_source="manual",
+        ),
+        metadata=VideoMetadata(original_title="法律智能体落地", original_theme_zh="不可见数据下的法律智能体"),
+        utterances=[
+            Utterance(id=0, start_s=0.0, end_s=5.0, zh="第一句测试话语"),
+            Utterance(id=1, start_s=5.0, end_s=10.0, zh="第二句测试话语"),
+            Utterance(id=2, start_s=10.0, end_s=15.0, zh="第三句关键结论"),
+        ],
+        clips=[
+            # Notice enabled=False: user unchecked all clips!
+            ClipItem(clip_id="c1", index=1, enabled=False, title="切片1", start_utt=0, end_utt=2, start_s=0.0, end_s=15.0),
+        ],
+    )
+    store.save(m)
+
+    mock_resp = {
+        "remix_title": "AI自主遴选高光",
+        "editorial_thesis": "自主挑选最佳切片",
+        "themes": [
+            {
+                "theme_id": "TH01",
+                "group_label": "核心洞察",
+                "card_title": "AI自主遴选观点",
+                "segments": [
+                    {
+                        "source_clip_id": "c1",
+                        "start_utt": 0,
+                        "end_utt": 2,
+                        "quote": "第一句...关键结论",
+                        "editorial_reason": "核心结论",
+                        "beat_type": "punchline",
+                    }
+                ],
+            }
+        ],
+    }
+
+    class MockLLMResult:
+        parsed = mock_resp
+        provider = "dashscope"
+        model = "qwen3.8-max"
+        prompt_tokens = 100
+        output_tokens = 100
+        elapsed_ms = 50
+
+    monkeypatch.setattr(
+        "clipcut.pipeline.verify_and_plan.ClipCutLLM.generate_json",
+        lambda *args, **kwargs: MockLLMResult(),
+    )
+
+    planned = plan_remix_from_clips(m, store, {}, run_id="test")
+    # Must NOT be emptied! AI autonomously curated it!
+    assert len(planned.remix.items) == 1
+    assert planned.remix.items[0].card_title == "AI自主遴选观点"
+    assert planned.remix.title == "AI自主遴选高光"
+
+
+def test_wechat_publish_passes_collection_argument(tmp_path, monkeypatch):
+    import subprocess
+    from clipcut.publish.publishers import publish_to_platforms
+    from clipcut.receipts import ProjectStore
+
+    store = ProjectStore(tmp_path / "work")
+    vid = tmp_path / "clips" / "c1.mp4"
+    vid.parent.mkdir(parents=True, exist_ok=True)
+    vid.write_bytes(b"dummy")
+    wx_script = tmp_path / "wechat_upload.py"
+    wx_script.write_text("#!/usr/bin/env python3")
+
+    m = ProjectManifest(
+        project_id="test-wechat-collection",
+        source=MediaSource(
+            analysis_video=str(vid),
+            render_video=str(vid),
+            duration_s=60.0,
+            work_dir=str(tmp_path / "work"),
+            metadata_source="manual",
+            output_dir=str(tmp_path / "clips"),
+        ),
+        metadata=VideoMetadata(original_title="法律智能体实践长标题", original_theme_zh="不可见数据法律AI"),
+        clips=[
+            ClipItem(clip_id="c1", index=1, enabled=True, title="切片1", start_utt=0, end_utt=1, output_file=str(vid), start_s=0.0, end_s=10.0),
+        ],
+    )
+    store.save(m)
+
+    captured_cmds: list[list[str]] = []
+
+    def mock_run_proc(cmd, env, timeout_s, on_line):
+        captured_cmds.append(list(cmd))
+        on_line("上传完成！")
+        return 0, ["上传完成！"]
+
+    monkeypatch.setattr("clipcut.publish.publishers._run_publish_process", mock_run_proc)
+    monkeypatch.setattr("clipcut.publish.publishers.sync_platform_covers_for_target", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "clipcut.publish.publishers._get_paths",
+        lambda: {"wechat": {"label": "微信视频号", "python": sys.executable, "script": wx_script}},
+    )
+
+    publish_to_platforms(
+        store=store,
+        target="c1",
+        platforms=["wechat"],
+        is_public=False,
+    )
+
+    assert len(captured_cmds) == 1
+    wx_cmd = captured_cmds[0]
+    assert "--collection" in wx_cmd
+    col_idx = wx_cmd.index("--collection")
+    assert wx_cmd[col_idx + 1] == "不可见数据法律AI"[:10]
 
 
 

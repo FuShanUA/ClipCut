@@ -507,6 +507,7 @@ def publish_to_platforms(
     desc: str | None = None,
     tags: list[str] | None = None,
     is_public: bool = False,
+    collection: str | None = None,
     tid: int | None = None,
     run_id: str | None = None,
     ui_schema: int | None = None,
@@ -648,6 +649,11 @@ def publish_to_platforms(
         elif plat == "wechat":
             if pinfo.get("profile_dir") is not None:
                 env["WECHAT_BROWSER_DATA_DIR"] = str(pinfo["profile_dir"])
+            effective_col = (
+                collection
+                if collection is not None
+                else (manifest.metadata.original_theme_zh or manifest.metadata.original_title or "")
+            ).strip()[:10]
             cmd = [
                 *caff_prefix,
                 py,
@@ -664,6 +670,8 @@ def publish_to_platforms(
                 tags_csv or "人工智能,AI",
                 "--headless",
             ]
+            if effective_col:
+                cmd.extend(["--collection", effective_col])
             if is_public:
                 cmd.append("--public")
         else:

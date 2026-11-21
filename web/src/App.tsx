@@ -185,6 +185,7 @@ export default function App() {
   const [pubDesc, setPubDesc] = useState("");
   const [pubTags, setPubTags] = useState("");
   const [pubPublic, setPubPublic] = useState(false);
+  const [pubCollection, setPubCollection] = useState("");
 
   useEffect(() => {
     api
@@ -418,6 +419,32 @@ export default function App() {
     }
   }
 
+  async function handleMoveClip(fromIdx: number, direction: -1 | 1) {
+    if (!manifest) return;
+    const toIdx = fromIdx + direction;
+    if (toIdx < 0 || toIdx >= manifest.clips.length) return;
+    const reordered = [...manifest.clips];
+    const [moved] = reordered.splice(fromIdx, 1);
+    reordered.splice(toIdx, 0, moved);
+    const clipIds = reordered.map((c) => c.clip_id);
+    try {
+      const res = await api.reorderClips(manifest.project_id, clipIds);
+      setManifest(res.manifest);
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    }
+  }
+
+  async function handleResetClipOrder() {
+    if (!manifest) return;
+    try {
+      const res = await api.resetClipOrder(manifest.project_id);
+      setManifest(res.manifest);
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    }
+  }
+
   async function handleRenderSingleClip(clipId: string) {
     if (!manifest) return;
     setErrorMsg(null);
@@ -629,6 +656,10 @@ export default function App() {
           .join(", ")
       );
     }
+    const defaultCol = (manifest.metadata.original_theme_zh || manifest.metadata.original_title || "")
+      .trim()
+      .slice(0, 10);
+    setPubCollection(defaultCol);
     setPubPublic(false);
     publishDialogRef.current?.showModal();
   }
@@ -667,6 +698,7 @@ export default function App() {
         desc: pubDesc.trim(),
         tags: tagsList,
         is_public: pubPublic,
+        collection: pubCollection.trim(),
         ui_schema: 2,
       });
       publishDialogRef.current?.close();
@@ -922,7 +954,7 @@ export default function App() {
                   打开目录
                 </button>
               </div>
-              <div style={{ display: "flex", gap: 4 }}>
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                 <button
                   type="button"
                   className="sm"
@@ -936,6 +968,14 @@ export default function App() {
                 </button>
                 <button type="button" className="sm" onClick={() => handleBatchClips("disable_all")} title="全部停用">
                   全不选
+                </button>
+                <button
+                  type="button"
+                  className="sm"
+                  onClick={handleResetClipOrder}
+                  title="按原片时间轴顺序一键复原切片排序"
+                >
+                  复原时间轴
                 </button>
               </div>
             </div>
@@ -1022,7 +1062,7 @@ export default function App() {
                   点击上方「一键出片」自动生成切片与封面。
                 </div>
               ) : (
-                manifest.clips.map((c) => {
+                manifest.clips.map((c, idx) => {
                   const isCached = Boolean(c.output_file && c.render_hash === c.last_rendered_hash);
                   return (
                     <div
@@ -1043,6 +1083,34 @@ export default function App() {
                         />
                         <div className="clip-title">
                           {String(c.index).padStart(2, "0")}. {c.title}
+                        </div>
+                        <div style={{ display: "inline-flex", gap: 2, marginLeft: "auto" }}>
+                          <button
+                            type="button"
+                            className="sm"
+                            style={{ padding: "0 5px", fontSize: 11, minWidth: 20, height: 20, lineHeight: "20px" }}
+                            title="上移"
+                            disabled={idx === 0}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleMoveClip(idx, -1);
+                            }}
+                          >
+                            ↑
+                          </button>
+                          <button
+                            type="button"
+                            className="sm"
+                            style={{ padding: "0 5px", fontSize: 11, minWidth: 20, height: 20, lineHeight: "20px" }}
+                            title="下移"
+                            disabled={idx === manifest.clips.length - 1}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleMoveClip(idx, 1);
+                            }}
+                          >
+                            ↓
+                          </button>
                         </div>
                       </div>
                       <div className="clip-meta">
@@ -1997,6 +2065,17 @@ export default function App() {
           <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
             <span style={{ fontSize: 12, color: "var(--text-2)" }}>标签（逗号分隔）</span>
             <input type="text" value={pubTags} onChange={(e) => setPubTags(e.target.value)} />
+          </label>
+
+          <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span style={{ fontSize: 12, color: "var(--text-2)" }}>视频号合集（上传切片自动创建或存入同名合集，微信限10字）</span>
+            <input
+              type="text"
+              maxLength={10}
+              placeholder="默认取本片核心中文主题题眼"
+              value={pubCollection}
+              onChange={(e) => setPubCollection(e.target.value)}
+            />
           </label>
 
           <label style={{ display: "inline-flex", alignItems: "center", gap: 6, cursor: "pointer" }}>

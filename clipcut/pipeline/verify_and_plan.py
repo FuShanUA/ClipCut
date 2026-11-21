@@ -582,6 +582,7 @@ def _build_remix_macro_prompt(
     cfg: dict[str, Any],
     enabled_clips: list[ClipItem],
     clip_bounds: dict[str, tuple[int, int]],
+    user_filtered: bool = True,
 ) -> tuple[str, int, int, float]:
     utts = manifest.utterances
     r_cfg = cfg.get("remix", {})
@@ -658,7 +659,14 @@ def _build_remix_macro_prompt(
             + "\n".join(lines)
         )
 
-    prompt = f"""请以首席总编视角，基于全片宏观背景与以下定稿切片，策划一支总时长约 {target_min}~{target_max} 秒（硬上限 ≤{target_max} 秒，即原片 1/10）、分为 {est_min_themes}~{est_max_themes} 个主题板块、共 {est_min_excerpts}~{est_max_excerpts} 个弹性完整小段的 Remix 高光集锦。
+    source_note = (
+        f"【策展切片来源】：用户已选定以下 {len(enabled_clips)} 支切片，请优先参照切片先后排列顺序与核心命题进行高光重组策划。"
+        if user_filtered
+        else "【策展切片来源】：用户当前未手动限定切片，请以首席总编视角，自主从以下全部候选切片中遴选最反映全片主旨、最具争议反直觉或最精彩的片段组合，总时长严格精选控制在目标区间内。"
+    )
+
+    prompt = f"""请以首席总编视角，基于全片宏观背景与以下候选切片，策划一支总时长约 {target_min}~{target_max} 秒（硬上限 ≤{target_max} 秒，即原片 1/10）、分为 {est_min_themes}~{est_max_themes} 个主题板块、共 {est_min_excerpts}~{est_max_excerpts} 个弹性完整小段的 Remix 高光集锦。
+{source_note}
 
 【全片宏观语境】
 - 原视频标题: {manifest.metadata.original_title}
@@ -735,7 +743,8 @@ def plan_remix_from_clips(
     """Plan curated macro-context Remix AFTER clips are finalized (also callable after human edits)."""
     utts = manifest.utterances
     enabled_clips = [c for c in manifest.clips if c.enabled]
-    if not enabled_clips and not manifest.remix_only_pool:
+    candidate_clips = enabled_clips if enabled_clips else list(manifest.clips)
+    if not candidate_clips and not manifest.remix_only_pool:
         manifest.remix.items = []
         manifest.remix.editorial_thesis = ""
         manifest.remix.render_hash = compute_remix_render_hash(manifest)
@@ -745,14 +754,16 @@ def plan_remix_from_clips(
     r_cfg = cfg.get("remix", {})
     max_excerpt_s = float(r_cfg.get("max_excerpt_seconds", 90))
     clip_bounds: dict[str, tuple[int, int]] = {}
-    for c in enabled_clips:
+    for c in candidate_clips:
         bridge_lo = _compute_clip_bridge_window(c, manifest.clips, manifest.topic_map, manifest.metadata.chapters, utts)
         allowed_lo = bridge_lo if (c.start_utt - bridge_lo >= 2) else c.start_utt
         clip_bounds[c.clip_id] = (allowed_lo, c.end_utt)
     for p in manifest.remix_only_pool:
         clip_bounds[p.candidate_id] = (p.start_utt, p.end_utt)
 
-    prompt, _, _, hard_cap_s = _build_remix_macro_prompt(manifest, cfg, enabled_clips, clip_bounds)
+    prompt, _, _, hard_cap_s = _build_remix_macro_prompt(
+        manifest, cfg, candidate_clips, clip_bounds, user_filtered=bool(enabled_clips)
+    )
 
     models_cfg = cfg.get("models", {})
     text_provider = models_cfg.get("text_provider", "dashscope")

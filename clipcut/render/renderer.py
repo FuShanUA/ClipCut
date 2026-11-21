@@ -784,11 +784,13 @@ def compose_pip_card_image(
         # Left editorial rail (x: 4.2% -> 20.0%)
         rail_x = int(width * 0.042)
         rail_w = int(width * 0.158)
-        idx_font = _load_cjk_font(max(36, int(height * 0.092)), weight="heavy")
-        ib = draw.textbbox((0, 0), index_text, font=idx_font)
-        draw.text((rail_x - ib[0], pip_y0 - ib[1]), index_text, font=idx_font, fill=(245, 158, 11, 255))
-
-        rule_y = pip_y0 + (ib[3] - ib[1]) + int(height * 0.022)
+        if index_text:
+            idx_font = _load_cjk_font(max(36, int(height * 0.092)), weight="heavy")
+            ib = draw.textbbox((0, 0), index_text, font=idx_font)
+            draw.text((rail_x - ib[0], pip_y0 - ib[1]), index_text, font=idx_font, fill=(245, 158, 11, 255))
+            rule_y = pip_y0 + (ib[3] - ib[1]) + int(height * 0.022)
+        else:
+            rule_y = pip_y0 + int(height * 0.015)
         draw.rectangle([rail_x, rule_y, rail_x + int(width * 0.036), rule_y + 5], fill=(251, 191, 36, 255))
 
         grp_font = _load_cjk_font(max(20, int(height * 0.030)), weight="bold")
@@ -826,7 +828,8 @@ def compose_pip_card_image(
     margin_x = int(width * 0.12)
     draw.rectangle([margin_x, int(height * 0.30), margin_x + int(width * 0.055), int(height * 0.30) + 5], fill=(245, 158, 11))
     tag_font = _load_cjk_font(max(24, int(height * 0.032)), weight="bold")
-    draw.text((margin_x, int(height * 0.33)), f"{index_text}  /  {group_label or 'HIGHLIGHT'}", font=tag_font, fill=(251, 191, 36))
+    tag_str = f"{index_text}  /  {group_label or 'HIGHLIGHT'}" if index_text else (group_label or "HIGHLIGHT")
+    draw.text((margin_x, int(height * 0.33)), tag_str, font=tag_font, fill=(251, 191, 36))
     return _draw_frosted_glass_box(
         canvas,
         title=card_title or group_label,
@@ -1666,19 +1669,20 @@ def _create_title_card_video(
     fade_s: float,
     group_label: str,
     card_title: str,
-    card_index: int,
+    card_index: int = 0,
     out_mp4: Path,
     use_vt: bool,
     meta_parts: list[str] | None = None,
     left_meta_lines: list[str] | None = None,
     portrait_frame: SelectedFrame | None = None,
     enable_pip: bool = True,
+    index_text: str = "",
 ) -> bool:
     """Render an editorial PiP title card PNG and encode to an MP4 segment matching main stream."""
     img = compose_pip_card_image(
         width=width,
         height=height,
-        index_text=f"{card_index:02d}",
+        index_text=index_text,
         group_label=group_label or "高光精选",
         card_title=card_title or group_label,
         meta_parts=meta_parts or [],
@@ -1872,11 +1876,12 @@ def _render_remix(
                 use_vt=use_vt,
                 meta_parts=meta_parts,
                 left_meta_lines=[
-                    f"片段 {idx + 1:02d} · {BEAT_LABELS_ZH.get(it.beat_type, '高光')}",
+                    BEAT_LABELS_ZH.get(it.beat_type, "高光"),
                     published_date or (manifest.metadata.channel_zh or manifest.metadata.channel or ""),
                 ],
                 portrait_frame=portrait_sf,
                 enable_pip=remix_card_pip,
+                index_text="",
             )
             if ok:
                 concat_files.append(card_mp4)
@@ -2194,9 +2199,11 @@ def _render_compilation(
         # 1. Chapter title card
         card_mp4 = tmp_dir / f"card_{idx:02d}.mp4"
         card_title = (clip.cover_title or clip.title).strip()
-        part_tag = f"Part {idx:02d}"
-        if clip.categories:
-            part_tag += f" · {clip.categories[0]}"
+        part_tag = (
+            CATEGORY_LABELS_ZH.get(clip.categories[0], clip.categories[0])
+            if clip.categories
+            else (clip.chapter_title or "切片精选")
+        )
         portrait = _pick_portrait_frame(hero_pool, clip.start_s, clip.end_s)
         _create_title_card_video(
             width=w,
@@ -2212,6 +2219,7 @@ def _render_compilation(
             meta_parts=meta_parts,
             portrait_frame=portrait,
             enable_pip=True,
+            index_text="",
         )
         concat_files.append(card_mp4)
 
