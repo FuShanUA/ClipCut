@@ -152,6 +152,8 @@ class ProjectStore:
             "clips": [c.model_dump() for c in manifest.clips],
             "remix": manifest.remix.model_dump(),
             "metadata": manifest.metadata.model_dump(),
+            "source": manifest.source.model_dump(),
+            "utterances": [u.model_dump() for u in manifest.utterances],
         }
         snap_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         # Keep latest 30 snapshots
@@ -167,11 +169,15 @@ class ProjectStore:
         latest = snaps[-1]
         data = json.loads(latest.read_text(encoding="utf-8"))
         manifest = self.load()
-        from .models import ClipItem, RemixConfig, VideoMetadata
+        from .models import ClipItem, MediaSource, RemixConfig, Utterance, VideoMetadata
 
         manifest.clips = [ClipItem.model_validate(c) for c in data["clips"]]
         manifest.remix = RemixConfig.model_validate(data["remix"])
         manifest.metadata = VideoMetadata.model_validate(data["metadata"])
+        if "source" in data:
+            manifest.source = MediaSource.model_validate(data["source"])
+        if "utterances" in data:
+            manifest.utterances = [Utterance.model_validate(u) for u in data["utterances"]]
         self.save(manifest)
         latest.unlink(missing_ok=True)
         self.append_receipt(

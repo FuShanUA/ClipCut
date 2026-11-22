@@ -370,6 +370,14 @@ def make_project_id(video_path: Path) -> str:
     return f"{slug}-{h}" if slug else f"vid-{h}"
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def resolve_work_dir(video_path: Path) -> Path:
     pid = make_project_id(video_path)
     return video_path.parent / ".clipcut" / pid
@@ -483,6 +491,7 @@ def ingest_source(
         analysis_video=str(analysis_video),
         subtitle_path=str(sub_p),
         subtitle_format=sub_p.suffix.lower().lstrip("."),
+        subtitle_sha256=sha256_file(sub_p),
         work_dir=str(work_dir),
         output_dir=str(output_dir),
         duration_s=probe["duration_s"],

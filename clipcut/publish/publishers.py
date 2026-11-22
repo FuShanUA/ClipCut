@@ -487,6 +487,21 @@ def _default_target_metadata(manifest: ProjectManifest, target: str) -> tuple[Pa
         tags = list(dict.fromkeys(manifest.primary_topics + ["AI", "深度访谈", "合集"]))[:6]
         return vpath, title, cover_title, desc, tags, cmp.publish_records
 
+    if target == "clean_cut":
+        cc = manifest.clean_cut
+        vpath = Path(cc.output_file) if cc.output_file else None
+        fallback_t = f"{manifest.metadata.original_theme_zh or manifest.metadata.original_title or '全片'}（净版）"
+        title = (cc.title or cc.cover_title or fallback_t).strip()
+        cover_title = (cc.cover_title or title).strip()
+        active_segs = [
+            s for s in manifest.cut_segments
+            if s.enabled and ((s.kind == "ad" and cc.cut_ads) or (s.kind == "political_sensitive" and cc.cut_political_sensitive))
+        ]
+        summary = f"已智能剪除 {len(active_segs)} 段广告/敏感内容（完整合规净版）" if active_segs else "完整合规净版"
+        desc = f"{manifest.metadata.guest_zh or ''} · {manifest.metadata.channel_zh or manifest.metadata.channel or ''}\n{summary}".strip()
+        tags = list(dict.fromkeys(manifest.primary_topics + ["AI", "深度访谈", "全片"]))[:6]
+        return vpath, title, cover_title, desc, tags, cc.publish_records
+
     for c in manifest.clips:
         if c.clip_id == target:
             vpath = Path(c.output_file) if c.output_file else None

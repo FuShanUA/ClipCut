@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import copy
 import json
 import mimetypes
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -16,16 +18,37 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ..adapters.ingest import ingest_source, resolve_work_dir, scan_input_path
+from ..cancel import JobCancelToken, JobCancelledError, use_cancel_token
 from ..config import PROJECT_ROOT, load_editorial_config, load_editorial_raw, save_editorial_config, save_editorial_raw
 from ..llm import MODEL_CATALOG, parse_provider_model
-from ..models import ProjectManifest, PublishRecord, utc_now_iso
-from ..pipeline.orchestrator import ALL_STAGES, run_existing_project_stages
+from ..models import CutSegment, ProjectManifest, PublishRecord, RemixItem, SubtitleRepairItem, utc_now_iso
+from ..pipeline.content_filter import (
+    DEFAULT_POLITICAL_PROFILES,
+    VALID_POLITICAL_ACTIONS,
+    VALID_SEVERITIES,
+    get_active_cut_segments,
+    get_active_cut_spans,
+    get_active_delete_spans,
+    get_overlapping_mask_payload,
+    get_political_profiles,
+    has_clean_source_video,
+    scan_cut_segments,
+    segment_matches_sensitivity,
+    sync_all_render_hashes,
+)
+from ..pipeline.orchestrator import (
+    ALL_STAGES,
+    inspect_rendered_assets,
+    reset_project_strategy,
+    run_existing_project_stages,
+)
 from ..pipeline.verify_and_plan import (
     _load_audio_envelope,
     compute_clip_render_hash,
     compute_compilation_render_hash,
     compute_remix_render_hash,
     compute_remix_source_signature,
+    get_compilation_clips,
     select_curated_top_clips,
     snap_bounds_with_acoustic_guard,
 )
@@ -33,9 +56,12 @@ from ..publish import get_platforms_status, launch_platform_login, publish_to_pl
 from ..receipts import ProjectStore
 from ..render.renderer import (
     refresh_single_cover,
+    render_clean_cut_and_cover,
     render_compilation_and_cover,
+    render_remix_and_cover,
     render_single_clip_and_cover,
 )
+from ..subtitle_repair import apply_subtitle_repairs
 
 REGISTRY_PATH = PROJECT_ROOT / ".clipcut_registry.json"
 
@@ -58,8 +84,54 @@ async def _no_cache_html(request: Request, call_next):
 
 # Background job state per project_id
 _ACTIVE_JOBS: dict[str, dict[str, Any]] = {}
+_JOB_CANCEL_TOKENS: dict[str, JobCancelToken] = {}
 _JOBS_LOCK = threading.Lock()
 _SERVER_STARTED_AT = utc_now_iso()
+
+
+def _start_job_entry(
+    project_id: str,
+    job_id: str,
+    stages: list[str],
+    *,
+    cancellable: bool = True,
+) -> JobCancelToken | None:
+    token = JobCancelToken() if cancellable else None
+    with _JOBS_LOCK:
+        if _ACTIVE_JOBS.get(project_id, {}).get("running"):
+            raise HTTPException(status_code=409, detail="该项目已有流水线任务正在运行中")
+        _ACTIVE_JOBS[project_id] = {
+            "job_id": job_id,
+            "running": True,
+            "cancelling": False,
+            "cancelled": False,
+            "stages": list(stages),
+            "error": None,
+        }
+        if token is not None:
+            _JOB_CANCEL_TOKENS[project_id] = token
+        else:
+            _JOB_CANCEL_TOKENS.pop(project_id, None)
+    return token
+
+
+def _finish_job_entry(
+    project_id: str,
+    job_id: str,
+    token: JobCancelToken | None,
+    *,
+    cancelled: bool = False,
+    error: str | None = None,
+) -> None:
+    with _JOBS_LOCK:
+        cur = _ACTIVE_JOBS.get(project_id)
+        if cur and cur.get("job_id") == job_id:
+            cur["running"] = False
+            cur["cancelling"] = False
+            cur["cancelled"] = cancelled
+            cur["error"] = error
+        if token is not None and _JOB_CANCEL_TOKENS.get(project_id) is token:
+            _JOB_CANCEL_TOKENS.pop(project_id, None)
 
 
 def _is_before_server_start(ts: str) -> bool:
@@ -81,12 +153,19 @@ def _has_stale_running_record(manifest: ProjectManifest) -> bool:
     all_lists = [
         manifest.remix.publish_records,
         manifest.compilation.publish_records,
+        manifest.clean_cut.publish_records,
         *[c.publish_records for c in manifest.clips],
     ]
-    return any(
+    has_stale_pub = any(
         rec.status == "running" and _is_before_server_start(rec.updated_at)
         for recs in all_lists
         for rec in recs
+    )
+    if has_stale_pub:
+        return True
+    return any(
+        st.status == "running" and _is_before_server_start(st.started_at or manifest.updated_at)
+        for st in manifest.stages.values()
     )
 
 
@@ -101,6 +180,7 @@ def _cleanup_stale_running_publish_records(store: ProjectStore, job_running: boo
         all_lists = [
             m.remix.publish_records,
             m.compilation.publish_records,
+            m.clean_cut.publish_records,
             *[c.publish_records for c in m.clips],
         ]
         for recs in all_lists:
@@ -112,6 +192,11 @@ def _cleanup_stale_running_publish_records(store: ProjectStore, job_running: boo
                     rec.message = "上传因服务重启中断"
                     rec.error = "上次上传未完成（服务已重启），请重新发布"
                     rec.updated_at = now_iso
+        for st in m.stages.values():
+            if st.status == "running" and _is_before_server_start(st.started_at or m.updated_at):
+                st.status = "idle"
+                st.message = "上次执行因服务重启中断"
+                st.error = None
 
     return store.update_manifest(_mutate)
 
@@ -173,8 +258,16 @@ class OpenProjectRequest(BaseModel):
 
 
 class RunStagesRequest(BaseModel):
-    stages: list[str] = Field(default_factory=lambda: ["signals", "analyze", "verify_and_plan"])
+    stages: list[str] = Field(default_factory=lambda: ["signals", "scan_cuts", "analyze", "verify_and_plan"])
     force_render: bool = False
+    render_targets: list[str] | None = None
+    text_model: str | None = None
+    multimodal_model: str | None = None
+
+
+class ReplanStrategyRequest(BaseModel):
+    delete_rendered_files: bool = False
+    force_signals: bool = False
     text_model: str | None = None
     multimodal_model: str | None = None
 
@@ -221,6 +314,11 @@ class PatchRemixRequest(BaseModel):
     enable_bgm: bool | None = None
     bgm_volume: float | None = None
     sfx_volume: float | None = None
+    source_clip_ids: list[str] | None = None
+    clear_source_clip_ids: bool = False
+    manual_script_locked: bool | None = None
+    add_clip_id: str | None = None
+    remove_remix_id: str | None = None
     items: list[PatchRemixItem] | None = None
 
 
@@ -228,12 +326,64 @@ class PatchCompilationRequest(BaseModel):
     enabled: bool | None = None
     title: str | None = None
     cover_title: str | None = None
+    clip_ids: list[str] | None = None
+    clear_clip_ids: bool = False
     card_duration_s: float | None = None
     card_fade_s: float | None = None
 
 
+class ScanCleanCutRequest(BaseModel):
+    cut_ads: bool | None = None
+    cut_political_sensitive: bool | None = None
+    sensitivity: str | None = None
+
+
+class CutSegmentPatch(BaseModel):
+    cut_id: str
+    enabled: bool | None = None
+    kind: str | None = None
+    severity: str | None = None
+    action: str | None = None
+    sensitive_terms_zh: list[str] | None = None
+    sensitive_terms_en: list[str] | None = None
+    start_utt: int | None = None
+    end_utt: int | None = None
+    start_s: float | None = None
+    end_s: float | None = None
+    reason: str | None = None
+
+
+class AddCutSegmentPayload(BaseModel):
+    kind: str = "political_sensitive"
+    start_s: float
+    end_s: float
+    reason: str = "人工手动屏蔽区间"
+
+
+class PatchCleanCutRequest(BaseModel):
+    enabled: bool | None = None
+    title: str | None = None
+    cover_title: str | None = None
+    cut_ads: bool | None = None
+    cut_political_sensitive: bool | None = None
+    sensitivity: str | None = None
+    political_action: str | None = None
+    apply_to_clips: bool | None = None
+    cut_mode: str | None = None
+    segments: list[CutSegmentPatch] | None = None
+    add_segment: AddCutSegmentPayload | None = None
+    delete_ids: list[str] | None = None
+
+
 class RefreshCoverRequest(BaseModel):
     target: str = "remix"
+
+
+class SubtitleRepairRequest(BaseModel):
+    repairs: list[SubtitleRepairItem]
+    rebuild_full_subtitle: bool = True
+    render_clip: bool = True
+    render_full_video: bool = False
 
 
 class ReorderClipsRequest(BaseModel):
@@ -255,6 +405,30 @@ class PublishRequest(BaseModel):
 
 class UpdateEditorialRequest(BaseModel):
     raw_yaml: str
+
+
+class PoliticalRuleSchema(BaseModel):
+    id: str = ""
+    name: str
+    severity: str = "medium"
+    description: str = ""
+
+
+class PoliticalProfileSchema(BaseModel):
+    label: str
+    description: str = ""
+    trigger_severities: list[str]
+    rules: list[PoliticalRuleSchema] = Field(default_factory=list)
+
+
+class UpdateContentFilterConfigRequest(BaseModel):
+    default_sensitivity: str | None = None
+    default_political_action: str | None = None
+    political_profiles: dict[str, PoliticalProfileSchema] | None = None
+
+
+class ResetContentFilterConfigRequest(BaseModel):
+    profile: str | None = None
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -357,46 +531,129 @@ def open_project(req: OpenProjectRequest):
 def get_project(project_id: str):
     store = _get_store(project_id)
     with _JOBS_LOCK:
-        job = _ACTIVE_JOBS.get(project_id, {"running": False})
+        job = dict(_ACTIVE_JOBS.get(project_id) or {"running": False})
     manifest = _cleanup_stale_running_publish_records(store, bool(job.get("running")))
+    if not bool(job.get("running")) and manifest.clean_cut.enabled:
+        cfg = load_editorial_config()
+        if not get_active_cut_segments(manifest, cfg):
+            manifest.clean_cut.enabled = False
+            sync_all_render_hashes(manifest, cfg=cfg)
+            store.save(manifest)
     return {
         "manifest": manifest.model_dump(),
         "job": job,
+        "assets": inspect_rendered_assets(manifest),
+        "can_mask": has_clean_source_video(manifest),
     }
 
 
 @app.post("/api/projects/{project_id}/run")
 def run_project_stages(project_id: str, req: RunStagesRequest):
     store = _get_store(project_id)
-    with _JOBS_LOCK:
-        if _ACTIVE_JOBS.get(project_id, {}).get("running"):
-            raise HTTPException(status_code=409, detail="该项目已有流水线任务正在运行中")
-        job_id = f"job_{uuid.uuid4().hex[:8]}"
-        _ACTIVE_JOBS[project_id] = {
-            "job_id": job_id,
-            "running": True,
-            "stages": req.stages,
-            "error": None,
-        }
+    job_id = f"job_{uuid.uuid4().hex[:8]}"
+    token = _start_job_entry(project_id, job_id, req.stages, cancellable=True)
+    assert token is not None
 
     def _worker():
         try:
-            run_existing_project_stages(
-                store.work_dir,
-                req.stages,
-                force_render=req.force_render,
-                text_model=req.text_model,
-                multimodal_model=req.multimodal_model,
-            )
-            with _JOBS_LOCK:
-                _ACTIVE_JOBS[project_id]["running"] = False
+            with use_cancel_token(token):
+                run_existing_project_stages(
+                    store.work_dir,
+                    req.stages,
+                    force_render=req.force_render,
+                    render_targets=req.render_targets,
+                    text_model=req.text_model,
+                    multimodal_model=req.multimodal_model,
+                    cancel_token=token,
+                )
+            _finish_job_entry(project_id, job_id, token)
+        except JobCancelledError:
+            _finish_job_entry(project_id, job_id, token, cancelled=True, error=None)
         except Exception as exc:
-            with _JOBS_LOCK:
-                _ACTIVE_JOBS[project_id]["running"] = False
-                _ACTIVE_JOBS[project_id]["error"] = str(exc)
+            _finish_job_entry(project_id, job_id, token, error=str(exc))
 
     threading.Thread(target=_worker, daemon=True).start()
     return {"started": True, "job_id": job_id, "stages": req.stages}
+
+
+@app.post("/api/projects/{project_id}/cancel")
+def cancel_project_job(project_id: str):
+    store = _get_store(project_id)
+    _ = store
+    with _JOBS_LOCK:
+        job = _ACTIVE_JOBS.get(project_id)
+        if not job or not job.get("running"):
+            return {"cancelled": False, "message": "当前没有正在运行的任务"}
+        token = _JOB_CANCEL_TOKENS.get(project_id)
+        if token is None:
+            raise HTTPException(status_code=400, detail="当前任务类型不支持中途取消")
+        job["cancelling"] = True
+        job_id = str(job.get("job_id") or "")
+
+    token.cancel()
+    return {"cancelled": True, "job_id": job_id, "message": "已发送中止信号，正在停止任务..."}
+
+
+@app.get("/api/projects/{project_id}/rendered-assets")
+def get_rendered_assets(project_id: str):
+    store = _get_store(project_id)
+    manifest = store.load()
+    return inspect_rendered_assets(manifest)
+
+
+@app.post("/api/projects/{project_id}/replan-strategy")
+def replan_strategy(project_id: str, req: ReplanStrategyRequest):
+    store = _get_store(project_id)
+    manifest = store.load()
+    has_signals = (
+        not req.force_signals
+        and (store.work_dir / "audio_envelope.npz").exists()
+        and manifest.stages.get("signals") is not None
+        and manifest.stages["signals"].status == "completed"
+    )
+    stages = ["scan_cuts", "analyze", "verify_and_plan"] if has_signals else ["signals", "scan_cuts", "analyze", "verify_and_plan"]
+
+    job_id = f"replan_{uuid.uuid4().hex[:8]}"
+    token = _start_job_entry(project_id, job_id, stages, cancellable=True)
+    assert token is not None
+
+    try:
+        cleanup_info = reset_project_strategy(
+            manifest,
+            store,
+            delete_rendered_files=req.delete_rendered_files,
+            force_signals=req.force_signals,
+            run_id=job_id,
+        )
+        fresh_manifest = store.load()
+    except Exception as exc:
+        _finish_job_entry(project_id, job_id, token, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"重置策略失败: {exc}")
+
+    def _worker():
+        try:
+            with use_cancel_token(token):
+                run_existing_project_stages(
+                    store.work_dir,
+                    stages,
+                    text_model=req.text_model,
+                    multimodal_model=req.multimodal_model,
+                    cancel_token=token,
+                )
+            _finish_job_entry(project_id, job_id, token)
+        except JobCancelledError:
+            _finish_job_entry(project_id, job_id, token, cancelled=True, error=None)
+        except Exception as exc:
+            _finish_job_entry(project_id, job_id, token, error=str(exc))
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return {
+        "started": True,
+        "job_id": job_id,
+        "stages": stages,
+        **cleanup_info,
+        "manifest": fresh_manifest.model_dump(),
+    }
 
 
 def _sync_derived_hashes_after_clip_change(manifest: ProjectManifest, *, mark_remix_stale: bool = True) -> None:
@@ -575,7 +832,15 @@ def patch_clip(project_id: str, clip_id: str, req: PatchClipRequest):
         target.snap_delta_end_ms = de
         target.hook = manifest.utterances[target.start_utt].zh or manifest.utterances[target.start_utt].en
 
-    target.render_hash = compute_clip_render_hash(target, manifest.source.render_video)
+    active_cuts = get_active_delete_spans(manifest, cfg) if manifest.clean_cut.apply_to_clips else []
+    clip_masks = get_overlapping_mask_payload(target.start_s, target.end_s, manifest, cfg) if manifest.clean_cut.apply_to_clips else []
+    target.render_hash = compute_clip_render_hash(
+        target,
+        manifest.source.render_video,
+        active_cuts,
+        manifest.source.subtitle_sha256,
+        mask_payload=clip_masks,
+    )
     enabled_changed = req.enabled is not None and target.enabled != before["enabled"]
     _sync_derived_hashes_after_clip_change(manifest, mark_remix_stale=(enabled_changed or bounds_changed))
     store.save(manifest)
@@ -616,6 +881,36 @@ def render_single_clip(project_id: str, clip_id: str, force: bool = False):
     return {"ok": True, "output_file": res, "manifest": manifest.model_dump()}
 
 
+@app.post("/api/projects/{project_id}/clips/{clip_id}/subtitle-repair")
+def repair_clip_subtitles(project_id: str, clip_id: str, req: SubtitleRepairRequest):
+    store = _get_store(project_id)
+    manifest = store.load()
+    try:
+        outcome = apply_subtitle_repairs(
+            manifest,
+            store,
+            clip_id,
+            req.repairs,
+            rebuild_full_subtitle=req.rebuild_full_subtitle,
+            render_clip=req.render_clip,
+            render_full_video=req.render_full_video,
+        )
+    except (ValueError, FileNotFoundError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    manifest = store.load()
+    return {
+        "ok": True,
+        "changed_utterance_ids": outcome.changed_utterance_ids,
+        "bi_srt_path": str(outcome.bi_srt_path),
+        "cn_srt_path": str(outcome.cn_srt_path),
+        "en_srt_path": str(outcome.en_srt_path),
+        "ass_path": str(outcome.ass_path),
+        "clip_output_path": str(outcome.clip_output_path) if outcome.clip_output_path else None,
+        "full_hardsub_path": str(outcome.full_hardsub_path) if outcome.full_hardsub_path else None,
+        "manifest": manifest.model_dump(),
+    }
+
+
 @app.patch("/api/projects/{project_id}/remix")
 def patch_remix(project_id: str, req: PatchRemixRequest):
     store = _get_store(project_id)
@@ -650,6 +945,52 @@ def patch_remix(project_id: str, req: PatchRemixRequest):
         r.bgm_volume = max(0.0, min(1.0, float(req.bgm_volume)))
     if req.sfx_volume is not None:
         r.sfx_volume = max(0.0, min(1.0, float(req.sfx_volume)))
+
+    clip_by_id = {c.clip_id: c for c in manifest.clips}
+    if req.clear_source_clip_ids:
+        r.source_clip_ids = None
+        r.manual_script_locked = False
+    elif req.source_clip_ids is not None:
+        deduped_src: list[str] = []
+        seen_src: set[str] = set()
+        for cid in req.source_clip_ids:
+            if cid in clip_by_id and cid not in seen_src:
+                deduped_src.append(cid)
+                seen_src.add(cid)
+        r.source_clip_ids = deduped_src
+        r.manual_script_locked = False
+
+    if req.add_clip_id:
+        add_c = clip_by_id.get(req.add_clip_id)
+        if not add_c:
+            raise HTTPException(status_code=404, detail=f"未找到切片: {req.add_clip_id}")
+        next_order = max((it.order for it in r.items), default=0) + 1
+        r.items.append(
+            RemixItem(
+                remix_id=f"rmx_{uuid.uuid4().hex[:6]}",
+                order=next_order,
+                enabled=True,
+                source_clip_id=add_c.clip_id,
+                role="core",
+                beat_type="case_demo",
+                theme_id=f"M{next_order:02d}",
+                group_label=(add_c.chapter_title or add_c.title)[:10],
+                card_title=(add_c.cover_title or add_c.title)[:24],
+                start_utt=add_c.start_utt,
+                end_utt=add_c.end_utt,
+                start_s=add_c.start_s,
+                end_s=add_c.end_s,
+                quote=(add_c.hook or add_c.key_quote or add_c.title)[:160],
+                reason="人工手动加入混剪",
+            )
+        )
+        r.manual_script_locked = True
+
+    if req.remove_remix_id:
+        r.items = [it for it in r.items if it.remix_id != req.remove_remix_id]
+        for idx, it in enumerate(sorted(r.items, key=lambda x: x.order), 1):
+            it.order = idx
+        r.manual_script_locked = True
 
     if req.items is not None:
         rms, hop_s = _load_audio_envelope(store)
@@ -687,6 +1028,12 @@ def patch_remix(project_id: str, req: PatchRemixRequest):
                 it.start_s = s_t
                 it.end_s = e_t
         r.items.sort(key=lambda x: x.order)
+        r.manual_script_locked = True
+
+    if req.manual_script_locked is not None:
+        r.manual_script_locked = bool(req.manual_script_locked)
+    if r.manual_script_locked:
+        r.planned_source_signature = compute_remix_source_signature(manifest)
 
     r.render_hash = compute_remix_render_hash(manifest)
     store.save(manifest)
@@ -701,6 +1048,89 @@ def patch_remix(project_id: str, req: PatchRemixRequest):
         summary=f"人工更新 Remix 编排（卡片:{r.card_mode}，BGM:{'开' if r.enable_bgm else '关'}，启用段落 {sum(1 for x in r.items if x.enabled)}/{len(r.items)}）",
     )
     return {"manifest": manifest.model_dump()}
+
+
+def _set_render_stage_state(
+    store: ProjectStore,
+    *,
+    status: str,
+    message: str,
+    elapsed_ms: int | None = None,
+    error: str | None = None,
+) -> None:
+    def _mut(m: ProjectManifest) -> None:
+        st = m.stages.get("render")
+        if st is None:
+            return
+        st.status = status  # type: ignore[assignment]
+        st.message = message
+        if status == "running":
+            st.started_at = utc_now_iso()
+            st.finished_at = None
+            st.error = None
+        else:
+            st.finished_at = utc_now_iso()
+            st.error = error
+        if elapsed_ms is not None:
+            st.elapsed_ms = elapsed_ms
+
+    store.update_manifest(_mut)
+
+
+def _launch_target_render_job(
+    project_id: str,
+    store: ProjectStore,
+    prefix: str,
+    label: str,
+    runner_fn: Any,
+) -> dict[str, Any]:
+    job_id = f"{prefix}_{uuid.uuid4().hex[:8]}"
+    token = _start_job_entry(project_id, job_id, ["render"], cancellable=True)
+    assert token is not None
+    _set_render_stage_state(store, status="running", message=f"正在渲染{label}...")
+
+    def _worker():
+        t0 = time.monotonic()
+        try:
+            manifest = store.load()
+            with use_cancel_token(token):
+                ok, res = runner_fn(manifest)
+                if not ok:
+                    raise RuntimeError(res)
+            elapsed = int((time.monotonic() - t0) * 1000)
+            _set_render_stage_state(store, status="completed", message=f"{label}渲染完成", elapsed_ms=elapsed)
+            _finish_job_entry(project_id, job_id, token)
+        except JobCancelledError:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            _set_render_stage_state(store, status="idle", message="已手动中止", elapsed_ms=elapsed)
+            _finish_job_entry(project_id, job_id, token, cancelled=True, error=None)
+        except Exception as exc:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            _set_render_stage_state(
+                store, status="error", message=str(exc)[:180], elapsed_ms=elapsed, error=str(exc)
+            )
+            _finish_job_entry(project_id, job_id, token, error=str(exc))
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return {"started": True, "job_id": job_id}
+
+
+@app.post("/api/projects/{project_id}/remix/render")
+def render_remix_endpoint(project_id: str, force: bool = False):
+    store = _get_store(project_id)
+    cfg = load_editorial_config()
+    manifest_chk = store.load()
+    if manifest_chk.remix.items and not any(it.enabled for it in manifest_chk.remix.items):
+        raise HTTPException(status_code=400, detail="未勾选任何混剪段落，请至少勾选 1 段后再渲染")
+    if not manifest_chk.remix.items and not (manifest_chk.clips or manifest_chk.remix_only_pool):
+        raise HTTPException(status_code=400, detail="没有可用于混剪的切片素材")
+    return _launch_target_render_job(
+        project_id,
+        store,
+        "remix",
+        "AI 混剪",
+        lambda m: render_remix_and_cover(m, store, cfg, force=force),
+    )
 
 
 @app.patch("/api/projects/{project_id}/compilation")
@@ -725,6 +1155,17 @@ def patch_compilation(project_id: str, req: PatchCompilationRequest):
         if new_ct != c.cover_title:
             c.cover_title = new_ct
             cover_title_changed = True
+    if req.clear_clip_ids:
+        c.clip_ids = []
+    elif req.clip_ids is not None:
+        valid_ids = {cl.clip_id for cl in manifest.clips}
+        deduped_cids: list[str] = []
+        seen_cids: set[str] = set()
+        for cid in req.clip_ids:
+            if cid in valid_ids and cid not in seen_cids:
+                deduped_cids.append(cid)
+                seen_cids.add(cid)
+        c.clip_ids = deduped_cids
     if req.card_duration_s is not None:
         c.card_duration_s = max(0.5, min(5.0, float(req.card_duration_s)))
     if req.card_fade_s is not None:
@@ -740,7 +1181,7 @@ def patch_compilation(project_id: str, req: PatchCompilationRequest):
         stage="human_edit",
         actor="human",
         action="edit_compilation",
-        summary=f"人工更新切片精选集设置（启用:{c.enabled}，片头卡片停留:{c.card_duration_s:.1f}s）",
+        summary=f"人工更新切片精选集设置（启用:{c.enabled}，片头卡片停留:{c.card_duration_s:.1f}s，已选 {len(get_compilation_clips(manifest))} 支切片）",
     )
     return {"manifest": manifest.model_dump()}
 
@@ -748,13 +1189,243 @@ def patch_compilation(project_id: str, req: PatchCompilationRequest):
 @app.post("/api/projects/{project_id}/compilation/render")
 def render_compilation_endpoint(project_id: str, force: bool = False):
     store = _get_store(project_id)
+    cfg = load_editorial_config()
+    manifest_chk = store.load()
+    if not get_compilation_clips(manifest_chk):
+        raise HTTPException(status_code=400, detail="精选集未选择任何切片，请先在精选集内勾选切片")
+    return _launch_target_render_job(
+        project_id,
+        store,
+        "comp",
+        "切片精选集",
+        lambda m: render_compilation_and_cover(m, store, cfg, force=force),
+    )
+
+
+@app.post("/api/projects/{project_id}/clean-cut/scan")
+def scan_clean_cut_endpoint(project_id: str, req: ScanCleanCutRequest):
+    store = _get_store(project_id)
+    cfg = load_editorial_config()
+    job_id = f"scan_{uuid.uuid4().hex[:8]}"
+    token = _start_job_entry(project_id, job_id, ["clean_cut_scan"], cancellable=True)
+    assert token is not None
+
+    def _worker():
+        try:
+            manifest = store.load()
+            with use_cancel_token(token):
+                scan_cut_segments(
+                    manifest,
+                    store,
+                    cfg,
+                    job_id,
+                    scan_ads=req.cut_ads,
+                    scan_political=req.cut_political_sensitive,
+                    sensitivity=req.sensitivity,
+                )
+            _finish_job_entry(project_id, job_id, token)
+        except JobCancelledError:
+            store.log("[clean_cut] 合规扫描已手动中止")
+            store.append_receipt(
+                run_id=job_id,
+                stage="clean_cut",
+                actor="human",
+                action="scan_cancelled",
+                summary="广告/敏感内容扫描已手动中止",
+            )
+            _finish_job_entry(project_id, job_id, token, cancelled=True, error=None)
+        except Exception as exc:
+            _finish_job_entry(project_id, job_id, token, error=str(exc))
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return {"started": True, "job_id": job_id}
+
+
+@app.patch("/api/projects/{project_id}/clean-cut")
+def patch_clean_cut(project_id: str, req: PatchCleanCutRequest):
+    store = _get_store(project_id)
     manifest = store.load()
     cfg = load_editorial_config()
-    ok, res = render_compilation_and_cover(manifest, store, cfg, force=force)
-    if not ok:
-        raise HTTPException(status_code=500, detail=f"渲染精选集失败: {res}")
-    manifest = store.load()
-    return {"ok": True, "output_file": res, "manifest": manifest.model_dump()}
+    store.save_undo_snapshot(manifest, "修改全片净版设置与剪除区间")
+
+    cc = manifest.clean_cut
+    prev_sens = str(cc.sensitivity or "strict")
+    prev_has_pol = any(
+        s.kind == "political_sensitive" and segment_matches_sensitivity(s, prev_sens, cfg)
+        for s in manifest.cut_segments
+    )
+    if req.enabled is not None:
+        cc.enabled = req.enabled
+    title_changed = False
+    if req.title is not None:
+        new_t = req.title.strip()
+        if new_t != cc.title:
+            cc.title = new_t
+            title_changed = True
+    cover_title_changed = False
+    if req.cover_title is not None:
+        new_ct = req.cover_title.strip()
+        if new_ct != cc.cover_title:
+            cc.cover_title = new_ct
+            cover_title_changed = True
+    if req.sensitivity in ("strict", "balanced", "loose"):
+        cc.sensitivity = req.sensitivity  # type: ignore[assignment]
+    if req.political_action in VALID_POLITICAL_ACTIONS:
+        cc.political_action = req.political_action  # type: ignore[assignment]
+    if req.apply_to_clips is not None:
+        cc.apply_to_clips = req.apply_to_clips
+    if req.cut_mode in ("auto", "precise", "reencode"):
+        cc.cut_mode = req.cut_mode  # type: ignore[assignment]
+
+    if req.delete_ids:
+        del_set = set(req.delete_ids)
+        manifest.cut_segments = [s for s in manifest.cut_segments if s.cut_id not in del_set]
+
+    n_utts = len(manifest.utterances)
+    dur = float(manifest.source.duration_s or (manifest.utterances[-1].end_s if manifest.utterances else 0.0))
+    if req.segments:
+        rms, hop_s = _load_audio_envelope(store)
+        by_id = {s.cut_id: s for s in manifest.cut_segments}
+        for upd in req.segments:
+            seg = by_id.get(upd.cut_id)
+            if not seg:
+                continue
+            if upd.enabled is not None:
+                seg.enabled = upd.enabled
+            if upd.kind in ("ad", "political_sensitive"):
+                seg.kind = upd.kind  # type: ignore[assignment]
+            if upd.severity in ("high", "medium", "low"):
+                seg.severity = upd.severity  # type: ignore[assignment]
+            if upd.action in ("inherit", "delete", "mask"):
+                seg.action = upd.action  # type: ignore[assignment]
+            if upd.sensitive_terms_zh is not None:
+                seg.sensitive_terms_zh = [str(x).strip() for x in upd.sensitive_terms_zh if str(x).strip()]
+            if upd.sensitive_terms_en is not None:
+                seg.sensitive_terms_en = [str(x).strip() for x in upd.sensitive_terms_en if str(x).strip()]
+            if upd.reason is not None:
+                seg.reason = upd.reason.strip()
+            utt_bounds_changed = False
+            if n_utts > 0 and upd.start_utt is not None:
+                seg.start_utt = max(0, min(upd.start_utt, n_utts - 1))
+                utt_bounds_changed = True
+            if n_utts > 0 and upd.end_utt is not None:
+                base_su = seg.start_utt if seg.start_utt is not None else 0
+                seg.end_utt = max(base_su, min(upd.end_utt, n_utts - 1))
+                utt_bounds_changed = True
+            if utt_bounds_changed and seg.start_utt is not None and seg.end_utt is not None:
+                s_t, e_t, _, _, _ = snap_bounds_with_acoustic_guard(
+                    start_utt=seg.start_utt,
+                    end_utt=seg.end_utt,
+                    utterances=manifest.utterances,
+                    rms=rms,
+                    hop_s=hop_s,
+                    video_duration=dur,
+                    cfg=cfg,
+                )
+                seg.start_s = s_t
+                seg.end_s = e_t
+                seg.quote = " ".join(
+                    (manifest.utterances[i].zh or manifest.utterances[i].en).strip()
+                    for i in range(seg.start_utt, seg.end_utt + 1)
+                )[:180]
+            else:
+                if upd.start_s is not None:
+                    seg.start_s = round(max(0.0, float(upd.start_s)), 3)
+                if upd.end_s is not None:
+                    seg.end_s = round(min(dur if dur > 0 else float(upd.end_s), max(seg.start_s + 0.2, float(upd.end_s))), 3)
+
+    added_kind: str | None = None
+    if req.add_segment is not None:
+        ns = max(0.0, float(req.add_segment.start_s))
+        ne = min(dur if dur > 0 else float(req.add_segment.end_s), max(ns + 0.5, float(req.add_segment.end_s)))
+        su = next((u.id for u in manifest.utterances if u.end_s > ns), None)
+        eu = next((u.id for u in reversed(manifest.utterances) if u.start_s < ne), None)
+        if su is not None and eu is not None and eu < su:
+            su, eu = None, None
+        quote = ""
+        if su is not None and eu is not None:
+            quote = " ".join(
+                (manifest.utterances[i].zh or manifest.utterances[i].en).strip()
+                for i in range(su, eu + 1)
+            )[:180]
+        kind_val = req.add_segment.kind if req.add_segment.kind in ("ad", "political_sensitive") else "political_sensitive"
+        added_kind = kind_val
+        manifest.cut_segments.append(
+            CutSegment(
+                cut_id=f"cut_m_{uuid.uuid4().hex[:6]}",
+                kind=kind_val,  # type: ignore[arg-type]
+                subtype="manual",
+                enabled=True,
+                detector="manual",
+                start_utt=su,
+                end_utt=eu,
+                start_s=round(ns, 3),
+                end_s=round(ne, 3),
+                quote=quote,
+                reason=req.add_segment.reason.strip() or "人工手动屏蔽区间",
+                severity="high",
+            )
+        )
+        manifest.cut_segments.sort(key=lambda x: (x.start_s, x.end_s))
+
+    has_ads = any(s.kind == "ad" for s in manifest.cut_segments)
+    has_pol = any(
+        s.kind == "political_sensitive" and segment_matches_sensitivity(s, cc.sensitivity, cfg)
+        for s in manifest.cut_segments
+    )
+    if added_kind == "ad":
+        cc.cut_ads = True
+    elif added_kind == "political_sensitive":
+        cc.cut_political_sensitive = True
+    if req.cut_ads is not None:
+        cc.cut_ads = bool(req.cut_ads) and has_ads
+    if req.cut_political_sensitive is not None:
+        cc.cut_political_sensitive = bool(req.cut_political_sensitive) and has_pol
+    elif cc.sensitivity != prev_sens:
+        if not has_pol:
+            cc.cut_political_sensitive = False
+        elif not prev_has_pol and has_pol:
+            cc.cut_political_sensitive = True
+    if not has_ads:
+        cc.cut_ads = False
+    if not has_pol:
+        cc.cut_political_sensitive = False
+    if not get_active_cut_segments(manifest, cfg):
+        cc.enabled = False
+
+    sync_all_render_hashes(manifest, cfg=cfg)
+    store.save(manifest)
+    if (cover_title_changed or (title_changed and not cc.cover_title)) and cc.cover_file:
+        refresh_single_cover(manifest, store, cfg, "clean_cut")
+        manifest = store.load()
+    store.append_receipt(
+        run_id=f"human_{uuid.uuid4().hex[:6]}",
+        stage="human_edit",
+        actor="human",
+        action="edit_clean_cut",
+        summary=f"人工更新全片净版设置（启用:{cc.enabled}，广告:{cc.cut_ads}，政敏:{cc.cut_political_sensitive}，同步切片:{cc.apply_to_clips}，分段 {len(manifest.cut_segments)} 处）",
+    )
+    return {"manifest": manifest.model_dump()}
+
+
+@app.post("/api/projects/{project_id}/clean-cut/render")
+def render_clean_cut_endpoint(project_id: str, force: bool = False):
+    store = _get_store(project_id)
+    cfg = load_editorial_config()
+    manifest_chk = store.load()
+    if not get_active_cut_segments(manifest_chk, cfg):
+        if manifest_chk.clean_cut.enabled:
+            manifest_chk.clean_cut.enabled = False
+            sync_all_render_hashes(manifest_chk, cfg=cfg)
+            store.save(manifest_chk)
+        raise HTTPException(status_code=400, detail="当前没有任何需要剪切或脱敏的内容，无需输出全片净版")
+    return _launch_target_render_job(
+        project_id,
+        store,
+        "clean",
+        "全片净版",
+        lambda m: render_clean_cut_and_cover(m, store, cfg, force=force),
+    )
 
 
 
@@ -790,16 +1461,8 @@ def api_publish_project(project_id: str, req: PublishRequest):
     store = _get_store(project_id)
     if not req.platforms:
         raise HTTPException(status_code=400, detail="请至少选择一个发布平台")
-    with _JOBS_LOCK:
-        if _ACTIVE_JOBS.get(project_id, {}).get("running"):
-            raise HTTPException(status_code=409, detail="该项目已有后台任务正在运行中")
-        job_id = f"pub_{uuid.uuid4().hex[:8]}"
-        _ACTIVE_JOBS[project_id] = {
-            "job_id": job_id,
-            "running": True,
-            "stages": ["publish"],
-            "error": None,
-        }
+    job_id = f"pub_{uuid.uuid4().hex[:8]}"
+    _start_job_entry(project_id, job_id, ["publish"], cancellable=False)
 
     def _worker():
         try:
@@ -816,12 +1479,9 @@ def api_publish_project(project_id: str, req: PublishRequest):
                 tid=req.tid,
                 ui_schema=req.ui_schema,
             )
-            with _JOBS_LOCK:
-                _ACTIVE_JOBS[project_id]["running"] = False
+            _finish_job_entry(project_id, job_id, None)
         except Exception as exc:
-            with _JOBS_LOCK:
-                _ACTIVE_JOBS[project_id]["running"] = False
-                _ACTIVE_JOBS[project_id]["error"] = str(exc)
+            _finish_job_entry(project_id, job_id, None, error=str(exc))
 
     threading.Thread(target=_worker, daemon=True).start()
     return {"started": True, "job_id": job_id, "target": req.target, "platforms": req.platforms}
@@ -931,6 +1591,14 @@ def stream_media(project_id: str, kind: str, request: Request, clip_id: str | No
         if not manifest.compilation.cover_file:
             raise HTTPException(status_code=404, detail="精选集封面不存在")
         return FileResponse(manifest.compilation.cover_file, media_type="image/jpeg")
+    if kind == "clean_cut":
+        if not manifest.clean_cut.output_file:
+            raise HTTPException(status_code=404, detail="全片净版尚未渲染")
+        return _stream_file_range(Path(manifest.clean_cut.output_file), request)
+    if kind == "clean_cut_cover":
+        if not manifest.clean_cut.cover_file:
+            raise HTTPException(status_code=404, detail="全片净版封面不存在")
+        return FileResponse(manifest.clean_cut.cover_file, media_type="image/jpeg")
     raise HTTPException(status_code=400, detail=f"未知媒体类型: {kind}")
 
 
@@ -988,6 +1656,107 @@ def put_editorial_config(req: UpdateEditorialRequest):
         return {"saved": True, "categories": len(parsed.get("hot_topics", {}).get("categories", []))}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"YAML 格式错误: {exc}")
+
+
+@app.get("/api/config/content-filter")
+def get_content_filter_config():
+    cfg = load_editorial_config()
+    cf = cfg.get("content_filter", {})
+    default_sens = str(cf.get("sensitivity") or "strict").strip().lower()
+    if default_sens not in ("strict", "balanced", "loose"):
+        default_sens = "strict"
+    default_action = str(cf.get("political_action") or "auto").strip().lower()
+    if default_action not in VALID_POLITICAL_ACTIONS:
+        default_action = "auto"
+    return {
+        "default_sensitivity": default_sens,
+        "default_political_action": default_action,
+        "political_profiles": get_political_profiles(cfg),
+    }
+
+
+@app.put("/api/config/content-filter")
+def put_content_filter_config(req: UpdateContentFilterConfigRequest):
+    cfg = load_editorial_config()
+    cf = cfg.setdefault("content_filter", {})
+
+    if req.default_sensitivity is not None:
+        def_sens = str(req.default_sensitivity or "strict").strip().lower()
+        if def_sens not in ("strict", "balanced", "loose"):
+            raise HTTPException(status_code=400, detail=f"未知政审默认标准: {req.default_sensitivity}")
+        cf["sensitivity"] = def_sens
+
+    if req.default_political_action is not None:
+        def_action = str(req.default_political_action or "").strip().lower()
+        if def_action not in VALID_POLITICAL_ACTIONS:
+            raise HTTPException(status_code=400, detail=f"未知默认脱敏策略: {req.default_political_action}")
+        cf["political_action"] = def_action
+
+    if req.political_profiles is not None:
+        normalized: dict[str, dict[str, Any]] = {}
+        for key in ("strict", "balanced", "loose"):
+            prof = req.political_profiles.get(key)
+            if prof is None:
+                raise HTTPException(status_code=400, detail=f"缺少政审档位配置: {key}")
+            trig = [s for s in VALID_SEVERITIES if s in {x.strip().lower() for x in prof.trigger_severities}]
+            if not trig:
+                raise HTTPException(status_code=400, detail=f"档位 {key} 至少须包含一个生效风险等级")
+            clean_rules: list[dict[str, str]] = []
+            seen_ids: set[str] = set()
+            for idx, r in enumerate(prof.rules, 1):
+                name = r.name.strip()
+                desc = r.description.strip()
+                if not name and not desc:
+                    continue
+                rid = (r.id or "").strip() or f"rule_{idx}"
+                if rid in seen_ids:
+                    rid = f"{rid}_{idx}"
+                seen_ids.add(rid)
+                sev = str(r.severity or "medium").strip().lower()
+                if sev not in VALID_SEVERITIES:
+                    raise HTTPException(status_code=400, detail=f"规则 {name or rid} 风险等级无效: {r.severity}")
+                clean_rules.append(
+                    {
+                        "id": rid,
+                        "name": name or rid,
+                        "severity": sev,
+                        "description": desc,
+                    }
+                )
+            normalized[key] = {
+                "label": prof.label.strip() or DEFAULT_POLITICAL_PROFILES[key]["label"],
+                "description": prof.description.strip(),
+                "trigger_severities": trig,
+                "rules": clean_rules,
+            }
+        cf["political_profiles"] = normalized
+
+    save_editorial_config(cfg)
+    return {
+        "saved": True,
+        **get_content_filter_config(),
+    }
+
+
+@app.post("/api/config/content-filter/reset")
+def reset_content_filter_config(req: ResetContentFilterConfigRequest):
+    cfg = load_editorial_config()
+    cf = cfg.setdefault("content_filter", {})
+    profiles = get_political_profiles(cfg)
+    if req.profile is not None:
+        if req.profile not in ("strict", "balanced", "loose"):
+            raise HTTPException(status_code=400, detail=f"未知政审档位: {req.profile}")
+        profiles[req.profile] = copy.deepcopy(DEFAULT_POLITICAL_PROFILES[req.profile])
+    else:
+        profiles = copy.deepcopy(DEFAULT_POLITICAL_PROFILES)
+        cf["sensitivity"] = "strict"
+        cf["political_action"] = "auto"
+    cf["political_profiles"] = profiles
+    save_editorial_config(cfg)
+    return {
+        "reset": True,
+        **get_content_filter_config(),
+    }
 
 
 # Serve compiled React SPA if present

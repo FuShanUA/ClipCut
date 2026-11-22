@@ -76,8 +76,10 @@ def test_remix_quote_matching_and_utt_parsing():
 
 def test_editorial_config_loads():
     cfg = load_editorial_config()
-    assert cfg["clip_duration"]["min_seconds"] == 60
-    assert cfg["clip_duration"]["max_seconds"] == 300
+    assert cfg["clip_duration"]["min_seconds"] == 90
+    assert cfg["clip_duration"]["max_seconds"] == 360
+    assert cfg["clip_duration"]["adjacent_merge_max_gap_s"] == 12
+    assert cfg["clip_duration"]["max_clips_per_hour"] == 12
     assert cfg["hot_topics"]["primary_topic_dedup"] is True
     assert len(cfg["hot_topics"]["categories"]) >= 5
 
@@ -1685,6 +1687,289 @@ def test_wechat_publish_records_share_cover_unverified_warning(tmp_path, monkeyp
     rec = updated.clips[0].publish_records[0]
     assert rec.status == "draft"
     assert "分享卡片封面未确认" in rec.message
+
+
+def test_analyze_anti_fragmentation_budgets_and_prompts():
+    from clipcut.pipeline.analyze import (
+        _build_pass1_prompt,
+        _build_pass2_prompt,
+        _compute_clip_budget,
+        _compute_topic_budget,
+    )
+
+    cfg = load_editorial_config()
+    t_min, t_max = _compute_topic_budget(3135.4)
+    assert (t_min, t_max) == (9, 17)
+    b_min, b_max = _compute_clip_budget(3135.4, cfg)
+    assert 6 <= b_min <= b_max <= 12
+
+    utts = [Utterance(id=i, start_s=i * 100.0, end_s=(i + 1) * 100.0, zh=f"第{i}段内容。") for i in range(32)]
+    dense_chapters = [
+        Chapter(index=i, title=f"ShortCh{i}", start_s=i * 120.0, end_s=(i + 1) * 120.0)
+        for i in range(26)
+    ]
+    m = ProjectManifest(
+        project_id="test-anti-frag-prompts",
+        source=MediaSource(
+            analysis_video="v.mp4",
+            render_video="v.mp4",
+            duration_s=3135.4,
+            work_dir="/tmp/w",
+            output_dir="/tmp/o",
+        ),
+        metadata=VideoMetadata(original_title="Long Interview", chapters=dense_chapters),
+        utterances=utts,
+        topic_map=[
+            TopicMapItem(topic_id="T01", start_utt=0, end_utt=4, start_s=0.0, end_s=499.0, title="话题1", summary="总结1")
+        ],
+    )
+    p1 = _build_pass1_prompt(m, "txt")
+    assert f"{t_min}~{t_max} 个话题" in p1
+    assert "密集短章节强制归并" in p1
+
+    p2 = _build_pass2_prompt(m, cfg, "txt")
+    assert f"{b_min}~{b_max} 支" in p2
+    assert "同章/同论证链聚合" in p2
+
+
+def test_consolidate_adjacent_candidates_respects_chapters_and_limits():
+    from clipcut.models import MultimodalVerdict
+    from clipcut.pipeline.verify_and_plan import _consolidate_adjacent_candidates
+
+    cfg = load_editorial_config()
+    utts = [
+        Utterance(id=0, start_s=68.0, end_s=183.0, zh="CH1第一段。"),
+        Utterance(id=1, start_s=184.0, end_s=244.0, zh="CH1第二段。"),
+        Utterance(id=2, start_s=241.0, end_s=316.0, zh="CH2第一段。"),
+        Utterance(id=3, start_s=316.5, end_s=383.0, zh="CH2第二段。"),
+        Utterance(id=4, start_s=383.5, end_s=490.0, zh="CH2第三段。"),
+        Utterance(id=5, start_s=500.0, end_s=700.0, zh="CH3第一大段。"),
+        Utterance(id=6, start_s=702.0, end_s=910.0, zh="CH3第二大段。"),
+    ]
+    normal_chapters = [
+        Chapter(index=0, title="CH1", start_s=60.0, end_s=245.0),
+        Chapter(index=1, title="CH2", start_s=245.0, end_s=495.0),
+        Chapter(index=2, title="CH3", start_s=495.0, end_s=920.0),
+    ]
+    m = ProjectManifest(
+        project_id="test-consolidate",
+        source=MediaSource(
+            analysis_video="v.mp4",
+            render_video="v.mp4",
+            duration_s=1000.0,
+            work_dir="/tmp/w",
+            output_dir="/tmp/o",
+        ),
+        metadata=VideoMetadata(chapters=normal_chapters),
+        utterances=utts,
+    )
+    cands = [
+        Candidate(candidate_id="C1", chapter_title="CH1", title="背景", start_utt=0, end_utt=0, score=7.8),
+        Candidate(candidate_id="C2", chapter_title="CH1", title="转折", start_utt=1, end_utt=1, score=8.1),
+        Candidate(candidate_id="C3", chapter_title="CH2", title="OS可改", start_utt=2, end_utt=2, score=9.0),
+        Candidate(candidate_id="C4", chapter_title="CH2", title="可塑OS", start_utt=3, end_utt=3, score=8.8),
+        Candidate(
+            candidate_id="C5",
+            chapter_title="CH2",
+            title="Linux优势",
+            start_utt=4,
+            end_utt=4,
+            score=9.5,
+            multimodal=MultimodalVerdict(status="pass", intensity_score=9.0),
+        ),
+        # Total ~410s > 360s max_seconds -> must stay separate
+        Candidate(candidate_id="C6", chapter_title="CH3", title="大段1", start_utt=5, end_utt=5, score=8.9),
+        Candidate(candidate_id="C7", chapter_title="CH3", title="大段2", start_utt=6, end_utt=6, score=8.7),
+    ]
+
+    kept, logs = _consolidate_adjacent_candidates(cands, utts, m, cfg)
+    assert len(kept) == 4
+    # CH1 merged into 1
+    assert (kept[0].start_utt, kept[0].end_utt) == (0, 1)
+    assert kept[0].candidate_id == "C2"
+    # CH2 chained 3-into-1 and kept separate from CH1
+    assert (kept[1].start_utt, kept[1].end_utt) == (2, 4)
+    assert kept[1].candidate_id == "C5"
+    assert kept[1].multimodal.status == "pass"
+    # CH3 exceeds max_seconds so stays 2 separate clips
+    assert [(k.start_utt, k.end_utt) for k in kept[2:]] == [(5, 5), (6, 6)]
+    assert cands[0].disposition == "merged"
+    assert cands[2].disposition == "merged"
+    assert cands[3].disposition == "merged"
+    assert len(logs) == 3
+
+    # Dense short chapters allow merging tiny adjacent fragments across chapter titles
+    dense_m = m.model_copy(
+        update={
+            "source": m.source.model_copy(update={"duration_s": 3000.0}),
+            "metadata": VideoMetadata(
+                chapters=[
+                    Chapter(index=i, title=f"D{i}", start_s=i * 100.0, end_s=(i + 1) * 100.0)
+                    for i in range(25)
+                ]
+            ),
+        }
+    )
+    dense_utts = [
+        Utterance(id=0, start_s=100.0, end_s=165.0, zh="短章节A。"),
+        Utterance(id=1, start_s=165.5, end_s=235.0, zh="短章节B。"),
+    ]
+    dense_cands = [
+        Candidate(candidate_id="DA", chapter_title="D1", title="短A", start_utt=0, end_utt=0, score=8.0),
+        Candidate(candidate_id="DB", chapter_title="D2", title="短B", start_utt=1, end_utt=1, score=8.5),
+    ]
+    d_kept, d_logs = _consolidate_adjacent_candidates(dense_cands, dense_utts, dense_m, cfg)
+    assert len(d_kept) == 1
+    assert (d_kept[0].start_utt, d_kept[0].end_utt) == (0, 1)
+    assert len(d_logs) == 1
+
+
+def test_long_video_short_clip_routed_to_remix_pool(tmp_path, monkeypatch):
+    from clipcut.pipeline.verify_and_plan import run_verify_and_plan_stage
+
+    cfg = load_editorial_config()
+    vid = tmp_path / "long.mp4"
+    vid.write_bytes(b"v")
+    store = ProjectStore(tmp_path / "work")
+    m = ProjectManifest(
+        project_id="test-long-short-routing",
+        source=MediaSource(
+            analysis_video=str(vid),
+            render_video=str(vid),
+            duration_s=3100.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        utterances=[
+            Utterance(id=0, start_s=10.0, end_s=70.0, zh="一个60秒的短评论。"),
+            Utterance(id=1, start_s=500.0, end_s=620.0, zh="一个120秒的完整深度论证。"),
+        ],
+        candidates=[
+            Candidate(candidate_id="C_short", title="60秒短段", start_utt=0, end_utt=0, score=8.4),
+            Candidate(candidate_id="C_full", title="120秒完整段", start_utt=1, end_utt=1, score=9.0),
+        ],
+    )
+    store.save(m)
+    monkeypatch.setattr("clipcut.pipeline.verify_and_plan.plan_remix_from_clips", lambda manifest, *a, **kw: manifest)
+
+    out = run_verify_and_plan_stage(m, store, cfg, run_id="test_route")
+    assert [c.title for c in out.clips] == ["120秒完整段"]
+    assert [p.candidate_id for p in out.remix_only_pool] == ["C_short"]
+    assert out.candidates[0].disposition == "remix_only"
+
+
+def test_cancel_token_kills_subprocess_and_skips_llm_fallbacks():
+    import threading
+    import time
+    from clipcut.cancel import (
+        JobCancelToken,
+        JobCancelledError,
+        run_cancellable_subprocess,
+        use_cancel_token,
+    )
+    from clipcut.llm import ClipCutLLM
+
+    token = JobCancelToken()
+    errors: list[BaseException] = []
+
+    def _run_proc():
+        try:
+            with use_cancel_token(token):
+                run_cancellable_subprocess([sys.executable, "-c", "import time; time.sleep(10)"])
+        except BaseException as exc:
+            errors.append(exc)
+
+    t0 = time.monotonic()
+    th = threading.Thread(target=_run_proc, daemon=True)
+    th.start()
+    time.sleep(0.15)
+    token.cancel()
+    th.join(timeout=2.0)
+    elapsed = time.monotonic() - t0
+    assert not th.is_alive()
+    assert elapsed < 1.5
+    assert len(errors) == 1 and isinstance(errors[0], JobCancelledError)
+
+    # ClipCutLLM.generate_json must propagate JobCancelledError without trying fallback models
+    called_models: list[str] = []
+    llm = ClipCutLLM({})
+    llm.dashscope_key = "test-key"
+
+    def _fake_dashscope(**kwargs):
+        called_models.append(kwargs["model"])
+        raise JobCancelledError("任务已手动中止")
+
+    llm._call_dashscope = _fake_dashscope  # type: ignore[method-assign]
+    with use_cancel_token(JobCancelToken()):
+        try:
+            llm.generate_json(
+                prompt="hi",
+                model="qwen3.8-max",
+                provider="dashscope",
+                fallback_models=["qwen4-max", "glm-5.3"],
+            )
+            raise AssertionError("expected JobCancelledError")
+        except JobCancelledError:
+            pass
+    assert called_models == ["qwen3.8-max"]
+
+
+def test_orchestrator_cancel_resets_stage_to_idle_and_writes_receipt(tmp_path, monkeypatch):
+    from clipcut.cancel import JobCancelToken, JobCancelledError, check_cancelled
+    import clipcut.pipeline.orchestrator as orch
+
+    vid = tmp_path / "v.mp4"
+    vid.write_bytes(b"v")
+    store = ProjectStore(tmp_path / "work")
+    m = ProjectManifest(
+        project_id="test-orch-cancel",
+        source=MediaSource(
+            analysis_video=str(vid),
+            render_video=str(vid),
+            duration_s=120.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        utterances=[Utterance(id=0, start_s=0.0, end_s=10.0, zh="你好。")],
+    )
+    store.save(m)
+
+    token = JobCancelToken()
+    visited: list[str] = []
+
+    def fake_analyze(manifest, st, cfg, rid):
+        visited.append("analyze")
+        token.cancel()
+        check_cancelled()
+        return manifest
+
+    def fake_verify(manifest, st, cfg, rid):
+        visited.append("verify_and_plan")
+        return manifest
+
+    monkeypatch.setattr(orch, "run_analyze_stage", fake_analyze)
+    monkeypatch.setattr(orch, "run_verify_and_plan_stage", fake_verify)
+
+    try:
+        orch.run_existing_project_stages(
+            store.work_dir,
+            ["analyze", "verify_and_plan"],
+            cancel_token=token,
+        )
+        raise AssertionError("expected JobCancelledError")
+    except JobCancelledError:
+        pass
+
+    assert visited == ["analyze"]
+    loaded = store.load()
+    assert loaded.stages["analyze"].status == "idle"
+    assert loaded.stages["analyze"].message == "已手动中止"
+    assert loaded.stages["analyze"].error is None
+    assert loaded.stages["verify_and_plan"].status == "idle"
+    receipts = store.list_receipts(limit=20)
+    assert any(r.action == "stage_cancelled" and r.stage == "analyze" for r in receipts)
+
+
 
 
 

@@ -33,6 +33,11 @@ cd /path/to/ClipCut
 # 增量渲染变动项 / 重排 Remix
 .venv/bin/clipcut render "/path/to/video.mp4"
 .venv/bin/clipcut replan-remix "/path/to/video.mp4"
+
+# 按切片修复字幕并只重烧该切片；如需全片硬字幕同步修正，追加 --render-full-video
+.venv/bin/clipcut repair-subtitle "/path/to/video.mp4" \
+  --clip-id clip_10 \
+  --repair '{"utterance_id":193,"zh":"正确中文","en":"Correct English"}'
 ```
 
 ## 配置文件

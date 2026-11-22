@@ -68,6 +68,7 @@ class MediaSource(BaseModel):
     analysis_video: str
     subtitle_path: str | None = None
     subtitle_format: str = "srt"
+    subtitle_sha256: str = ""
     work_dir: str
     output_dir: str
     duration_s: float = 0.0
@@ -167,6 +168,12 @@ class PublishRecord(BaseModel):
     error: str | None = None
 
 
+class SubtitleRepairItem(BaseModel):
+    utterance_id: int
+    zh: str | None = None
+    en: str | None = None
+
+
 class ClipItem(BaseModel):
     clip_id: str
     index: int
@@ -197,6 +204,7 @@ class ClipItem(BaseModel):
     output_file: str | None = None
     cover_file: str | None = None
     cover_hash: str = ""
+    rendered_filter_tag: str = ""
     publish_records: list[PublishRecord] = Field(default_factory=list)
 
 
@@ -233,6 +241,8 @@ class RemixConfig(BaseModel):
     sfx_volume: float = 0.35
     bgm_path: str | None = None
     sfx_path: str | None = None
+    source_clip_ids: list[str] | None = None
+    manual_script_locked: bool = False
     items: list[RemixItem] = Field(default_factory=list)
     planned_source_signature: str = ""
     render_hash: str = ""
@@ -240,6 +250,7 @@ class RemixConfig(BaseModel):
     output_file: str | None = None
     cover_file: str | None = None
     cover_hash: str = ""
+    rendered_filter_tag: str = ""
     publish_records: list[PublishRecord] = Field(default_factory=list)
 
 
@@ -247,6 +258,7 @@ class CompilationConfig(BaseModel):
     enabled: bool = True
     title: str = "切片精选集"
     cover_title: str = ""
+    clip_ids: list[str] | None = None
     card_duration_s: float = 1.8
     card_fade_s: float = 0.2
     render_hash: str = ""
@@ -254,6 +266,47 @@ class CompilationConfig(BaseModel):
     output_file: str | None = None
     cover_file: str | None = None
     cover_hash: str = ""
+    rendered_filter_tag: str = ""
+    publish_records: list[PublishRecord] = Field(default_factory=list)
+
+
+class CutSegment(BaseModel):
+    cut_id: str
+    kind: Literal["ad", "political_sensitive"] = "ad"
+    subtype: str = ""
+    enabled: bool = True
+    detector: Literal["llm", "visual", "manual"] = "llm"
+    action: Literal["inherit", "delete", "mask"] = "inherit"
+    recommended_action: Literal["delete", "mask"] = "delete"
+    sensitive_terms_zh: list[str] = Field(default_factory=list)
+    sensitive_terms_en: list[str] = Field(default_factory=list)
+    start_utt: int | None = None
+    end_utt: int | None = None
+    start_s: float
+    end_s: float
+    quote: str = ""
+    reason: str = ""
+    severity: Literal["high", "medium", "low"] = "high"
+    chapter_title: str = ""
+
+
+class CleanCutConfig(BaseModel):
+    enabled: bool = False
+    title: str = ""
+    cover_title: str = ""
+    cut_ads: bool = False
+    cut_political_sensitive: bool = False
+    sensitivity: Literal["strict", "balanced", "loose"] = "strict"
+    political_action: Literal["auto", "delete", "mask"] = "delete"
+    apply_to_clips: bool = True
+    cut_mode: Literal["auto", "precise", "reencode"] = "auto"
+    scanned_at: str | None = None
+    render_hash: str = ""
+    last_rendered_hash: str = ""
+    output_file: str | None = None
+    cover_file: str | None = None
+    cover_hash: str = ""
+    rendered_filter_tag: str = ""
     publish_records: list[PublishRecord] = Field(default_factory=list)
 
 
@@ -278,6 +331,7 @@ class ProjectManifest(BaseModel):
         default_factory=lambda: {
             "ingest": StageStatus(),
             "signals": StageStatus(),
+            "scan_cuts": StageStatus(),
             "analyze": StageStatus(),
             "verify_and_plan": StageStatus(),
             "render": StageStatus(),
@@ -292,6 +346,8 @@ class ProjectManifest(BaseModel):
     remix_only_pool: list[Candidate] = Field(default_factory=list)
     remix: RemixConfig = Field(default_factory=RemixConfig)
     compilation: CompilationConfig = Field(default_factory=CompilationConfig)
+    cut_segments: list[CutSegment] = Field(default_factory=list)
+    clean_cut: CleanCutConfig = Field(default_factory=CleanCutConfig)
 
 
 class Receipt(BaseModel):

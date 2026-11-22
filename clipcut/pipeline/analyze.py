@@ -4,6 +4,7 @@ import re
 import time
 from typing import Any
 
+from ..cancel import check_cancelled
 from ..llm import ClipCutLLM, DEFAULT_TEXT_FALLBACK_MODELS
 from ..models import (
     Candidate,
@@ -63,13 +64,49 @@ def _make_slug(text: str) -> str:
     return s[:48].rstrip("-") or "clip"
 
 
-PASS1_SYSTEM = """你是顶级财经/科技视频总编，负责对长视频做严谨的全文结构解构与话题地图测绘。
-你的工作遵循 BaoCut 的「先画 100% 覆盖全片的话题地图，再做选片」铁律：绝不边读边挑，绝不漏掉后半段内容。
+PASS1_SYSTEM = """你是顶级财经/科技视频总编，负责对长视频做严谨的全文结构解构与宏观话题地图测绘。
+你的工作遵循「先画 100% 覆盖全片的宏观话题地图，再做高质量完整切片」铁律：把同一论题的追问、举例与推论合并为完整叙事单元，绝不把长对话拆成大量1分钟碎片，绝不遗漏后半段内容。
 你必须严格输出合法 JSON，不附加任何解释或 Markdown 围栏。"""
+
+
+def _compute_topic_budget(duration_s: float) -> tuple[int, int]:
+    """Compute recommended (min, max) topic count for Pass 1 macro segmentation."""
+    dur_min = max(1.0, float(duration_s or 0.0) / 60.0)
+    tmax = max(6, min(20, int(round(dur_min / 3.0))))
+    tmin = max(4, int(round(tmax * 0.55)))
+    return tmin, tmax
+
+
+def _compute_clip_budget(duration_s: float, cfg: dict[str, Any]) -> tuple[int, int]:
+    """Compute recommended (min, max) standalone clip count from video duration and config."""
+    dur_cfg = cfg.get("clip_duration", {})
+    max_per_hour = float(dur_cfg.get("max_clips_per_hour", 12))
+    min_floor = int(dur_cfg.get("min_clips_floor", 4))
+    dur_hours = max(0.05, float(duration_s or 0.0) / 3600.0)
+    bmax = max(min_floor, min(16, int(round(dur_hours * max_per_hour))))
+    bmin = max(2, int(round(bmax * 0.55)))
+    return bmin, bmax
 
 
 def _build_pass1_prompt(manifest: ProjectManifest, transcript_text: str) -> str:
     n_utts = len(manifest.utterances)
+    dur_s = float(manifest.source.duration_s or 0.0)
+    t_min, t_max = _compute_topic_budget(dur_s)
+    ch_count = len(manifest.metadata.chapters)
+    avg_ch_s = (dur_s / ch_count) if ch_count > 0 and dur_s > 0 else 0.0
+    is_dense_chapters = ch_count > 18 or (ch_count > 0 and avg_ch_s < 150.0)
+    if is_dense_chapters:
+        chapter_grouping_note = (
+            f"   - 【密集短章节强制归并】：原视频包含 {ch_count} 个细碎短章节（平均仅 {int(avg_ch_s)} 秒），"
+            "严禁按原章节 1:1 切分！必须把探讨同一大议题的相邻短章节归并为 2.5~6 分钟的完整宏观话题。\n"
+        )
+    elif ch_count > 0:
+        chapter_grouping_note = (
+            "   - 【章节归并原则】：3~5 分钟的官方章节通常对应 1 个完整话题；6~10 分钟长章节最多拆 2 个宏观话题，避免把同一章节拆成 3~5 段 1 分钟碎片。\n"
+        )
+    else:
+        chapter_grouping_note = ""
+
     return f"""请通读整部视频的元数据、章节与带编号字幕，完成以下四项测绘任务：
 
 【原视频元数据】
@@ -86,8 +123,9 @@ def _build_pass1_prompt(manifest: ProjectManifest, transcript_text: str) -> str:
 1. `primary_topics`：提炼本视频的 1~4 个核心主话题/主角实体（例如若整期访谈就是采访 Palantir CEO 或英伟达高管，则必须把 "Palantir" / "英伟达" / "NVIDIA" 写入 `primary_topics`，供后续热点去重使用）。
 2. `meta`：提炼规范中文信息 `guest_zh`、`channel_zh`、`original_theme_zh`。
 3. `chapter_audits`：如果原视频有章节，逐一审视每个章节；对于前后较短的片花（Teaser）、开场客套寒暄、赞助广告（Sponsor）、片尾致谢，标为 `"skip"` 并写明理由；有实质内容的标为 `"keep"`。如果原视频无章节，可留空数组 `[]`。
-4. `topic_map`：按时间顺序把整部视频切成首尾相接、覆盖 u0000 到 u{n_utts - 1:04d} 的完整话题清单（每换一个问题、核心论点或故事就是一个话题；一般每段 1~6 分钟，总计 8~35 个话题）。
-   - 寒暄、片花、广告、片尾也要单独记一行并设 `is_filler: true` + `filler_reason`，不留空当。
+4. `topic_map`：按时间顺序把整部视频切成首尾相接、覆盖 u0000 到 u{n_utts - 1:04d} 的**完整宏观叙事单元**清单，总计严格控制在 **{t_min}~{t_max} 个话题**，实质话题一般 **2~7 分钟**：
+   - 同一核心论点下的连续追问、举例佐证、对比论证与推论必须归在同一个话题中，严禁拆成多个 1 分钟左右的碎片。
+{chapter_grouping_note}   - 寒暄、片花、广告、片尾也要单独记一行并设 `is_filler: true` + `filler_reason`，不留空当。
    - 每个话题给出准确的 `start_utt`、`end_utt`（整数，对应 `uXXXX`）、`punchline_utt`（落点/金句所在句号）、所属 `chapter_title`、`title`（中文简短主题）、`summary`（1~2句概括论点与结论）。
 
 【输出 JSON Schema】
@@ -125,11 +163,11 @@ def _build_pass1_prompt(manifest: ProjectManifest, transcript_text: str) -> str:
 {transcript_text}"""
 
 
-PASS2_SYSTEM = """你是严肃的中文科技/商业视频切片主编。你必须严格基于已经画好的「话题地图」与原文带信号字幕，执行三类选片、主话题热点去重与边界收敛。
+PASS2_SYSTEM = """你是严肃的中文科技/商业视频切片主编。你必须严格基于已经画好的「话题地图」与原文带信号字幕，执行三类精选、主话题热点去重、反碎片聚合与边界收敛。
 切记：
-1. 每个切片必须保证上下文完整（独立观看能听懂，不留指代悬空），同时取最小必要片段，目标时长 1~5 分钟（60~300秒）。
+1. 每个独立切片必须是一个完整自洽的独立叙事弧（理想 2~4.5 分钟，允许 1.5~6 分钟），宁缺毋滥，严禁把长访谈按话题逐段连切成十几二十条碎片，同论点或同章节内的相邻子话题必须合并为 1 支完整切片。
 2. 开头和结尾必须是完整的句子（开头最好直接落在钩子/明确提问/核心论点，结尾停在完整结论或包袱之后）。
-3. 如果某话题未入选，必须在 `dropped_topics` 中如实写明淘汰理由。
+3. 如果某话题因平淡或铺垫未入选，必须在 `dropped_topics` 中如实写明淘汰理由。
 4. 严格输出合法 JSON。"""
 
 
@@ -139,8 +177,13 @@ def _build_pass2_prompt(
     transcript_text: str,
 ) -> str:
     dur_cfg = cfg.get("clip_duration", {})
-    min_s = dur_cfg.get("min_seconds", 60)
-    max_s = dur_cfg.get("max_seconds", 300)
+    min_s = int(dur_cfg.get("min_seconds", 90))
+    max_s = int(dur_cfg.get("max_seconds", 360))
+    ideal_min_s = int(dur_cfg.get("ideal_min_seconds", 120))
+    ideal_max_s = int(dur_cfg.get("ideal_max_seconds", 270))
+    short_max_s = int(dur_cfg.get("short_highlight_max_seconds", 75))
+    b_min, b_max = _compute_clip_budget(manifest.source.duration_s, cfg)
+    dur_min_total = max(1, int(round(float(manifest.source.duration_s or 0.0) / 60.0)))
 
     topic_lines = []
     for t in manifest.topic_map:
@@ -153,7 +196,7 @@ def _build_pass2_prompt(
     kept_chapters = [a for a in manifest.metadata.chapter_audits if a.decision == "keep"]
     kept_ch_text = "\n".join(f"- Ch{a.chapter_index}: {a.title} ({_fmt_ts(a.start_s)}-{_fmt_ts(a.end_s)})" for a in kept_chapters) or "（按话题地图覆盖）"
 
-    return f"""请基于以下「话题地图」、元数据与字幕信号，完成严格的三类选片与主话题热点去重。
+    return f"""请基于以下「话题地图」、元数据与字幕信号，完成严格的三类精选与主话题热点去重。
 
 【原视频信息】
 - 原标题: {manifest.metadata.original_title}
@@ -172,9 +215,9 @@ def _build_pass2_prompt(
 
 【三类选片严格标准】
 1. `key_dialogue`（重点对话）：
-   - 覆盖原标题核心命题的对应段落；
-   - 覆盖简介中提炼的关键要点的对应段落；
-   - 审视每一个有效章节，把该章节最核心的主题内容与关键观点切出来（不要机械切整章，剔除章节内的铺垫和闲聊，取论证最密、上下文完整的 1~5 分钟最小片段）。
+   - 围绕原标题核心命题、简介关键要点与全片信息密度最高的宏观议题进行**精选**（宁缺毋滥，绝不按章节或话题 1:1 机械切分）；
+   - 服务于同一论点的「提问/前提 -> 案例/证据 -> 推论/总结」相邻子话题必须合并为 1 支完整切片，并在 `topic_ids` 中列出所合并的话题 ID；
+   - 背景介绍、平淡过渡、常识性铺垫或观点重复的段落应直接淘汰并写入 `dropped_topics`。
 2. `exciting_dialogue`（精彩对话）：
    - 结合字幕语义与 `<<音量峰值/语速激增/大幅动作/高频交锋>>` 声画信号标记，挑出大笑、大幅度动作、激烈论辩、犀利追问与反转交锋段落。
    - 这些候选会被送入下一步多模态视频复核，因此请标出 `needs_multimodal_verify: true`。
@@ -182,9 +225,11 @@ def _build_pass2_prompt(
    - 命中上述热点词表且有实质观点、对比或数据支撑的段落。
    - 【主话题去重硬规则】：本视频主话题是 `{manifest.primary_topics}`。凡是仅仅在常规讨论主话题本身的内容，**严禁**当作 `hot_topic` 切出（应归为 `key_dialogue` 或不切），并将其记录到 `suppressed_hot_topics` 中说明原因！只有当该段出现了**具体可量化的业务用例/ROI数据**、**明确的中国市场/中美竞争视角**、或**跨界讨论了主话题之外的其他热点词**时，才允许标为 `hot_topic`。
 
-【片段边界与时长铁律】
-- 独立切片时长目标：{min_s}~{max_s} 秒（1~5 分钟）。允许为保持完整句首尾略微浮动（最多 ±15 秒）。
-- 如果某高能情绪/金句片段天然短于 50 秒且无需硬凑铺垫，仍可输出并在 `score` 打高分、标注 `is_short_highlight: true`（系统会自动将其归入 Remix 精选池）。
+【反碎片化、篇幅预算与边界铁律】
+- **全片切片数量预算**：本片时长约 {dur_min_total} 分钟，独立切片总数（`is_short_highlight: false`）应严格控制在 **{b_min}~{b_max} 支**，挑选全片真正值得单条传播的精华叙事单元，**严禁**将全片 75%~90% 时长首尾 0 秒连切成十几二十条碎片。
+- **独立切片目标时长**：理想 **{ideal_min_s}~{ideal_max_s} 秒**（2~4.5 分钟），允许区间 **{min_s}~{max_s} 秒**（1.5~6 分钟）；首尾为完整句可略微浮动（最多 ±15 秒）。
+- **同章/同论证链聚合**：单个 3~5 分钟章节原则上最多切出 1 支完整切片；6~9 分钟长章节最多 2 支；不要把一个完整论点的前后两半硬拆成 60~80 秒两截。
+- **短高光分流（Remix 精选池）**：如果某高能情绪/锋利金句片段天然短于 **{short_max_s} 秒** 且无需或无法自然并入前后完整论证，不要硬凑铺垫、也不要发成破碎的独立长切片，请输出并标注 `is_short_highlight: true`（系统会自动收入 Remix 精选池）。
 - 开头不能以依赖前文的残缺指代词起头（如“所以这个也是”“That's why it works”），必须包含必要的问句或前提句；结尾必须停在完整结论句之后。
 - 切片标题规范：标题必须立足所属章节与全片大主题，提炼嘉宾借该案例论证的宏观核心命题，避免把表层举例场景写成主标题（例如借某部门问卷或内部案例演示“Agentic AI 决策分析能力”，标题应聚焦 AI 决策能力而非该部门本身）。
 - 每个候选可以同时归属多个类别（例如既是 `key_dialogue` 又是 `hot_topic`），避免为同一段拆出重复候选。
@@ -268,6 +313,7 @@ def run_analyze_stage(
     transcript_text = format_transcript_for_llm(utts)
 
     # ── Pass 1: Video Profile, Chapter Audit & 100% Topic Map ──
+    check_cancelled()
     store.log(f"[analyze] Pass 1: 测绘全片话题地图与章节审查（{n_utts} 句字幕，模型: {text_provider}:{analyze_model}）")
     res1 = llm.generate_json(
         prompt=_build_pass1_prompt(manifest, transcript_text),
@@ -350,6 +396,7 @@ def run_analyze_stage(
     )
 
     # ── Pass 2: Three-Track Selection & Primary-Topic Dedup ──
+    check_cancelled()
     store.log(f"[analyze] Pass 2: 执行三类选片（重点对话/精彩对话/中国热点）与主话题去重（模型: {text_provider}:{analyze_model}）")
     res2 = llm.generate_json(
         prompt=_build_pass2_prompt(manifest, cfg, transcript_text),
@@ -457,6 +504,7 @@ def run_analyze_stage(
         elif t.topic_id not in selected_tids:
             t.dropped_reason = t.filler_reason or "信息密度或独立完整性未达选片门槛"
 
+    check_cancelled()
     manifest.candidates = candidates
     manifest.suppressed_hot_topics = suppressed
     store.save(manifest)

@@ -1,9 +1,14 @@
 clip_duration:
-  min_seconds: 60
-  max_seconds: 300
-  ideal_min_seconds: 90
-  ideal_max_seconds: 210
+  min_seconds: 90
+  max_seconds: 360
+  ideal_min_seconds: 120
+  ideal_max_seconds: 270
+  short_highlight_max_seconds: 75
   overlap_merge_iou: 0.35
+  adjacent_merge_max_gap_s: 12
+  adjacent_merge_trigger_seconds: 135
+  max_clips_per_hour: 12
+  min_clips_floor: 4
 clip_selection:
   default_selected_max: 6
 boundary:
@@ -110,7 +115,7 @@ hot_topics:
     - 节省
     note: 带有具体行业场景、可验证数字或真实投产效果的AI落地案例
 remix:
-  max_duration_ratio: 0.10
+  max_duration_ratio: 0.1
   target_min_ratio: 0.065
   min_excerpt_seconds: 8
   max_excerpt_seconds: 90
@@ -131,3 +136,68 @@ cover:
   style: natural
   prefer_two_shot: true
   remix_card_pip: true
+content_filter:
+  cut_ads: true
+  cut_political_sensitive: true
+  sensitivity: balanced
+  political_action: auto
+  apply_to_clips: true
+  cut_mode: auto
+  political_profiles:
+    strict:
+      label: 严格从严（推荐视频号/B站）
+      description: 适配中国大陆主流平台强审核：覆盖涉华及中国友好国家（俄/朝/伊朗与伊斯兰世界等）的硬红线、明确指责对抗及边缘涉政表述。
+      trigger_severities:
+      - high
+      - medium
+      - low
+      rules:
+      - id: hard_redline
+        name: 硬性政治红线
+        severity: high
+        description: 直接涉及中国领导人、执政党、政治体制、政权评论或影射；台湾/香港/新疆/西藏/南海主权挑战或台海军事冲突；对中/俄/朝/伊朗等中国友好国家的政权攻击、极端军事打击渲染或直接意识形态攻击。
+      - id: geopolitics_confrontation
+        name: 涉华及友好国家对抗站队
+        severity: medium
+        description: 上下文明确指向中国，或指向俄罗斯、朝鲜、伊朗/伊斯兰世界等中国友好国家，且发表针对上述国家的军事威慑、国防军工部署、芯片/科技制裁封锁或地缘政治对抗站队（纯提及美国科技领先或中性中外产业交流不标）。
+      - id: policy_sensitive
+        name: 涉华及友好国家政策体制指责
+        severity: medium
+        description: 上下文明确指向中国，或指向俄罗斯、朝鲜、伊朗/伊斯兰世界等中国友好国家，并对其政府政策、监管审查、人权或体制提出明确指责或负面定性批评（泛谈“政府监管/接管”或批评美国/西方政府、NSA及商业公司不标）。
+      - id: borderline_stance
+        name: 从严边缘涉政表述复核
+        severity: low
+        description: 确涉及中国或俄/朝/伊朗等中国友好国家的敏感地缘摩擦、制度隐喻或争议政治人物评价，但措辞温和间接的边缘涉政表述（纯商业/科技访谈中中性提及去中国参观企业、对比技术进度、称赞美国领先、批评欧美政府或公司严禁标为低危，应直接忽略不输出）。
+    balanced:
+      label: 平衡
+      description: 聚焦硬红线及针对中国或友好国家（俄/朝/伊朗等）的明确指责与对抗；放行一般技术对比、商业讨论及欧美内政。
+      trigger_severities:
+      - high
+      - medium
+      rules:
+      - id: hard_redline
+        name: 硬性政治红线
+        severity: high
+        description: 直接涉及中国领导人、执政党、政治体制或政权评价/影射；台湾/香港/新疆/西藏/南海主权议题；对中/俄/朝/伊朗等中国友好国家的政权攻击或直接意识形态攻击。
+      - id: geopolitics_confrontation
+        name: 明确涉华及友好国家军事制裁对抗
+        severity: medium
+        description: 上下文明确指向中国或俄罗斯、朝鲜、伊朗/伊斯兰世界等中国友好国家的军事威慑、台海冲突推演或直接制裁对抗站队（普通中美技术对比、单纯称赞美国领先或非涉华历史类比不标中危或低危）。
+      - id: policy_sensitive
+        name: 涉华及友好国家审查与体制指责
+        severity: medium
+        description: 明确指向中国或俄罗斯、朝鲜、伊朗/伊斯兰世界等中国友好国家的审查、监控或人权体制指责；泛指“政府”、批评欧美政府/NSA或商业垄断不标。
+    loose:
+      label: 仅硬红线
+      description: 仅识别直接触及国内法律法规与平台红线的高危内容；一般地缘竞争、产业讨论、历史类比与欧美内政均放行。
+      trigger_severities:
+      - high
+      rules:
+      - id: hard_redline
+        name: 硬性政治红线
+        severity: high
+        description: 直接涉及中国领导人、执政党、政治体制或政权评论与影射；台湾/香港/新疆/西藏/南海主权挑战；敏感政治历史事件、违禁人物与直接意识形态攻击。
+      - id: exclude_general_geopolitics
+        name: 非红线政治/产业评论豁免（指导界定）
+        severity: low
+        description: 普通科技竞争、美国本土政策吐槽、非涉华历史冷战/核威慑类比或开源模型对比不属高危红线，严禁误标为 high。

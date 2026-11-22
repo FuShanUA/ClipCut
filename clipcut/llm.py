@@ -13,6 +13,8 @@ import httpx
 from google import genai
 from google.genai import types
 
+from .cancel import JobCancelledError, check_cancelled, get_current_cancel_token
+
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 DEFAULT_TEXT_FALLBACK_MODELS = [
@@ -268,7 +270,7 @@ class ClipCutLLM:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if not any(x in _mn for x in ("o1", "o3", "kimi-k2.5", "kimi-k2.6")):
+        if not any(x in _mn for x in ("o1", "o3", "kimi-k2.5", "kimi-k2.6", "kimi-k3")):
             payload["temperature"] = temperature
         is_omni = "omni" in _mn
         if is_omni:
@@ -280,44 +282,60 @@ class ClipCutLLM:
         usage: dict[str, Any] = {}
         direct_data: dict[str, Any] | None = None
         client_timeout = httpx.Timeout(connect=15.0, read=120.0, write=60.0, pool=15.0)
+        token = get_current_cancel_token()
+        check_cancelled()
         with httpx.Client(trust_env=False, timeout=client_timeout) as client:
-            for attempt in range(2):
-                raw_chunks.clear()
-                usage = {}
-                direct_data = None
-                with client.stream("POST", url, headers=headers, json=payload) as resp:
-                    if resp.status_code == 400 and attempt == 0 and "response_format" in payload:
-                        # Some reasoning/multimodal models disallow response_format=json_object
-                        resp.read()
-                        payload.pop("response_format", None)
-                        continue
-                    if resp.status_code != 200:
-                        err_body = resp.read().decode("utf-8", errors="replace")
-                        raise RuntimeError(f"HTTP {resp.status_code}: {err_body[:300]}")
-
-                    ctype = (resp.headers.get("content-type") or "").lower()
-                    if "application/json" in ctype:
-                        direct_data = json.loads(resp.read().decode("utf-8", errors="replace"))
-                        break
-
-                    for line in resp.iter_lines():
-                        if not line or not line.startswith("data:"):
+            if token is not None:
+                token.register_client(client)
+            try:
+                for attempt in range(2):
+                    check_cancelled()
+                    raw_chunks.clear()
+                    usage = {}
+                    direct_data = None
+                    with client.stream("POST", url, headers=headers, json=payload) as resp:
+                        if resp.status_code == 400 and attempt == 0 and "response_format" in payload:
+                            # Some reasoning/multimodal models disallow response_format=json_object
+                            resp.read()
+                            payload.pop("response_format", None)
                             continue
-                        data_str = line[5:].strip()
-                        if data_str == "[DONE]":
+                        if resp.status_code != 200:
+                            err_body = resp.read().decode("utf-8", errors="replace")
+                            raise RuntimeError(f"HTTP {resp.status_code}: {err_body[:300]}")
+
+                        ctype = (resp.headers.get("content-type") or "").lower()
+                        if "application/json" in ctype:
+                            direct_data = json.loads(resp.read().decode("utf-8", errors="replace"))
                             break
-                        try:
-                            obj = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
-                        if isinstance(obj.get("usage"), dict):
-                            usage = obj["usage"]
-                        for ch in obj.get("choices") or []:
-                            delta = ch.get("delta") or {}
-                            part = delta.get("content")
-                            if part:
-                                raw_chunks.append(str(part))
-                    break
+
+                        for line in resp.iter_lines():
+                            check_cancelled()
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data_str = line[5:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                obj = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
+                            if isinstance(obj.get("usage"), dict):
+                                usage = obj["usage"]
+                            for ch in obj.get("choices") or []:
+                                delta = ch.get("delta") or {}
+                                part = delta.get("content")
+                                if part:
+                                    raw_chunks.append(str(part))
+                        break
+            except JobCancelledError:
+                raise
+            except Exception:
+                if token is not None and token.is_cancelled:
+                    raise JobCancelledError("任务已手动中止") from None
+                raise
+            finally:
+                if token is not None:
+                    token.unregister_client(client)
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         if direct_data is not None:
@@ -369,17 +387,35 @@ class ClipCutLLM:
         else:
             contents = combined_prompt
 
-        cfg = types.GenerateContentConfig(
-            temperature=temperature,
-            max_output_tokens=max_output_tokens,
-            response_mime_type="application/json",
-        )
+        eff_max = max(int(max_output_tokens or 0), 8192)
+        cfg_kwargs: dict[str, Any] = {
+            "temperature": temperature,
+            "max_output_tokens": eff_max,
+            "response_mime_type": "application/json",
+        }
+        if "2.5" in model.lower():
+            cfg_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_budget=min(1024, max(128, eff_max // 8))
+            )
+        cfg = types.GenerateContentConfig(**cfg_kwargs)
+        check_cancelled()
         resp = client.models.generate_content(model=model, contents=contents, config=cfg)
+        check_cancelled()
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         raw_text = (resp.text or "").strip()
         if not raw_text:
             raise ValueError(f"Empty response from {provider}:{model}")
-        parsed = _extract_json(raw_text)
+        try:
+            parsed = _extract_json(raw_text)
+        except Exception as exc:
+            finish_reason = None
+            try:
+                cands = getattr(resp, "candidates", None) or []
+                if cands:
+                    finish_reason = getattr(cands[0], "finish_reason", None)
+            except Exception:
+                pass
+            raise ValueError(f"JSON 解析失败 (finish_reason={finish_reason}): {exc}") from exc
         usage = getattr(resp, "usage_metadata", None)
         return LLMCallResult(
             text=raw_text,
@@ -419,7 +455,11 @@ class ClipCutLLM:
                 attempts.append(pair)
 
         errors: list[str] = []
+        skip_dashscope = False
         for prov, mod in attempts:
+            check_cancelled()
+            if skip_dashscope and prov == "dashscope":
+                continue
             try:
                 if prov == "dashscope":
                     return self._call_dashscope(
@@ -442,7 +482,15 @@ class ClipCutLLM:
                         media_bytes=media_bytes,
                         media_mime=media_mime,
                     )
+            except JobCancelledError:
+                raise
             except Exception as exc:
+                msg = str(exc)
+                if prov == "dashscope" and (
+                    "data_inspection_failed" in msg
+                    or "inappropriate content" in msg.lower()
+                ):
+                    skip_dashscope = True
                 errors.append(f"{prov}:{mod} -> {exc}")
                 continue
 

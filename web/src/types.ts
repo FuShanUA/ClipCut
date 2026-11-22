@@ -85,6 +85,24 @@ export interface PublishRecord {
   error: string | null;
 }
 
+export interface SubtitleRepairItem {
+  utterance_id: number;
+  zh?: string | null;
+  en?: string | null;
+}
+
+export interface SubtitleRepairResponse {
+  ok: boolean;
+  changed_utterance_ids: number[];
+  bi_srt_path: string;
+  cn_srt_path: string;
+  en_srt_path: string;
+  ass_path: string;
+  clip_output_path: string | null;
+  full_hardsub_path: string | null;
+  manifest: ProjectManifest;
+}
+
 export interface PlatformStatus {
   platform: string;
   label: string;
@@ -124,6 +142,7 @@ export interface ClipItem {
   output_file: string | null;
   cover_file: string | null;
   cover_hash?: string;
+  rendered_filter_tag?: string;
   publish_records?: PublishRecord[];
 }
 
@@ -158,12 +177,15 @@ export interface RemixConfig {
   enable_bgm: boolean;
   bgm_volume: number;
   sfx_volume: number;
+  source_clip_ids?: string[] | null;
+  manual_script_locked?: boolean;
   items: RemixItem[];
   render_hash: string;
   last_rendered_hash: string;
   output_file: string | null;
   cover_file?: string | null;
   cover_hash?: string;
+  rendered_filter_tag?: string;
   publish_records?: PublishRecord[];
 }
 
@@ -171,6 +193,7 @@ export interface CompilationConfig {
   enabled: boolean;
   title: string;
   cover_title?: string;
+  clip_ids?: string[] | null;
   card_duration_s: number;
   card_fade_s: number;
   render_hash: string;
@@ -178,6 +201,47 @@ export interface CompilationConfig {
   output_file: string | null;
   cover_file?: string | null;
   cover_hash?: string;
+  rendered_filter_tag?: string;
+  publish_records?: PublishRecord[];
+}
+
+export interface CutSegment {
+  cut_id: string;
+  kind: "ad" | "political_sensitive";
+  subtype?: string;
+  enabled: boolean;
+  detector: "llm" | "visual" | "manual";
+  action?: "inherit" | "delete" | "mask";
+  recommended_action?: "delete" | "mask";
+  sensitive_terms_zh?: string[];
+  sensitive_terms_en?: string[];
+  start_utt?: number | null;
+  end_utt?: number | null;
+  start_s: number;
+  end_s: number;
+  quote?: string;
+  reason?: string;
+  severity?: "high" | "medium" | "low";
+  chapter_title?: string;
+}
+
+export interface CleanCutConfig {
+  enabled: boolean;
+  title: string;
+  cover_title?: string;
+  cut_ads: boolean;
+  cut_political_sensitive: boolean;
+  sensitivity: "strict" | "balanced" | "loose";
+  political_action?: "auto" | "delete" | "mask";
+  apply_to_clips: boolean;
+  cut_mode: "auto" | "precise" | "reencode";
+  scanned_at?: string | null;
+  render_hash: string;
+  last_rendered_hash: string;
+  output_file: string | null;
+  cover_file?: string | null;
+  cover_hash?: string;
+  rendered_filter_tag?: string;
   publish_records?: PublishRecord[];
 }
 
@@ -213,8 +277,11 @@ export interface ProjectManifest {
   topic_map: TopicMapItem[];
   suppressed_hot_topics: SuppressedHotTopic[];
   clips: ClipItem[];
+  remix_only_pool?: unknown[];
   remix: RemixConfig;
   compilation?: CompilationConfig;
+  cut_segments?: CutSegment[];
+  clean_cut?: CleanCutConfig;
 }
 
 export interface Receipt {
@@ -241,4 +308,39 @@ export interface ProjectSummary {
   duration_s: number;
   clip_count: number;
   updated_at: string;
+}
+
+export interface RenderedAssetsInfo {
+  has_strategy: boolean;
+  has_rendered: boolean;
+  output_dir: string;
+  video_files: string[];
+  cover_files: string[];
+  doc_files: string[];
+  total_files: number;
+  total_size_bytes: number;
+  rendered_clips_count: number;
+  remix_rendered: boolean;
+  compilation_rendered: boolean;
+  clean_cut_rendered: boolean;
+}
+
+export interface PoliticalRule {
+  id: string;
+  name: string;
+  severity: "high" | "medium" | "low";
+  description: string;
+}
+
+export interface PoliticalProfile {
+  label: string;
+  description: string;
+  trigger_severities: ("high" | "medium" | "low")[];
+  rules: PoliticalRule[];
+}
+
+export interface ContentFilterConfig {
+  default_sensitivity: "strict" | "balanced" | "loose";
+  default_political_action?: "auto" | "delete" | "mask";
+  political_profiles: Record<"strict" | "balanced" | "loose", PoliticalProfile>;
 }

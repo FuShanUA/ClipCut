@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 
+from ..cancel import check_cancelled, run_cancellable_subprocess
 from ..models import ProjectManifest
 from ..receipts import ProjectStore
 
@@ -39,7 +40,7 @@ def _extract_audio_envelope(video_path: Path, sample_rate: int = 16000, hop_ms: 
         "s16le",
         "pipe:1",
     ]
-    res = subprocess.run(cmd, capture_output=True)
+    res = run_cancellable_subprocess(cmd, capture_output=True)
     if res.returncode != 0 or not res.stdout:
         return np.zeros(0, dtype=np.float32), hop_ms / 1000.0
 
@@ -70,7 +71,7 @@ def _extract_visual_motion(video_path: Path, fps: float = 1.0, width: int = 160,
         "gray",
         "pipe:1",
     ]
-    res = subprocess.run(cmd, capture_output=True)
+    res = run_cancellable_subprocess(cmd, capture_output=True)
     if res.returncode != 0 or not res.stdout:
         return np.zeros(0, dtype=np.float32)
 
@@ -112,8 +113,11 @@ def run_signals_stage(
         raise ValueError("没有可分析的字幕句")
 
     store.log(f"[signals] 开始提取声画信号: {analysis_video.name}")
+    check_cancelled()
     rms, hop_s = _extract_audio_envelope(analysis_video)
+    check_cancelled()
     motion = _extract_visual_motion(analysis_video, fps=1.0)
+    check_cancelled()
 
     # Save audio envelope for accurate acoustic pause snapping in verify_and_plan
     env_path = store.work_dir / "audio_envelope.npz"
@@ -190,6 +194,7 @@ def run_signals_stage(
             }
         )
 
+    check_cancelled()
     store.save(manifest)
     store.append_receipt(
         run_id=run_id,

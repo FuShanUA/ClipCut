@@ -9,9 +9,16 @@ from rich.prompt import IntPrompt
 from rich.table import Table
 
 from .adapters.ingest import resolve_work_dir, scan_input_path
-from .pipeline.orchestrator import ALL_STAGES, run_existing_project_stages, run_pipeline
+from .pipeline.orchestrator import (
+    ALL_STAGES,
+    find_existing_plan,
+    run_existing_project_stages,
+    run_pipeline,
+)
 from .publish import publish_to_platforms
 from .receipts import ProjectStore
+from .models import SubtitleRepairItem
+from .subtitle_repair import apply_subtitle_repairs
 
 app = typer.Typer(name="clipcut", help="ClipCut — 严肃自动化视频切片与精装 Remix 工具")
 console = Console()
@@ -72,13 +79,24 @@ def plan(
     title: Optional[str] = typer.Option(None, "--title", help="手动覆盖原视频标题"),
     text_model: Optional[str] = typer.Option(None, "--text-model", help="文本分析模型"),
     multimodal_model: Optional[str] = typer.Option(None, "--multimodal-model", help="多模态复核模型"),
+    force: bool = typer.Option(False, "--force", help="忽略已完成策划并强制重跑"),
     yes: bool = typer.Option(False, "--yes", "-y", help="目录含多视频时不交互提示，默认选第一个"),
 ):
     """【推荐】制定切片策略与Remix规划（不执行重型渲染，产出后供人工审阅选择）"""
     video_path = _select_video_from_input(path, non_interactive=yes)
-    stages = ["ingest", "signals", "analyze", "verify_and_plan"]
+    stages = ["ingest", "signals", "scan_cuts", "analyze", "verify_and_plan"]
 
     console.print(f"目标视频: {video_path.name}", markup=False)
+    if not force:
+        existing = find_existing_plan(
+            video_path,
+            subtitle_path=subtitle,
+            expected_title=title,
+        )
+        if existing is not None:
+            console.print("[bold green]检测到已完成策划，直接复用。[/bold green]")
+            console.print(f"项目状态: {existing.source.work_dir}/project.json")
+            return
     console.print(f"执行阶段: {' -> '.join(stages)} (仅规划，跳过渲染)")
 
     manifest, store = run_pipeline(
@@ -196,6 +214,58 @@ def replan_remix(
     work_dir = resolve_work_dir(vpath)
     manifest = run_existing_project_stages(work_dir, ["replan_remix"], text_model=text_model)
     console.print(f"Remix 重新编排完成: {len(manifest.remix.items)} 段")
+
+
+@app.command("repair-subtitle")
+def repair_subtitle(
+    path: str = typer.Argument(..., help="视频文件路径"),
+    clip_id: str = typer.Option(..., "--clip-id", help="目标切片 ID，如 clip_10"),
+    repair: list[str] = typer.Option(..., "--repair", help='JSON 修复项，如 \'{"utterance_id":193,"zh":"...","en":"..."}\'，可重复'),
+    rebuild_full_subtitle: bool = typer.Option(True, "--rebuild-full-subtitle/--no-rebuild-full-subtitle", help="是否同步重建中英/双语字幕文件"),
+    render_clip: bool = typer.Option(True, "--render-clip/--no-render-clip", help="修复后是否只重烧该切片"),
+    render_full_video: bool = typer.Option(False, "--render-full-video", help="修复后是否重烧全片硬字幕"),
+):
+    """按切片修复字幕文本，并可选重烧该切片或全片硬字幕"""
+    import json
+
+    vpath = _select_video_from_input(path, non_interactive=True)
+    work_dir = resolve_work_dir(vpath)
+    store = ProjectStore(work_dir)
+    manifest = store.load()
+
+    items: list[SubtitleRepairItem] = []
+    for raw in repair:
+        try:
+            payload = json.loads(raw)
+            items.append(SubtitleRepairItem.model_validate(payload))
+        except Exception as exc:
+            console.print(f"[red]修复项 JSON 解析失败: {raw}[/red]")
+            raise typer.Exit(code=1) from exc
+
+    try:
+        outcome = apply_subtitle_repairs(
+            manifest,
+            store,
+            clip_id,
+            items,
+            rebuild_full_subtitle=rebuild_full_subtitle,
+            render_clip=render_clip,
+            render_full_video=render_full_video,
+        )
+    except Exception as exc:
+        console.print(f"[red]字幕修复失败: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]已修复 {len(outcome.changed_utterance_ids)} 句字幕。[/green]")
+    console.print(f"双语字幕: {outcome.bi_srt_path}")
+    if rebuild_full_subtitle:
+        console.print(f"中文字幕: {outcome.cn_srt_path}")
+        console.print(f"英文字幕: {outcome.en_srt_path}")
+    console.print(f"ASS 字幕: {outcome.ass_path}")
+    if outcome.clip_output_path:
+        console.print(f"切片输出: {outcome.clip_output_path}")
+    if outcome.full_hardsub_path:
+        console.print(f"全片硬字幕: {outcome.full_hardsub_path}")
 
 
 @app.command()

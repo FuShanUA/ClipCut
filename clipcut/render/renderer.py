@@ -7,7 +7,9 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,13 +19,30 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from ..adapters.ingest import _find_best_info_json, extract_published_date
 from ..assets_gen import ensure_default_assets
-from ..config import load_local_config
+from ..cancel import check_cancelled
+from ..config import load_editorial_config, load_local_config
 from ..models import ClipItem, ProjectManifest
+from ..pipeline.content_filter import (
+    build_masked_ass_file,
+    compute_clean_cut_render_hash,
+    describe_applied_filter,
+    get_active_cut_segments,
+    get_active_cut_spans,
+    get_active_delete_spans,
+    get_active_mask_segments,
+    get_overlapping_mask_payload,
+    has_clean_source_video,
+    merge_spans,
+    resolve_mask_audio_spans,
+    should_use_precise_copy,
+    subtract_cut_intervals,
+)
 from ..pipeline.verify_and_plan import (
     compute_clip_render_hash,
     compute_compilation_render_hash,
     compute_remix_render_hash,
     compute_remix_source_signature,
+    get_compilation_clips,
     plan_remix_from_clips,
 )
 from ..receipts import ProjectStore
@@ -127,12 +146,37 @@ def build_compilation_filename(manifest: ProjectManifest, published_date: str = 
     ch = _clean_file_token(manifest.metadata.channel_zh or manifest.metadata.channel or "", 24)
     title = _clean_file_token(manifest.compilation.title or "切片精选集", 36)
     dt = _clean_file_token(published_date or manifest.metadata.published_date or "", 12)
-    enabled_clips = [c for c in manifest.clips if c.enabled]
+    enabled_clips = get_compilation_clips(manifest)
     card_dur = float(manifest.compilation.card_duration_s or 1.8)
     dur_val = duration_s if (duration_s is not None and duration_s > 0) else (
         sum(max(0.0, c.end_s - c.start_s) for c in enabled_clips) + len(enabled_clips) * card_dur
     )
     parts = ["00", "Compilation"] + [p for p in (ch, title, dt, _fmt_ts_token(dur_val)) if p]
+    return "_".join(parts) + ".mp4"
+
+
+def _clean_cut_keep_spans(
+    manifest: ProjectManifest,
+    cfg: dict[str, Any] | None = None,
+) -> list[tuple[float, float]]:
+    total_dur = max(0.0, float(manifest.source.duration_s or 0.0))
+    if total_dur <= 0.0 and manifest.utterances:
+        total_dur = max(0.0, float(manifest.utterances[-1].end_s))
+    delete_spans = get_active_delete_spans(manifest, cfg)
+    return subtract_cut_intervals(0.0, total_dur, delete_spans, min_keep_s=0.4)
+
+
+def build_clean_cut_filename(manifest: ProjectManifest, published_date: str = "", duration_s: float | None = None) -> str:
+    ch = _clean_file_token(manifest.metadata.channel_zh or manifest.metadata.channel or "", 24)
+    base_t = manifest.clean_cut.title or f"{manifest.metadata.original_theme_zh or manifest.metadata.original_title or '全片'}净版"
+    title = _clean_file_token(base_t, 36) or "CleanCut"
+    dt = _clean_file_token(published_date or manifest.metadata.published_date or "", 12)
+    if duration_s is not None and duration_s > 0:
+        dur_val = duration_s
+    else:
+        keep_spans = _clean_cut_keep_spans(manifest)
+        dur_val = sum(max(0.0, e - s) for s, e in keep_spans) if keep_spans else float(manifest.source.duration_s or 0.0)
+    parts = ["00", "CleanCut"] + [p for p in (ch, title, dt, _fmt_ts_token(dur_val)) if p]
     return "_".join(parts) + ".mp4"
 
 
@@ -302,16 +346,411 @@ def _run_ffmpeg_encode(cmd_vt: list[str], cmd_x264: list[str], use_vt: bool) -> 
     return False, "failed", res2.stderr[-600:]
 
 
+def _probe_stream_layout_and_packets(media_path: Path) -> tuple[int, int, list[dict[str, Any]], list[dict[str, Any]] | None]:
+    out = subprocess.check_output(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(media_path)],
+        stderr=subprocess.DEVNULL,
+        text=True,
+    ).strip()
+    types = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    v_cnt, a_cnt = types.count("video"), types.count("audio")
+    if v_cnt != 1 or a_cnt > 1:
+        raise RuntimeError(f"Precise copy requires 1 video and <=1 audio stream (got v={v_cnt}, a={a_cnt})")
+
+    def _read_pkts(kind: str) -> list[dict[str, Any]]:
+        raw = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                f"{kind}:0",
+                "-show_entries",
+                "packet=pts_time,dts_time,flags",
+                "-of",
+                "csv=p=0",
+                str(media_path),
+            ],
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        pkts: list[dict[str, Any]] = []
+        for ln in raw.splitlines():
+            flds = ln.split(",")
+            if len(flds) < 3 or not flds[0]:
+                continue
+            try:
+                pts = float(flds[0])
+                dts = float(flds[1]) if flds[1] and flds[1] != "N/A" else None
+            except ValueError:
+                continue
+            pkts.append({"pts": pts, "dts": dts, "keyframe": "K" in flds[2]})
+        return pkts
+
+    v_pkts = _read_pkts("v")
+    a_pkts = _read_pkts("a") if a_cnt == 1 else None
+    if not v_pkts:
+        raise RuntimeError("No video packets found for precise copy")
+    return v_cnt, a_cnt, v_pkts, a_pkts
+
+
+def _cut_media_precise_copy(source_video: Path, keep_spans: list[tuple[float, float]], out_path: Path) -> None:
+    """Split A/V packet-accurate stream-copy matching AutoSub's remove_ads engine."""
+    _, a_cnt, v_pkts, a_pkts = _probe_stream_layout_and_packets(source_video)
+    plans: list[dict[str, Any]] = []
+    for start_s, end_s in keep_spans:
+        kf_indices = [i for i, p in enumerate(v_pkts) if p["keyframe"] and start_s <= p["pts"] < end_s]
+        if not kf_indices:
+            raise RuntimeError(f"No keyframe in keep span {start_s:.2f}-{end_s:.2f}")
+        k_idx = kf_indices[0]
+        v_start = v_pkts[k_idx]["pts"]
+        v_seek = v_pkts[k_idx]["dts"] if v_pkts[k_idx]["dts"] is not None else v_start
+        last_idx = k_idx - 1
+        for i in range(k_idx, len(v_pkts)):
+            if v_pkts[i]["pts"] >= end_s:
+                break
+            last_idx = i
+        v_count = last_idx - k_idx + 1
+        if v_count <= 0:
+            raise RuntimeError(f"No video packets in keep span {start_s:.2f}-{end_s:.2f}")
+        a_start = None
+        a_count = 0
+        if a_pkts is not None:
+            a_cands = [p for p in a_pkts if p["pts"] >= v_start]
+            if not a_cands:
+                raise RuntimeError(f"No audio packets after {v_start:.2f}")
+            a_start = a_cands[0]["pts"]
+            a_count = sum(1 for p in a_pkts if a_start <= p["pts"] < end_s)
+            if a_count <= 0:
+                raise RuntimeError(f"Empty audio count in {a_start:.2f}-{end_s:.2f}")
+        plans.append({
+            "v_seek": max(0.0, v_seek - 0.01),
+            "v_count": v_count,
+            "a_start": a_start,
+            "a_count": a_count,
+        })
+
+    ext = source_video.suffix.lower() or ".mp4"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="clipcut_precise_") as tmp:
+        tmp_dir = Path(tmp)
+        v_parts: list[Path] = []
+        a_parts: list[Path] = []
+        for idx, pl in enumerate(plans):
+            vp = tmp_dir / f"v_{idx:03d}{ext}"
+            r_v = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-v", "error", "-seek2any", "1", "-ss", f"{pl['v_seek']:.6f}",
+                    "-i", str(source_video), "-map", "0:v:0", "-frames:v", str(pl["v_count"]),
+                    "-an", "-c:v", "copy", "-avoid_negative_ts", "make_zero", str(vp),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if r_v.returncode != 0:
+                raise RuntimeError(r_v.stderr[-300:] or "video copy failed")
+            v_parts.append(vp)
+            if pl["a_start"] is not None:
+                ap = tmp_dir / f"a_{idx:03d}.mka"
+                r_a = subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-v", "error", "-i", str(source_video),
+                        "-ss", f"{pl['a_start']:.6f}", "-map", "0:a:0", "-frames:a", str(pl["a_count"]),
+                        "-vn", "-c:a", "copy", "-avoid_negative_ts", "make_zero", str(ap),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if r_a.returncode != 0:
+                    raise RuntimeError(r_a.stderr[-300:] or "audio copy failed")
+                a_parts.append(ap)
+
+        v_list = tmp_dir / "v.txt"
+        v_list.write_text("\n".join(_format_concat_file_entry(p, tmp_dir) for p in v_parts) + "\n", encoding="utf-8")
+        if a_parts:
+            a_list = tmp_dir / "a.txt"
+            a_list.write_text("\n".join(_format_concat_file_entry(p, tmp_dir) for p in a_parts) + "\n", encoding="utf-8")
+            mux_cmd = [
+                "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(v_list),
+                "-f", "concat", "-safe", "0", "-i", str(a_list),
+                "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-movflags", "+faststart", str(out_path),
+            ]
+        else:
+            mux_cmd = [
+                "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(v_list),
+                "-map", "0:v:0", "-an", "-c", "copy", "-movflags", "+faststart", str(out_path),
+            ]
+        r_m = subprocess.run(mux_cmd, capture_output=True, text=True)
+        if r_m.returncode != 0 or not out_path.exists() or out_path.stat().st_size <= 1024:
+            raise RuntimeError(r_m.stderr[-300:] or "mux failed")
+
+
+def _escape_ass_filter_path(path: Path) -> str:
+    return str(path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def _span_needs_mask(ks: float, ke: float, mask_spans: list[tuple[float, float]] | None) -> bool:
+    if not mask_spans or ke <= ks:
+        return False
+    return any(min(float(ke), float(me)) - max(float(ks), float(ms)) > 0.05 for ms, me in mask_spans)
+
+
+def _prepare_mask_render_context(
+    manifest: ProjectManifest,
+    work_dir: Path,
+    hash_key: str = "",
+    cfg: dict[str, Any] | None = None,
+) -> tuple[Path | None, Path | None, list[tuple[float, float]], list[tuple[float, float]]]:
+    mask_segs = get_active_mask_segments(manifest, cfg)
+    if not mask_segs or not has_clean_source_video(manifest):
+        return None, None, [], []
+    clean_video = Path(manifest.source.analysis_video).expanduser()
+    masked_ass = build_masked_ass_file(manifest, mask_segs, work_dir, hash_key=hash_key)
+    if masked_ass is None or not masked_ass.is_file():
+        return None, None, [], []
+    audio_mask_spans = resolve_mask_audio_spans(manifest, mask_segs)
+    mask_spans = merge_spans([(s.start_s, s.end_s) for s in mask_segs], max_gap_s=0.15)
+    return clean_video, masked_ass, audio_mask_spans, mask_spans
+
+
+def _render_masked_span(
+    clean_video: Path,
+    span_start: float,
+    span_end: float,
+    masked_ass_path: Path,
+    audio_mask_spans: list[tuple[float, float]] | None,
+    out_path: Path,
+    *,
+    fade_ms: int,
+    use_vt: bool,
+    vf_extra: str = "",
+    af_prefix: str = "",
+    apply_edge_fade: bool = True,
+) -> tuple[bool, str, str]:
+    """Burn redacted ASS onto clean video and mute + 880Hz bleep masked words in audio."""
+    start_s = max(0.0, float(span_start))
+    dur = max(0.2, float(span_end) - start_s)
+    local_raw = [
+        (max(0.0, float(s) - start_s), min(dur, float(e) - start_s))
+        for s, e in (audio_mask_spans or [])
+        if float(e) > start_s and float(s) < float(span_end)
+    ]
+    local_masks = merge_spans([(round(s, 3), round(e, 3)) for s, e in local_raw if e - s > 0.02], max_gap_s=0.05)
+
+    escaped_ass = _escape_ass_filter_path(masked_ass_path)
+    v_parts = [f"subtitles=filename='{escaped_ass}'", "setpts=PTS-STARTPTS"]
+    if vf_extra:
+        v_parts.append(vf_extra.strip(", "))
+    v_parts.append("format=yuv420p")
+    v_chain = f"[0:v]{','.join(v_parts)}[vout]"
+
+    a_parts = ["asetpts=PTS-STARTPTS"]
+    if af_prefix:
+        a_parts.append(af_prefix.strip(", "))
+    if apply_edge_fade:
+        fade_s = min(max(0.005, fade_ms / 1000.0), dur * 0.15)
+        fade_out_st = max(0.0, dur - fade_s)
+        a_parts.append(f"afade=t=in:st=0:d={fade_s:.3f}")
+        a_parts.append(f"afade=t=out:st={fade_out_st:.3f}:d={fade_s:.3f}")
+
+    if local_masks:
+        cond = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in local_masks)
+        a_parts.append(f"volume=0:enable='{cond}'")
+        a_chain = (
+            f"[0:a]{','.join(a_parts)}[amuted];"
+            f"sine=frequency=880:sample_rate=44100:duration={dur:.3f},"
+            f"aformat=channel_layouts=stereo,volume='if(gt({cond},0),0.12,0)':eval=frame[abeep];"
+            f"[amuted][abeep]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
+        )
+    else:
+        a_chain = f"[0:a]{','.join(a_parts)}[aout]"
+
+    fc = f"{v_chain};{a_chain}"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    base = [
+        "ffmpeg",
+        "-y",
+        "-v",
+        "error",
+        "-ss",
+        f"{start_s:.3f}",
+        "-copyts",
+        "-i",
+        str(clean_video),
+        "-t",
+        f"{dur:.3f}",
+        "-filter_complex",
+        fc,
+        "-map",
+        "[vout]",
+        "-map",
+        "[aout]",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-movflags",
+        "+faststart",
+    ]
+    cmd_vt = base + ["-c:v", "h264_videotoolbox", "-q:v", "60", str(out_path)]
+    cmd_x264 = base + ["-c:v", "libx264", "-preset", "fast", "-crf", "18", str(out_path)]
+    return _run_ffmpeg_encode(cmd_vt, cmd_x264, use_vt)
+
+
+def _render_multi_span_video(
+    source_video: Path,
+    keep_spans: list[tuple[float, float]],
+    out_path: Path,
+    *,
+    fade_ms: int,
+    use_vt: bool,
+    precise_copy: bool,
+    tmp_dir: Path,
+    log_fn: Any = None,
+    clean_video: Path | None = None,
+    masked_ass_path: Path | None = None,
+    audio_mask_spans: list[tuple[float, float]] | None = None,
+    mask_spans: list[tuple[float, float]] | None = None,
+) -> tuple[bool, str, str]:
+    """Render kept time intervals into out_path (precise stream-copy or VT re-encode + concat)."""
+    if not keep_spans:
+        return False, "skipped", "无有效保留视频区间"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    has_masked_part = bool(
+        clean_video is not None
+        and masked_ass_path is not None
+        and any(_span_needs_mask(ks, ke, mask_spans) for ks, ke in keep_spans)
+    )
+    if precise_copy and not has_masked_part:
+        try:
+            _cut_media_precise_copy(source_video, keep_spans, out_path)
+            return True, "precise_copy", ""
+        except Exception as exc:
+            if log_fn:
+                log_fn(f"[render] 极速无损剪切降级为硬件重编码: {str(exc)[:140]}")
+
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    part_files: list[Path] = []
+    encoder_used = "h264_videotoolbox" if use_vt else "libx264"
+
+    for idx, (s, e) in enumerate(keep_spans):
+        start_s = max(0.0, float(s))
+        end_s = max(start_s + 0.2, float(e))
+        seg_mp4 = tmp_dir / f"span_{uuid.uuid4().hex[:6]}_{idx:03d}.mp4"
+        if clean_video is not None and masked_ass_path is not None and _span_needs_mask(start_s, end_s, mask_spans):
+            ok, enc, err = _render_masked_span(
+                clean_video,
+                start_s,
+                end_s,
+                masked_ass_path,
+                audio_mask_spans,
+                seg_mp4,
+                fade_ms=fade_ms,
+                use_vt=use_vt,
+                apply_edge_fade=True,
+            )
+        else:
+            dur = max(0.2, end_s - start_s)
+            fade_s = min(max(0.005, fade_ms / 1000.0), dur * 0.15)
+            fade_out_st = max(0.0, dur - fade_s)
+            af = f"afade=t=in:st=0:d={fade_s:.3f},afade=t=out:st={fade_out_st:.3f}:d={fade_s:.3f}"
+            base = [
+                "ffmpeg", "-y", "-v", "error", "-ss", f"{start_s:.3f}", "-i", str(source_video),
+                "-t", f"{dur:.3f}", "-af", af, "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart",
+            ]
+            cmd_vt = base + ["-c:v", "h264_videotoolbox", "-q:v", "60", str(seg_mp4)]
+            cmd_x264 = base + ["-c:v", "libx264", "-preset", "fast", "-crf", "18", str(seg_mp4)]
+            ok, enc, err = _run_ffmpeg_encode(cmd_vt, cmd_x264, use_vt)
+        if not ok:
+            return False, "failed", err
+        encoder_used = enc
+        part_files.append(seg_mp4)
+
+    if len(part_files) == 1:
+        part_files[0].replace(out_path)
+        return True, encoder_used, ""
+
+    concat_txt = tmp_dir / f"concat_{uuid.uuid4().hex[:6]}.txt"
+    concat_txt.write_text("\n".join(_format_concat_file_entry(p, tmp_dir) for p in part_files) + "\n", encoding="utf-8")
+    r_cat = subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+            "-i", str(concat_txt), "-c", "copy", "-movflags", "+faststart", str(out_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r_cat.returncode != 0:
+        r_cat = subprocess.run(
+            [
+                "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+                "-i", str(concat_txt), "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+    for p in part_files:
+        p.unlink(missing_ok=True)
+    concat_txt.unlink(missing_ok=True)
+    if r_cat.returncode != 0 or not out_path.exists():
+        return False, "failed", (r_cat.stderr or "concat failed")[-500:]
+    return True, encoder_used, ""
+
+
 def _render_single_clip(
     source_video: Path,
     clip: ClipItem,
     out_path: Path,
     fade_ms: int,
     use_vt: bool,
+    *,
+    cut_spans: list[tuple[float, float]] | None = None,
+    tmp_dir: Path | None = None,
+    clean_video: Path | None = None,
+    masked_ass_path: Path | None = None,
+    audio_mask_spans: list[tuple[float, float]] | None = None,
+    mask_spans: list[tuple[float, float]] | None = None,
 ) -> tuple[bool, str, str]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     start_s = max(0.0, clip.start_s)
-    dur = max(0.5, clip.end_s - start_s)
+    end_s = max(start_s + 0.4, clip.end_s)
+    keep_spans = subtract_cut_intervals(start_s, end_s, cut_spans, min_keep_s=0.4)
+    if not keep_spans:
+        return False, "skipped", "切片已被广告/政治敏感区间完全覆盖"
+    needs_mask = bool(
+        clean_video is not None
+        and masked_ass_path is not None
+        and any(_span_needs_mask(ks, ke, mask_spans) for ks, ke in keep_spans)
+    )
+    is_trimmed = (
+        len(keep_spans) > 1
+        or abs(keep_spans[0][0] - round(start_s, 3)) > 0.05
+        or abs(keep_spans[0][1] - round(end_s, 3)) > 0.05
+    )
+    if is_trimmed or needs_mask:
+        local_tmp = tmp_dir or (out_path.parent / ".clipcut_span_tmp")
+        return _render_multi_span_video(
+            source_video,
+            keep_spans,
+            out_path,
+            fade_ms=fade_ms,
+            use_vt=use_vt,
+            precise_copy=False,
+            tmp_dir=local_tmp,
+            clean_video=clean_video,
+            masked_ass_path=masked_ass_path,
+            audio_mask_spans=audio_mask_spans,
+            mask_spans=mask_spans,
+        )
+
+    dur = max(0.5, end_s - start_s)
     fade_s = min(fade_ms / 1000.0, dur * 0.15)
     fade_out_st = max(0.0, dur - fade_s)
     af = f"afade=t=in:st=0:d={fade_s:.3f},afade=t=out:st={fade_out_st:.3f}:d={fade_s:.3f}"
@@ -1332,7 +1771,7 @@ def _generate_compilation_cover(
     if picked is None or not picked.image_path.exists():
         return False
 
-    enabled_clips = [c for c in manifest.clips if c.enabled]
+    enabled_clips = get_compilation_clips(manifest)
     dur_s = total_duration_s if (total_duration_s is not None and total_duration_s > 0) else sum(c.end_s - c.start_s for c in enabled_clips)
     dur_text = _fmt_dur(dur_s)
     meta_parts = _build_cover_meta_parts(manifest, published_date)
@@ -1369,6 +1808,73 @@ def _generate_compilation_cover(
         )
         return True
     return False
+
+
+def _generate_clean_cut_cover(
+    *,
+    manifest: ProjectManifest,
+    store: ProjectStore,
+    cfg: dict[str, Any],
+    hero_pool: list[SelectedFrame],
+    published_date: str,
+    cover_path: Path,
+    total_duration_s: float | None = None,
+) -> bool:
+    """Render cover JPEG for Clean Cut full video."""
+    c_cfg = cfg.get("cover", {})
+    style = str(c_cfg.get("style", "natural")).lower()
+    prefer_two_shot = bool(c_cfg.get("prefer_two_shot", True))
+    picked = _resolve_remix_selected_frame(
+        manifest=manifest,
+        store=store,
+        hero_pool=hero_pool,
+        prefer_two_shot=prefer_two_shot,
+    )
+    if picked is None or not picked.image_path.exists():
+        return False
+
+    keep_spans = _clean_cut_keep_spans(manifest)
+    kept_dur = total_duration_s if (total_duration_s is not None and total_duration_s > 0) else (
+        sum(e - s for s, e in keep_spans) if keep_spans else float(manifest.source.duration_s or 0.0)
+    )
+    saved_s = max(0.0, float(manifest.source.duration_s or kept_dur) - kept_dur)
+    dur_text = _fmt_dur(kept_dur)
+    meta_parts = _build_cover_meta_parts(manifest, published_date)
+    w = manifest.source.width or 1920
+    h = manifest.source.height or 1080
+    cc_title = (manifest.clean_cut.cover_title or manifest.clean_cut.title or manifest.metadata.original_theme_zh or manifest.metadata.original_title or "全片净版").strip()
+    badge_text = "CLEAN CUT  ·  净版全片"
+    left_meta = [f"净版 {dur_text}", f"已剪除 {_fmt_dur(saved_s)}" if saved_s > 0.5 else "完整合规版"]
+
+    out_img = _render_cover_image_at_size(
+        selected=picked,
+        width=w,
+        height=h,
+        badge_text=badge_text,
+        dur_text=dur_text,
+        title=cc_title,
+        meta_parts=meta_parts,
+        style=style,
+        index_text="净版",
+        group_label="净版全片",
+        left_meta_lines=left_meta,
+    )
+    _save_cover_jpeg(out_img, cover_path)
+    sync_existing_platform_covers(
+        selected=picked,
+        cover_path=cover_path,
+        badge_text=badge_text,
+        dur_text=dur_text,
+        title=cc_title,
+        meta_parts=meta_parts,
+        style=style,
+        index_text="净版",
+        group_label="净版全片",
+        left_meta_lines=left_meta,
+        published_date=published_date,
+        hero_pool=hero_pool,
+    )
+    return True
 
 
 
@@ -1424,7 +1930,7 @@ def sync_platform_covers_for_target(
         group_label = "高光集锦"
         left_meta_lines = [f"总长 {dur_text}", f"共 {len(enabled_items)} 段精华"]
     elif target == "compilation":
-        enabled_clips = [c for c in manifest.clips if c.enabled]
+        enabled_clips = get_compilation_clips(manifest)
         if not enabled_clips:
             return []
         est_dur_s = sum(max(0.0, c.end_s - c.start_s) for c in enabled_clips) + len(enabled_clips) * float(
@@ -1447,6 +1953,33 @@ def sync_platform_covers_for_target(
         index_text = "合辑"
         group_label = "精选合辑"
         left_meta_lines = [f"总长 {dur_text}", f"精选 {len(enabled_clips)} 支切片"]
+    elif target == "clean_cut":
+        keep_spans = _clean_cut_keep_spans(manifest)
+        kept_dur = sum(e - s for s, e in keep_spans) if keep_spans else float(manifest.source.duration_s or 0.0)
+        saved_s = max(0.0, float(manifest.source.duration_s or kept_dur) - kept_dur)
+        target_mp4 = (
+            Path(manifest.clean_cut.output_file)
+            if manifest.clean_cut.output_file
+            else (output_dir / build_clean_cut_filename(manifest, published_date, duration_s=kept_dur))
+        )
+        selected = _resolve_remix_selected_frame(
+            manifest=manifest,
+            store=store,
+            hero_pool=hero_pool,
+            prefer_two_shot=prefer_two_shot,
+        )
+        stored_title = (
+            manifest.clean_cut.cover_title
+            or manifest.clean_cut.title
+            or manifest.metadata.original_theme_zh
+            or manifest.metadata.original_title
+            or "全片净版"
+        ).strip()
+        dur_text = _fmt_dur(kept_dur)
+        badge_text = "CLEAN CUT  ·  净版全片"
+        index_text = "净版"
+        group_label = "净版全片"
+        left_meta_lines = [f"净版 {dur_text}", f"已剪除 {_fmt_dur(saved_s)}" if saved_s > 0.5 else "完整合规版"]
     else:
         for pos, clip in enumerate(manifest.clips):
             if clip.clip_id != target:
@@ -1583,7 +2116,7 @@ def refresh_single_cover(
         return None
 
     if target == "compilation":
-        enabled_clips = [c for c in manifest.clips if c.enabled]
+        enabled_clips = get_compilation_clips(manifest)
         if not enabled_clips:
             return None
         est_dur_s = sum(max(0.0, c.end_s - c.start_s) for c in enabled_clips) + len(enabled_clips) * float(
@@ -1618,6 +2151,48 @@ def refresh_single_cover(
         if ok:
             manifest.compilation.cover_file = str(cover_jpg)
             manifest.compilation.cover_hash = exp_hash
+            store.save(manifest)
+            return cover_jpg
+        return None
+
+    if target == "clean_cut":
+        keep_spans = _clean_cut_keep_spans(manifest)
+        kept_dur = sum(e - s for s, e in keep_spans) if keep_spans else float(manifest.source.duration_s or 0.0)
+        target_mp4 = (
+            Path(manifest.clean_cut.output_file)
+            if manifest.clean_cut.output_file
+            else (output_dir / build_clean_cut_filename(manifest, published_date, duration_s=kept_dur))
+        )
+        cover_jpg = target_mp4.with_suffix(".jpg")
+        effective_title = (
+            manifest.clean_cut.cover_title
+            or manifest.clean_cut.title
+            or manifest.metadata.original_theme_zh
+            or manifest.metadata.original_title
+            or "全片净版"
+        ).strip()
+        exp_hash = compute_cover_hash(
+            key="clean_cut",
+            title=effective_title,
+            categories=["clean_cut"],
+            start_s=0.0,
+            end_s=float(manifest.source.duration_s or kept_dur),
+            manifest=manifest,
+            cfg=cfg,
+            published_date=published_date,
+        )
+        ok = _generate_clean_cut_cover(
+            manifest=manifest,
+            store=store,
+            cfg=cfg,
+            hero_pool=hero_pool,
+            published_date=published_date,
+            cover_path=cover_jpg,
+            total_duration_s=kept_dur,
+        )
+        if ok:
+            manifest.clean_cut.cover_file = str(cover_jpg)
+            manifest.clean_cut.cover_hash = exp_hash
             store.save(manifest)
             return cover_jpg
         return None
@@ -1835,8 +2410,28 @@ def _render_remix(
     cursor_s = 0.0
     last_group: str | None = None
     card_num = 0
+    active_cuts = get_active_delete_spans(manifest, cfg) if manifest.clean_cut.apply_to_clips else []
+    clean_vid, masked_ass, audio_mask_spans, mask_spans = (
+        _prepare_mask_render_context(
+            manifest,
+            store.work_dir / "masked_subs",
+            hash_key=remix.render_hash or run_id,
+            cfg=cfg,
+        )
+        if manifest.clean_cut.apply_to_clips
+        else (None, None, [], [])
+    )
 
     for idx, it in enumerate(enabled_items):
+        sub_spans = (
+            subtract_cut_intervals(it.start_s, it.end_s, active_cuts, min_keep_s=1.0)
+            if active_cuts
+            else [(it.start_s, it.end_s)]
+        )
+        if not sub_spans:
+            store.log(f"[render] Remix 片段 {it.remix_id} 完全位于已屏蔽广告/敏感区间，跳过")
+            continue
+
         group_key = remix_item_group_key(it)
         need_card = should_insert_title_card(remix.card_mode, idx, group_key, last_group)
 
@@ -1891,46 +2486,63 @@ def _render_remix(
                 cursor_s += remix.card_duration_s
         last_group = group_key
 
-        # Extract loudness-normalized excerpt matching exact stream geometry
-        seg_mp4 = tmp_dir / f"seg_{idx + 1:02d}.mp4"
-        dur = max(0.5, it.end_s - it.start_s)
-        fade_s = min(0.03, dur * 0.15)
-        fade_out_st = max(0.0, dur - fade_s)
-        vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps={fps:.3f},format=yuv420p"
-        af = f"loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:st=0:d={fade_s:.3f},afade=t=out:st={fade_out_st:.3f}:d={fade_s:.3f}"
+        # Extract loudness-normalized excerpt(s) matching exact stream geometry
+        for part_i, (sub_s, sub_e) in enumerate(sub_spans):
+            seg_mp4 = tmp_dir / f"seg_{idx + 1:02d}_{part_i + 1:02d}.mp4"
+            dur = max(0.5, sub_e - sub_s)
+            vf_rmx = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps={fps:.3f}"
+            if clean_vid is not None and masked_ass is not None and _span_needs_mask(sub_s, sub_e, mask_spans):
+                ok, _, err = _render_masked_span(
+                    clean_vid,
+                    sub_s,
+                    sub_e,
+                    masked_ass,
+                    audio_mask_spans,
+                    seg_mp4,
+                    fade_ms=30,
+                    use_vt=use_vt,
+                    vf_extra=vf_rmx,
+                    af_prefix="loudnorm=I=-16:TP=-1.5:LRA=11",
+                    apply_edge_fade=True,
+                )
+            else:
+                fade_s = min(0.03, dur * 0.15)
+                fade_out_st = max(0.0, dur - fade_s)
+                vf = f"{vf_rmx},format=yuv420p"
+                af = f"loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:st=0:d={fade_s:.3f},afade=t=out:st={fade_out_st:.3f}:d={fade_s:.3f}"
 
-        base = [
-            "ffmpeg",
-            "-y",
-            "-v",
-            "error",
-            "-ss",
-            f"{it.start_s:.3f}",
-            "-i",
-            str(src_video),
-            "-t",
-            f"{dur:.3f}",
-            "-vf",
-            vf,
-            "-af",
-            af,
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            "44100",
-            "-ac",
-            "2",
-        ]
-        cmd_vt = base + ["-c:v", "h264_videotoolbox", "-q:v", "60", str(seg_mp4)]
-        cmd_x264 = base + ["-c:v", "libx264", "-preset", "fast", "-crf", "18", str(seg_mp4)]
-        ok, _, err = _run_ffmpeg_encode(cmd_vt, cmd_x264, use_vt)
-        if not ok:
-            store.log(f"[render] Remix 片段 {it.remix_id} 截取失败: {err}")
-            continue
-        concat_files.append(seg_mp4)
-        cursor_s += dur
+                base = [
+                    "ffmpeg",
+                    "-y",
+                    "-v",
+                    "error",
+                    "-ss",
+                    f"{sub_s:.3f}",
+                    "-i",
+                    str(src_video),
+                    "-t",
+                    f"{dur:.3f}",
+                    "-vf",
+                    vf,
+                    "-af",
+                    af,
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-ar",
+                    "44100",
+                    "-ac",
+                    "2",
+                ]
+                cmd_vt = base + ["-c:v", "h264_videotoolbox", "-q:v", "60", str(seg_mp4)]
+                cmd_x264 = base + ["-c:v", "libx264", "-preset", "fast", "-crf", "18", str(seg_mp4)]
+                ok, _, err = _run_ffmpeg_encode(cmd_vt, cmd_x264, use_vt)
+            if not ok:
+                store.log(f"[render] Remix 片段 {it.remix_id} 截取失败: {err}")
+                continue
+            concat_files.append(seg_mp4)
+            cursor_s += dur
 
     if not concat_files:
         return None
@@ -2088,6 +2700,11 @@ def _render_remix(
 
     remix.last_rendered_hash = remix.render_hash
     remix.output_file = str(out_mp4)
+    remix.rendered_filter_tag = (
+        describe_applied_filter(manifest, [(it.start_s, it.end_s) for it in enabled_items], cfg)
+        if manifest.clean_cut.apply_to_clips
+        else "原片直出(未关联)"
+    )
     if _generate_remix_cover(
         manifest=manifest,
         store=store,
@@ -2130,7 +2747,7 @@ def _render_compilation(
     """Render Selected Clips Compilation (sequential concatenation of enabled clips with title cards)."""
     t0 = time.monotonic()
     comp = manifest.compilation
-    enabled_clips = [c for c in manifest.clips if c.enabled]
+    enabled_clips = get_compilation_clips(manifest)
     if not comp.enabled or not enabled_clips:
         return None
 
@@ -2190,11 +2807,25 @@ def _render_compilation(
     tmp_dir.mkdir(parents=True, exist_ok=True)
     meta_parts = _build_cover_meta_parts(manifest, published_date)
     src_video = Path(manifest.source.render_video)
+    frame_src = Path(manifest.source.analysis_video)
+    if not frame_src.exists():
+        frame_src = src_video
     w = manifest.source.width or 1920
     h = manifest.source.height or 1080
     fps = manifest.source.fps or 30.0
 
     concat_files: list[Path] = []
+    active_cuts = get_active_delete_spans(manifest, cfg) if manifest.clean_cut.apply_to_clips else []
+    clean_vid, masked_ass, audio_mask_spans, mask_spans = (
+        _prepare_mask_render_context(
+            manifest,
+            store.work_dir / "masked_subs",
+            hash_key=comp.render_hash or run_id,
+            cfg=cfg,
+        )
+        if manifest.clean_cut.apply_to_clips
+        else (None, None, [], [])
+    )
     store.log(f"[render] 开始合成切片精选集 ({len(enabled_clips)} 支已选切片，预估总长 {est_dur_s:.1f}s)")
 
     for idx, clip in enumerate(enabled_clips, 1):
@@ -2206,7 +2837,16 @@ def _render_compilation(
             if clip.categories
             else (clip.chapter_title or "切片精选")
         )
-        portrait = _pick_portrait_frame(hero_pool, clip.start_s, clip.end_s)
+        portrait = select_best_frame_for_interval(
+            source_video=frame_src,
+            start_s=clip.start_s,
+            end_s=clip.end_s,
+            work_dir=store.work_dir,
+            cache_key=f"comp_{comp.render_hash}_{idx:02d}",
+            hero_pool=hero_pool,
+            fallback_index=idx - 1,
+            prefer_two_shot=prefer_two_shot,
+        )
         _create_title_card_video(
             width=w,
             height=h,
@@ -2225,14 +2865,47 @@ def _render_compilation(
         )
         concat_files.append(card_mp4)
 
-        # 2. Clip segment
-        clip_mp4 = Path(clip.output_file) if (clip.output_file and Path(clip.output_file).exists() and Path(clip.output_file).stat().st_size > 1024) else None
+        # 2. Clip segment (re-cut cleanly if active ad/sensitive cuts overlap and clip cache is stale)
+        clip_masks = (
+            get_overlapping_mask_payload(clip.start_s, clip.end_s, manifest, cfg)
+            if manifest.clean_cut.apply_to_clips
+            else []
+        )
+        expected_hash = compute_clip_render_hash(
+            clip,
+            manifest.source.render_video,
+            active_cuts,
+            manifest.source.subtitle_sha256,
+            mask_payload=clip_masks,
+        )
+        clip_mp4 = (
+            Path(clip.output_file)
+            if (
+                clip.output_file
+                and clip.last_rendered_hash == expected_hash
+                and Path(clip.output_file).exists()
+                and Path(clip.output_file).stat().st_size > 1024
+            )
+            else None
+        )
         if clip_mp4:
             concat_files.append(clip_mp4)
         else:
             seg_mp4 = tmp_dir / f"seg_{idx:02d}.mp4"
             fade_ms = int(cfg.get("boundary", {}).get("audio_fade_ms", 25))
-            ok, enc, err = _render_single_clip(src_video, clip, seg_mp4, fade_ms, use_vt)
+            ok, enc, err = _render_single_clip(
+                src_video,
+                clip,
+                seg_mp4,
+                fade_ms,
+                use_vt,
+                cut_spans=active_cuts,
+                tmp_dir=tmp_dir,
+                clean_video=clean_vid,
+                masked_ass_path=masked_ass,
+                audio_mask_spans=audio_mask_spans,
+                mask_spans=mask_spans,
+            )
             if ok and seg_mp4.exists():
                 concat_files.append(seg_mp4)
             else:
@@ -2307,6 +2980,11 @@ def _render_compilation(
         raw_mp4.replace(out_mp4)
         comp.output_file = str(out_mp4)
         comp.last_rendered_hash = comp.render_hash
+        comp.rendered_filter_tag = (
+            describe_applied_filter(manifest, [(c.start_s, c.end_s) for c in enabled_clips], cfg)
+            if manifest.clean_cut.apply_to_clips
+            else "原片直出(未关联)"
+        )
         _generate_compilation_cover(
             manifest=manifest,
             store=store,
@@ -2340,6 +3018,202 @@ def _render_compilation(
     return None
 
 
+def _render_clean_cut(
+    manifest: ProjectManifest,
+    store: ProjectStore,
+    cfg: dict[str, Any],
+    use_vt: bool,
+    run_id: str,
+    hero_pool: list[SelectedFrame] | None = None,
+    published_date: str = "",
+) -> Path | None:
+    """Render full Clean Cut video with selected ad and/or political-sensitive spans excised or masked."""
+    t0 = time.monotonic()
+    cc = manifest.clean_cut
+    active_segs = get_active_cut_segments(manifest, cfg)
+    if not active_segs:
+        cc.enabled = False
+        store.log("[render] 当前没有任何生效的去广或脱敏片段，自动跳过全片净版")
+        store.save(manifest)
+        return None
+    keep_spans = _clean_cut_keep_spans(manifest, cfg)
+    if not keep_spans:
+        store.log("[render] 全片净版无有效保留区间，取消渲染")
+        return None
+
+    kept_dur = sum(e - s for s, e in keep_spans)
+    saved_s = max(0.0, float(manifest.source.duration_s or kept_dur) - kept_dur)
+    c_cfg = cfg.get("cover", {})
+    prefer_two_shot = bool(c_cfg.get("prefer_two_shot", True))
+    if not published_date:
+        published_date = _ensure_published_date(manifest, store)
+    if hero_pool is None:
+        clean_src = Path(manifest.source.analysis_video)
+        hero_src = clean_src if clean_src.exists() else Path(manifest.source.render_video)
+        hero_pool = _build_hero_pool_for_manifest(hero_src, manifest, store, cfg, prefer_two_shot)
+
+    output_dir = Path(manifest.source.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_mp4 = output_dir / build_clean_cut_filename(manifest, published_date, duration_s=kept_dur)
+    cover_jpg = out_mp4.with_suffix(".jpg")
+
+    cc.render_hash = compute_clean_cut_render_hash(manifest, cfg)
+    effective_title = (
+        cc.cover_title
+        or cc.title
+        or manifest.metadata.original_theme_zh
+        or manifest.metadata.original_title
+        or "全片净版"
+    ).strip()
+    exp_cover_hash = compute_cover_hash(
+        key="clean_cut",
+        title=effective_title,
+        categories=["clean_cut"],
+        start_s=0.0,
+        end_s=float(manifest.source.duration_s or kept_dur),
+        manifest=manifest,
+        cfg=cfg,
+        published_date=published_date,
+    )
+
+    if cc.render_hash == cc.last_rendered_hash:
+        if not (out_mp4.exists() and out_mp4.stat().st_size > 1024):
+            _migrate_cached_media(cc.output_file, out_mp4, cover_jpg)
+        if out_mp4.exists() and out_mp4.stat().st_size > 1024:
+            cc.output_file = str(out_mp4)
+            if cc.cover_hash != exp_cover_hash or not cover_jpg.exists():
+                if _generate_clean_cut_cover(
+                    manifest=manifest,
+                    store=store,
+                    cfg=cfg,
+                    hero_pool=hero_pool,
+                    published_date=published_date,
+                    cover_path=cover_jpg,
+                    total_duration_s=kept_dur,
+                ):
+                    cc.cover_file = str(cover_jpg)
+                    cc.cover_hash = exp_cover_hash
+            else:
+                cc.cover_file = str(cover_jpg)
+            store.save(manifest)
+            store.append_receipt(
+                run_id=run_id,
+                stage="render",
+                actor="system",
+                action="render_clean_cut_cache_hit",
+                summary=f"全片净版命中增量缓存（hash {cc.render_hash}），跳过重渲: {out_mp4.name}",
+            )
+            return out_mp4
+
+    clean_vid, masked_ass, audio_mask_spans, mask_spans = _prepare_mask_render_context(
+        manifest,
+        store.work_dir / "clean_cut_masks",
+        hash_key=cc.render_hash or run_id,
+        cfg=cfg,
+    )
+    ad_cnt = sum(1 for x in active_segs if x.kind == "ad")
+    pol_del_cnt = sum(1 for x in active_segs if x.kind == "political_sensitive") - len(mask_spans)
+    pol_mask_cnt = len(mask_spans)
+    precise_copy = should_use_precise_copy(manifest, cfg) and not mask_spans
+    store.log(
+        f"[render] 开始渲染全片净版: 生效 {len(active_segs)} 段（去广 {ad_cnt} / 删敏 {max(0, pol_del_cnt)} / 遮蔽 {pol_mask_cnt}，时长变化 -{saved_s:.1f}s），"
+        f"模式={'极速无损' if precise_copy else '帧精准硬件重编'}"
+    )
+
+    fade_ms = int(cfg.get("boundary", {}).get("audio_fade_ms", 25))
+    src_video = Path(manifest.source.render_video)
+    tmp_dir = store.work_dir / "clean_cut_tmp"
+    ok, encoder, err = _render_multi_span_video(
+        src_video,
+        keep_spans,
+        out_mp4,
+        fade_ms=fade_ms,
+        use_vt=use_vt,
+        precise_copy=precise_copy,
+        tmp_dir=tmp_dir,
+        log_fn=store.log,
+        clean_video=clean_vid,
+        masked_ass_path=masked_ass,
+        audio_mask_spans=audio_mask_spans,
+        mask_spans=mask_spans,
+    )
+    if not ok or not out_mp4.exists():
+        store.log(f"[render] 全片净版渲染失败: {err}")
+        return None
+
+    cc.last_rendered_hash = cc.render_hash
+    cc.output_file = str(out_mp4)
+    cc.rendered_filter_tag = describe_applied_filter(manifest, None, cfg)
+    if _generate_clean_cut_cover(
+        manifest=manifest,
+        store=store,
+        cfg=cfg,
+        hero_pool=hero_pool,
+        published_date=published_date,
+        cover_path=cover_jpg,
+        total_duration_s=kept_dur,
+    ):
+        cc.cover_file = str(cover_jpg)
+        cc.cover_hash = exp_cover_hash
+    store.save(manifest)
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    store.append_receipt(
+        run_id=run_id,
+        stage="render",
+        actor="system",
+        action="render_clean_cut",
+        elapsed_ms=elapsed_ms,
+        summary=f"全片净版完成: {out_mp4.name}（保留 {_fmt_dur(kept_dur)}，剪除 {len(active_segs)} 段 / -{saved_s:.1f}s，编码: {encoder}）",
+        details={
+            "output_file": str(out_mp4),
+            "cover_file": cc.cover_file,
+            "kept_seconds": round(kept_dur, 1),
+            "removed_seconds": round(saved_s, 1),
+            "ads_cut": ad_cnt,
+            "political_cut": max(0, pol_del_cnt),
+            "political_masked": pol_mask_cnt,
+            "encoder": encoder,
+            "render_hash": cc.render_hash,
+        },
+    )
+    store.log(f"[render] 全片净版完成: {out_mp4.name}")
+    return out_mp4
+
+
+def render_clean_cut_and_cover(
+    manifest: ProjectManifest,
+    store: ProjectStore,
+    cfg: dict[str, Any] | None = None,
+    *,
+    force: bool = False,
+) -> tuple[bool, str]:
+    """On-demand render of Clean Cut full video and cover."""
+    if cfg is None:
+        cfg = load_editorial_config()
+    if not get_active_cut_segments(manifest, cfg):
+        manifest.clean_cut.enabled = False
+        store.save(manifest)
+        return False, "当前没有任何需要剪切或脱敏的内容，无需输出全片净版"
+    manifest.clean_cut.enabled = True
+    use_vt = _has_videotoolbox()
+    published_date = _ensure_published_date(manifest, store)
+    run_id = f"clean_{uuid.uuid4().hex[:6]}"
+    if force:
+        manifest.clean_cut.last_rendered_hash = ""
+    res = _render_clean_cut(
+        manifest=manifest,
+        store=store,
+        cfg=cfg,
+        use_vt=use_vt,
+        run_id=run_id,
+        published_date=published_date,
+    )
+    if res and res.exists():
+        return True, str(res)
+    return False, "全片净版渲染失败，请查看日志"
+
+
 
 def _write_markdown_deliverables(manifest: ProjectManifest, output_dir: Path) -> None:
     date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -2365,6 +3239,16 @@ def _write_markdown_deliverables(manifest: ProjectManifest, output_dir: Path) ->
     if manifest.remix.output_file:
         idx_lines.append(
             f"| 00 | {manifest.remix.title} | 混剪集锦 | — | {len([x for x in manifest.remix.items if x.enabled])} 段 | `{Path(manifest.remix.output_file).name}` |"
+        )
+    if manifest.compilation.output_file:
+        idx_lines.append(
+            f"| 00 | {manifest.compilation.title or '切片精选集'} | 切片精选集 | — | {len(get_compilation_clips(manifest))} 支串联 | `{Path(manifest.compilation.output_file).name}` |"
+        )
+    if manifest.clean_cut.output_file:
+        kept_spans = _clean_cut_keep_spans(manifest)
+        kept_s = sum(e - s for s, e in kept_spans)
+        idx_lines.append(
+            f"| 00 | {manifest.clean_cut.title or '全片净版'} | 全片净版 | {_fmt_dur(kept_s)} | {len(get_active_cut_segments(manifest))} 段已剪 | `{Path(manifest.clean_cut.output_file).name}` |"
         )
     (output_dir / "clips_index.md").write_text("\n".join(idx_lines) + "\n", encoding="utf-8")
 
@@ -2495,7 +3379,9 @@ def run_render_stage(
     run_id: str,
     *,
     force: bool = False,
+    render_targets: list[str] | None = None,
 ) -> ProjectManifest:
+    targets = set(render_targets) if render_targets is not None else {"clips", "remix", "compilation", "clean_cut"}
     t0 = time.monotonic()
     src_video = Path(manifest.source.render_video)
     clean_video = Path(manifest.source.analysis_video)
@@ -2512,113 +3398,153 @@ def run_render_stage(
     cached_count = 0
     cover_refreshed = 0
     failed_count = 0
-
-    for clip_pos, clip in enumerate(manifest.clips):
-        if not clip.enabled:
-            continue
-        clip.render_hash = compute_clip_render_hash(clip, manifest.source.render_video)
-        fname = build_clip_filename(clip, manifest, published_date)
-        out_mp4 = output_dir / fname
-        cover_jpg = out_mp4.with_suffix(".jpg")
-        effective_cover_title = (clip.cover_title or clip.title).strip()
-        exp_cover_hash = compute_cover_hash(
-            key=clip.clip_id,
-            title=effective_cover_title,
-            categories=clip.categories,
-            start_s=clip.start_s,
-            end_s=clip.end_s,
-            manifest=manifest,
+    apply_links = bool(manifest.clean_cut.apply_to_clips)
+    active_cuts = get_active_delete_spans(manifest, cfg) if apply_links else []
+    clean_vid, masked_ass, audio_mask_spans, mask_spans = (
+        _prepare_mask_render_context(
+            manifest,
+            store.work_dir / "masked_subs",
+            hash_key=manifest.clean_cut.render_hash or run_id,
             cfg=cfg,
-            published_date=published_date,
         )
+        if apply_links
+        else (None, None, [], [])
+    )
 
-        if not force and clip.render_hash == clip.last_rendered_hash:
-            if not (out_mp4.exists() and out_mp4.stat().st_size > 1024):
-                _migrate_cached_media(clip.output_file, out_mp4, cover_jpg)
-            if out_mp4.exists() and out_mp4.stat().st_size > 1024:
-                clip.output_file = str(out_mp4)
-                if clip.cover_hash != exp_cover_hash or not cover_jpg.exists():
-                    if _generate_clip_cover(
-                        clean_video=frame_src,
-                        fallback_video=out_mp4,
-                        clip=clip,
-                        manifest=manifest,
-                        store=store,
-                        cfg=cfg,
-                        hero_pool=hero_pool,
-                        fallback_index=clip_pos,
-                        published_date=published_date,
-                        cover_path=cover_jpg,
-                        reuse_cached_frame=True,
-                    ):
-                        clip.cover_file = str(cover_jpg)
-                        clip.cover_hash = exp_cover_hash
-                        cover_refreshed += 1
-                else:
-                    clip.cover_file = str(cover_jpg)
-                cached_count += 1
+    if "clips" in targets:
+        for clip_pos, clip in enumerate(manifest.clips):
+            check_cancelled()
+            if not clip.enabled:
                 continue
-
-        store.log(f"[render] 帧精准切片 {clip.clip_id}: {fname} ({clip.start_s:.2f}s → {clip.end_s:.2f}s)")
-        ct0 = time.monotonic()
-        ok, encoder, err = _render_single_clip(src_video, clip, out_mp4, fade_ms, use_vt)
-        celapsed = int((time.monotonic() - ct0) * 1000)
-
-        if ok:
-            clip.last_rendered_hash = clip.render_hash
-            clip.output_file = str(out_mp4)
-            if _generate_clip_cover(
-                clean_video=frame_src,
-                fallback_video=out_mp4,
-                clip=clip,
+            clip_masks = get_overlapping_mask_payload(clip.start_s, clip.end_s, manifest, cfg) if apply_links else []
+            clip.render_hash = compute_clip_render_hash(
+                clip,
+                manifest.source.render_video,
+                active_cuts,
+                manifest.source.subtitle_sha256,
+                mask_payload=clip_masks,
+            )
+            fname = build_clip_filename(clip, manifest, published_date)
+            out_mp4 = output_dir / fname
+            cover_jpg = out_mp4.with_suffix(".jpg")
+            effective_cover_title = (clip.cover_title or clip.title).strip()
+            exp_cover_hash = compute_cover_hash(
+                key=clip.clip_id,
+                title=effective_cover_title,
+                categories=clip.categories,
+                start_s=clip.start_s,
+                end_s=clip.end_s,
                 manifest=manifest,
-                store=store,
                 cfg=cfg,
-                hero_pool=hero_pool,
-                fallback_index=clip_pos,
                 published_date=published_date,
-                cover_path=cover_jpg,
-            ):
-                clip.cover_file = str(cover_jpg)
-                clip.cover_hash = exp_cover_hash
-            rendered_count += 1
-            store.append_receipt(
-                run_id=run_id,
-                stage="render",
-                actor="system",
-                action="render_clip",
-                elapsed_ms=celapsed,
-                summary=f"切出 {fname}（{clip.end_s - clip.start_s:.1f}s，编码器: {encoder}）",
-                details={
-                    "clip_id": clip.clip_id,
-                    "encoder": encoder,
-                    "output_file": str(out_mp4),
-                    "cover_file": clip.cover_file,
-                    "render_hash": clip.render_hash,
-                },
             )
-        else:
-            failed_count += 1
-            store.append_receipt(
-                run_id=run_id,
-                stage="render",
-                actor="system",
-                action="render_clip",
-                elapsed_ms=celapsed,
-                summary=f"切片 {clip.clip_id} 渲染失败",
-                error=err,
+
+            if not force and clip.render_hash == clip.last_rendered_hash:
+                if not (out_mp4.exists() and out_mp4.stat().st_size > 1024):
+                    _migrate_cached_media(clip.output_file, out_mp4, cover_jpg)
+                if out_mp4.exists() and out_mp4.stat().st_size > 1024:
+                    clip.output_file = str(out_mp4)
+                    if clip.cover_hash != exp_cover_hash or not cover_jpg.exists():
+                        if _generate_clip_cover(
+                            clean_video=frame_src,
+                            fallback_video=out_mp4,
+                            clip=clip,
+                            manifest=manifest,
+                            store=store,
+                            cfg=cfg,
+                            hero_pool=hero_pool,
+                            fallback_index=clip_pos,
+                            published_date=published_date,
+                            cover_path=cover_jpg,
+                            reuse_cached_frame=True,
+                        ):
+                            clip.cover_file = str(cover_jpg)
+                            clip.cover_hash = exp_cover_hash
+                            cover_refreshed += 1
+                    else:
+                        clip.cover_file = str(cover_jpg)
+                    cached_count += 1
+                    continue
+
+            store.log(f"[render] 帧精准切片 {clip.clip_id}: {fname} ({clip.start_s:.2f}s → {clip.end_s:.2f}s)")
+            ct0 = time.monotonic()
+            ok, encoder, err = _render_single_clip(
+                src_video,
+                clip,
+                out_mp4,
+                fade_ms,
+                use_vt,
+                cut_spans=active_cuts,
+                tmp_dir=store.work_dir / "clips_tmp",
+                clean_video=clean_vid,
+                masked_ass_path=masked_ass,
+                audio_mask_spans=audio_mask_spans,
+                mask_spans=mask_spans,
             )
+            celapsed = int((time.monotonic() - ct0) * 1000)
+
+            if ok:
+                clip.last_rendered_hash = clip.render_hash
+                clip.output_file = str(out_mp4)
+                clip.rendered_filter_tag = (
+                    describe_applied_filter(manifest, [(clip.start_s, clip.end_s)], cfg)
+                    if apply_links
+                    else "原片直出(未关联)"
+                )
+                if _generate_clip_cover(
+                    clean_video=frame_src,
+                    fallback_video=out_mp4,
+                    clip=clip,
+                    manifest=manifest,
+                    store=store,
+                    cfg=cfg,
+                    hero_pool=hero_pool,
+                    fallback_index=clip_pos,
+                    published_date=published_date,
+                    cover_path=cover_jpg,
+                ):
+                    clip.cover_file = str(cover_jpg)
+                    clip.cover_hash = exp_cover_hash
+                rendered_count += 1
+                store.append_receipt(
+                    run_id=run_id,
+                    stage="render",
+                    actor="system",
+                    action="render_clip",
+                    elapsed_ms=celapsed,
+                    summary=f"切出 {fname}（{clip.end_s - clip.start_s:.1f}s，编码器: {encoder}）",
+                    details={
+                        "clip_id": clip.clip_id,
+                        "encoder": encoder,
+                        "output_file": str(out_mp4),
+                        "cover_file": clip.cover_file,
+                        "render_hash": clip.render_hash,
+                    },
+                )
+            else:
+                failed_count += 1
+                store.append_receipt(
+                    run_id=run_id,
+                    stage="render",
+                    actor="system",
+                    action="render_clip",
+                    elapsed_ms=celapsed,
+                    summary=f"切片 {clip.clip_id} 渲染失败",
+                    error=err,
+                )
 
     remix_status = ""
     comp_status = ""
 
-    if manifest.remix.enabled:
+    if "remix" in targets and manifest.remix.enabled:
+        check_cancelled()
         has_remix_sources = bool(manifest.clips or manifest.remix_only_pool)
         cur_sig = compute_remix_source_signature(manifest)
         need_replan = has_remix_sources and (
             len(manifest.remix.items) == 0
             or (
-                bool(manifest.remix.planned_source_signature)
+                not manifest.remix.manual_script_locked
+                and bool(manifest.remix.planned_source_signature)
                 and manifest.remix.planned_source_signature != cur_sig
             )
         )
@@ -2649,7 +3575,8 @@ def run_render_stage(
         elif has_remix_sources and need_replan:
             raise RuntimeError("AI 混剪未能规划出有效高光片段，请查看日志或检查模型配置")
 
-    if manifest.compilation.enabled and any(c.enabled for c in manifest.clips):
+    if "compilation" in targets and manifest.compilation.enabled and get_compilation_clips(manifest):
+        check_cancelled()
         if force:
             manifest.compilation.last_rendered_hash = ""
         res_comp = _render_compilation(
@@ -2662,6 +3589,24 @@ def run_render_stage(
             published_date=published_date,
         )
         comp_status = "，精选集已输出" if (res_comp and res_comp.exists()) else "，精选集失败"
+
+    clean_status = ""
+    if "clean_cut" in targets and manifest.clean_cut.enabled and get_active_cut_segments(manifest, cfg):
+        check_cancelled()
+        if force:
+            manifest.clean_cut.last_rendered_hash = ""
+        res_clean = _render_clean_cut(
+            manifest,
+            store,
+            cfg,
+            use_vt,
+            run_id,
+            hero_pool=hero_pool,
+            published_date=published_date,
+        )
+        clean_status = "，全片净版已输出" if (res_clean and res_clean.exists()) else "，全片净版失败"
+    elif "clean_cut" in targets and manifest.clean_cut.enabled:
+        manifest.clean_cut.enabled = False
     _write_markdown_deliverables(manifest, output_dir)
 
     store.save(manifest)
@@ -2672,7 +3617,7 @@ def run_render_stage(
         actor="system",
         action="render_complete",
         elapsed_ms=total_ms,
-        summary=f"渲染完成：新切 {rendered_count} 支，命中缓存 {cached_count} 支，刷新封面 {cover_refreshed} 张，失败 {failed_count} 支{remix_status}{comp_status}；输出目录 {output_dir}",
+        summary=f"渲染完成：新切 {rendered_count} 支，命中缓存 {cached_count} 支，刷新封面 {cover_refreshed} 张，失败 {failed_count} 支{remix_status}{comp_status}{clean_status}；输出目录 {output_dir}",
         details={
             "rendered": rendered_count,
             "cached": cached_count,
@@ -2712,8 +3657,27 @@ def render_single_clip_and_cover(
     published_date = _ensure_published_date(manifest, store)
     prefer_two_shot = bool(cfg.get("cover", {}).get("prefer_two_shot", True))
     hero_pool = _build_hero_pool_for_manifest(frame_src, manifest, store, cfg, prefer_two_shot)
+    apply_links = bool(manifest.clean_cut.apply_to_clips)
+    active_cuts = get_active_delete_spans(manifest, cfg) if apply_links else []
+    clean_vid, masked_ass, audio_mask_spans, mask_spans = (
+        _prepare_mask_render_context(
+            manifest,
+            store.work_dir / "masked_subs",
+            hash_key=manifest.clean_cut.render_hash or "single",
+            cfg=cfg,
+        )
+        if apply_links
+        else (None, None, [], [])
+    )
 
-    clip.render_hash = compute_clip_render_hash(clip, manifest.source.render_video)
+    clip_masks = get_overlapping_mask_payload(clip.start_s, clip.end_s, manifest, cfg) if apply_links else []
+    clip.render_hash = compute_clip_render_hash(
+        clip,
+        manifest.source.render_video,
+        active_cuts,
+        manifest.source.subtitle_sha256,
+        mask_payload=clip_masks,
+    )
     fname = build_clip_filename(clip, manifest, published_date)
     out_mp4 = output_dir / fname
     cover_jpg = out_mp4.with_suffix(".jpg")
@@ -2751,13 +3715,30 @@ def render_single_clip_and_cover(
         return True, str(out_mp4)
 
     store.log(f"[render] 单片定向渲染 {clip.clip_id}: {fname} ({clip.start_s:.2f}s → {clip.end_s:.2f}s)")
-    ok, encoder, err = _render_single_clip(src_video, clip, out_mp4, fade_ms, use_vt)
+    ok, encoder, err = _render_single_clip(
+        src_video,
+        clip,
+        out_mp4,
+        fade_ms,
+        use_vt,
+        cut_spans=active_cuts,
+        tmp_dir=store.work_dir / "clips_tmp",
+        clean_video=clean_vid,
+        masked_ass_path=masked_ass,
+        audio_mask_spans=audio_mask_spans,
+        mask_spans=mask_spans,
+    )
     if not ok:
         store.log(f"[render] 切片 {clip.clip_id} 渲染失败: {err}")
         return False, err
 
     clip.last_rendered_hash = clip.render_hash
     clip.output_file = str(out_mp4)
+    clip.rendered_filter_tag = (
+        describe_applied_filter(manifest, [(clip.start_s, clip.end_s)], cfg)
+        if apply_links
+        else "原片直出(未关联)"
+    )
     _generate_clip_cover(
         clean_video=frame_src,
         fallback_video=out_mp4,
@@ -2786,9 +3767,9 @@ def render_compilation_and_cover(
     """定向渲染切片精选集及其封面，更新 manifest 并返回结果"""
     if cfg is None:
         cfg = load_editorial_config()
-    enabled_clips = [c for c in manifest.clips if c.enabled]
+    enabled_clips = get_compilation_clips(manifest)
     if not enabled_clips:
-        return False, "未选择任何切片，无法合成精选集"
+        return False, "精选集未选择任何切片，无法合成精选集"
 
     manifest.compilation.enabled = True
     use_vt = _has_videotoolbox()
@@ -2805,7 +3786,49 @@ def render_compilation_and_cover(
         published_date=published_date,
     )
     if res and res.exists():
+        _write_markdown_deliverables(manifest, Path(manifest.source.output_dir))
+        store.save(manifest)
         return True, str(res)
     return False, "精选集渲染失败，请查看日志"
+
+
+def render_remix_and_cover(
+    manifest: ProjectManifest,
+    store: ProjectStore,
+    cfg: dict[str, Any] | None = None,
+    *,
+    force: bool = False,
+) -> tuple[bool, str]:
+    """定向渲染 AI 混剪及封面：已有段落时严格按用户当前勾选段落出片，不自动改写脚本"""
+    if cfg is None:
+        cfg = load_editorial_config()
+    run_id = f"remix_{uuid.uuid4().hex[:6]}"
+    if len(manifest.remix.items) == 0:
+        has_sources = bool(manifest.clips or manifest.remix_only_pool)
+        if not has_sources:
+            return False, "没有可用于混剪的切片素材"
+        manifest = plan_remix_from_clips(manifest, store, cfg, run_id)
+
+    if not any(it.enabled for it in manifest.remix.items):
+        return False, "未勾选任何混剪段落，请至少勾选 1 段后再渲染"
+
+    manifest.remix.enabled = True
+    use_vt = _has_videotoolbox()
+    published_date = _ensure_published_date(manifest, store)
+    if force:
+        manifest.remix.last_rendered_hash = ""
+    res = _render_remix(
+        manifest=manifest,
+        store=store,
+        cfg=cfg,
+        use_vt=use_vt,
+        run_id=run_id,
+        published_date=published_date,
+    )
+    if res and res.exists():
+        _write_markdown_deliverables(manifest, Path(manifest.source.output_dir))
+        store.save(manifest)
+        return True, str(res)
+    return False, "混剪渲染失败，请查看日志"
 
 

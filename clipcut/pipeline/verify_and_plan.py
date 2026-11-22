@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 
+from ..cancel import JobCancelledError, check_cancelled, run_cancellable_subprocess
 from ..llm import ClipCutLLM, DEFAULT_MULTIMODAL_FALLBACK_MODELS, DEFAULT_TEXT_FALLBACK_MODELS
 from ..models import (
     Candidate,
@@ -22,6 +23,14 @@ from ..models import (
     Utterance,
 )
 from ..receipts import ProjectStore
+from .content_filter import (
+    clip_overlapping_cut_spans,
+    get_active_cut_spans,
+    get_active_delete_spans,
+    get_overlapping_mask_payload,
+    merge_spans,
+    subtract_cut_intervals,
+)
 
 DANGLING_START_PATTERNS = [
     re.compile(r"^(?:所以|但是|不过|而且|因此|也就是说|这就|那个|这个就是|刚才说的|第二点|第三点)"),
@@ -152,8 +161,14 @@ def ensure_sentence_completeness(
     return su, eu, notes
 
 
-def compute_clip_render_hash(clip: ClipItem, render_video: str) -> str:
-    payload = {
+def compute_clip_render_hash(
+    clip: ClipItem,
+    render_video: str,
+    cut_spans: list[tuple[float, float]] | None = None,
+    subtitle_sha256: str = "",
+    mask_payload: list[dict[str, Any]] | None = None,
+) -> str:
+    payload: dict[str, Any] = {
         "video": render_video,
         "start_s": round(clip.start_s, 3),
         "end_s": round(clip.end_s, 3),
@@ -161,27 +176,81 @@ def compute_clip_render_hash(clip: ClipItem, render_video: str) -> str:
         "title_en": clip.title_en,
         "slug": clip.slug,
         "index": clip.index,
+        "subtitle_sha256": subtitle_sha256,
     }
+    ov = clip_overlapping_cut_spans(clip.start_s, clip.end_s, cut_spans)
+    if ov:
+        payload["cut_spans"] = [[s, e] for s, e in ov]
+    if mask_payload:
+        payload["masks"] = mask_payload
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
-def compute_remix_source_signature(manifest: ProjectManifest) -> str:
+def _collect_interval_filters(
+    intervals: list[tuple[float, float]],
+    manifest: ProjectManifest,
+) -> tuple[list[list[float]], list[dict[str, Any]]]:
+    del_spans = get_active_delete_spans(manifest)
+    raw_deletes: list[tuple[float, float]] = []
+    seen_masks: dict[str, dict[str, Any]] = {}
+    for s, e in intervals:
+        raw_deletes.extend(clip_overlapping_cut_spans(s, e, del_spans))
+        for m in get_overlapping_mask_payload(s, e, manifest):
+            seen_masks[str(m.get("cut_id") or len(seen_masks))] = m
+    merged_del = [[round(a, 3), round(b, 3)] for a, b in merge_spans(raw_deletes, max_gap_s=0.05)]
+    masks_sorted = sorted(seen_masks.values(), key=lambda x: (float(x.get("start_s", 0.0)), str(x.get("cut_id", ""))))
+    return merged_del, masks_sorted
+
+
+def get_compilation_clips(manifest: ProjectManifest) -> list[ClipItem]:
+    """Return Compilation's selected clips (independent clip_ids if set, else legacy clip.enabled fallback)."""
+    by_id = {c.clip_id: c for c in manifest.clips}
+    if manifest.compilation.clip_ids is not None:
+        return [by_id[cid] for cid in manifest.compilation.clip_ids if cid in by_id]
+    return [c for c in manifest.clips if c.enabled]
+
+
+def get_remix_source_clips(manifest: ProjectManifest) -> tuple[list[ClipItem], bool]:
+    """Return (candidate_clips, user_filtered) for AI Remix planning."""
+    if manifest.remix.source_clip_ids is not None:
+        by_id = {c.clip_id: c for c in manifest.clips}
+        picked = [by_id[cid] for cid in manifest.remix.source_clip_ids if cid in by_id]
+        if picked:
+            return picked, True
+        return list(manifest.clips), False
     enabled_clips = [c for c in manifest.clips if c.enabled]
-    mode = "selected" if enabled_clips else "auto_all"
-    source_clips = enabled_clips if enabled_clips else list(manifest.clips)
-    payload = {
+    if enabled_clips:
+        return enabled_clips, True
+    return list(manifest.clips), False
+
+
+def compute_remix_source_signature(manifest: ProjectManifest) -> str:
+    source_clips, user_filtered = get_remix_source_clips(manifest)
+    mode = "selected" if user_filtered else "auto_all"
+    payload: dict[str, Any] = {
         "mode": mode,
         "clips": [
             {"id": c.clip_id, "start_utt": c.start_utt, "end_utt": c.end_utt}
             for c in source_clips
         ],
-        "pool_ids": [] if enabled_clips else [p.candidate_id for p in manifest.remix_only_pool],
+        "pool_ids": [] if user_filtered else [p.candidate_id for p in manifest.remix_only_pool],
     }
+    if manifest.clean_cut.apply_to_clips:
+        intervals = [(c.start_s, c.end_s) for c in source_clips]
+        if not intervals and manifest.utterances:
+            n_u = len(manifest.utterances)
+            for p in manifest.remix_only_pool:
+                if 0 <= p.start_utt <= p.end_utt < n_u:
+                    intervals.append((manifest.utterances[p.start_utt].start_s, manifest.utterances[p.end_utt].end_s))
+        hit_del, _ = _collect_interval_filters(intervals, manifest)
+        if hit_del:
+            payload["active_cuts"] = hit_del
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
 def compute_remix_render_hash(manifest: ProjectManifest) -> str:
     r = manifest.remix
+    enabled_items = [it for it in sorted(r.items, key=lambda x: x.order) if it.enabled]
     payload: dict[str, Any] = {
         "video": manifest.source.render_video,
         "card_template": "v2-vision-pip",
@@ -205,11 +274,17 @@ def compute_remix_render_hash(manifest: ProjectManifest) -> str:
                 "start_s": round(it.start_s, 3),
                 "end_s": round(it.end_s, 3),
             }
-            for it in sorted(r.items, key=lambda x: x.order)
-            if it.enabled
+            for it in enabled_items
         ],
     }
-    if r.planned_source_signature:
+    if manifest.clean_cut.apply_to_clips:
+        intervals = [(it.start_s, it.end_s) for it in enabled_items]
+        hit_del, hit_masks = _collect_interval_filters(intervals, manifest)
+        if hit_del:
+            payload["active_cuts"] = hit_del
+        if hit_masks:
+            payload["masks"] = hit_masks
+    if not r.manual_script_locked and r.planned_source_signature:
         cur_sig = compute_remix_source_signature(manifest)
         if r.planned_source_signature != cur_sig:
             payload["pending_replan_for"] = cur_sig
@@ -218,7 +293,8 @@ def compute_remix_render_hash(manifest: ProjectManifest) -> str:
 
 def compute_compilation_render_hash(manifest: ProjectManifest) -> str:
     comp = manifest.compilation
-    payload = {
+    enabled_clips = get_compilation_clips(manifest)
+    payload: dict[str, Any] = {
         "video": manifest.source.render_video,
         "title": comp.title,
         "cover_title": comp.cover_title,
@@ -232,10 +308,16 @@ def compute_compilation_render_hash(manifest: ProjectManifest) -> str:
                 "start_s": round(c.start_s, 3),
                 "end_s": round(c.end_s, 3),
             }
-            for c in manifest.clips
-            if c.enabled
+            for c in enabled_clips
         ],
     }
+    if manifest.clean_cut.apply_to_clips:
+        intervals = [(c.start_s, c.end_s) for c in enabled_clips]
+        hit_del, hit_masks = _collect_interval_filters(intervals, manifest)
+        if hit_del:
+            payload["active_cuts"] = hit_del
+        if hit_masks:
+            payload["masks"] = hit_masks
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
@@ -272,7 +354,7 @@ def _extract_verify_preview(video_path: Path, start_s: float, end_s: float, out_
         "64k",
         str(out_path),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    res = run_cancellable_subprocess(cmd, capture_output=True, text=True, timeout=60)
     return res.returncode == 0 and out_path.exists() and out_path.stat().st_size > 1024
 
 
@@ -309,6 +391,7 @@ def _verify_exciting_candidates(
 
     verdicts_summary: list[dict[str, Any]] = []
     for cand in to_verify:
+        check_cancelled()
         s_t = utts[cand.start_utt].start_s
         e_t = utts[cand.end_utt].end_s
         preview_path = preview_dir / f"{cand.candidate_id}.mp4"
@@ -387,6 +470,8 @@ def _verify_exciting_candidates(
                 summary=f"多模态复核 {cand.candidate_id} [{v.upper()}] (强度 {cand.multimodal.intensity_score:.1f}): {cand.multimodal.evidence[:90]}",
                 details=verdicts_summary[-1],
             )
+        except JobCancelledError:
+            raise
         except Exception as exc:
             cand.multimodal = MultimodalVerdict(
                 status="unverified",
@@ -444,6 +529,123 @@ def _merge_overlapping_candidates(
             kept.append(c)
     kept.sort(key=lambda c: c.start_utt)
     return kept
+
+
+def _norm_chapter_name(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip().lower())
+
+
+def _pick_stronger_multimodal(a: MultimodalVerdict, b: MultimodalVerdict) -> MultimodalVerdict:
+    rank = {"pass": 4, "downgrade": 3, "not_required": 2, "unverified": 1, "reject": 0}
+    ra = (rank.get(a.status, 0), float(a.intensity_score or 0.0))
+    rb = (rank.get(b.status, 0), float(b.intensity_score or 0.0))
+    return a if ra >= rb else b
+
+
+def _consolidate_adjacent_candidates(
+    cands: list[Candidate],
+    utterances: list[Utterance],
+    manifest: ProjectManifest,
+    cfg: dict[str, Any],
+) -> tuple[list[Candidate], list[dict[str, Any]]]:
+    """
+    Merge adjacent short/medium fragments within the same chapter or narrative arc
+    so long interviews produce cohesive standalone clips rather than micro-fragments.
+    """
+    if len(cands) <= 1 or not utterances:
+        return sorted(cands, key=lambda c: (c.start_utt, c.end_utt)), []
+
+    dur_cfg = cfg.get("clip_duration", {})
+    min_s = float(dur_cfg.get("min_seconds", 90))
+    max_s = float(dur_cfg.get("max_seconds", 360))
+    ideal_max_s = float(dur_cfg.get("ideal_max_seconds", 270))
+    max_gap_s = float(dur_cfg.get("adjacent_merge_max_gap_s", 12.0))
+    trigger_s = float(dur_cfg.get("adjacent_merge_trigger_seconds", 135.0))
+
+    chapters = manifest.metadata.chapters or []
+    dur_total = float(manifest.source.duration_s or 0.0)
+    avg_ch_s = (dur_total / len(chapters)) if chapters and dur_total > 0 else 0.0
+    is_dense_chapters = len(chapters) > 18 or (len(chapters) > 0 and avg_ch_s < 150.0)
+
+    ordered = sorted(cands, key=lambda c: (c.start_utt, c.end_utt))
+    consolidated: list[Candidate] = []
+    merge_logs: list[dict[str, Any]] = []
+
+    for curr in ordered:
+        if not consolidated:
+            consolidated.append(curr)
+            continue
+
+        prev = consolidated[-1]
+        p0, p1 = utterances[prev.start_utt].start_s, utterances[prev.end_utt].end_s
+        c0, c1 = utterances[curr.start_utt].start_s, utterances[curr.end_utt].end_s
+        prev_dur = max(0.0, p1 - p0)
+        curr_dur = max(0.0, c1 - c0)
+        gap = c0 - p1
+        combined_dur = max(p1, c1) - min(p0, c0)
+
+        ch_prev = _norm_chapter_name(prev.chapter_title)
+        ch_curr = _norm_chapter_name(curr.chapter_title)
+        same_chapter = bool(ch_prev and ch_curr and ch_prev == ch_curr)
+        both_have_diff_chapter = bool(ch_prev and ch_curr and ch_prev != ch_curr)
+
+        should_merge = False
+        if gap <= max_gap_s and combined_dur <= max_s:
+            if same_chapter:
+                should_merge = prev_dur < trigger_s or curr_dur < trigger_s
+            elif both_have_diff_chapter:
+                should_merge = (
+                    is_dense_chapters
+                    and gap <= 2.0
+                    and min(prev_dur, curr_dur) < min_s
+                    and combined_dur <= ideal_max_s
+                )
+            else:
+                should_merge = gap <= min(max_gap_s, 6.0) and (
+                    min(prev_dur, curr_dur) < min_s or (prev_dur < trigger_s and curr_dur < trigger_s)
+                )
+
+        if not should_merge:
+            consolidated.append(curr)
+            continue
+
+        primary, secondary = (curr, prev) if curr.score > prev.score else (prev, curr)
+        primary.start_utt = min(prev.start_utt, curr.start_utt)
+        primary.end_utt = max(prev.end_utt, curr.end_utt)
+        primary.hook = prev.hook or curr.hook
+        for tid in prev.topic_ids + curr.topic_ids:
+            if tid not in primary.topic_ids:
+                primary.topic_ids.append(tid)
+        for cat in prev.categories + curr.categories:
+            if cat not in primary.categories:
+                primary.categories.append(cat)
+        for ht in prev.matched_hot_topics + curr.matched_hot_topics:
+            if ht not in primary.matched_hot_topics:
+                primary.matched_hot_topics.append(ht)
+        primary.score = max(float(prev.score), float(curr.score))
+        primary.needs_multimodal_verify = bool(prev.needs_multimodal_verify or curr.needs_multimodal_verify)
+        primary.multimodal = _pick_stronger_multimodal(prev.multimodal, curr.multimodal)
+        if secondary.title and secondary.title not in primary.summary and len(primary.summary) < 120:
+            primary.summary = f"{primary.summary}（合并涵盖：{secondary.title}）".strip()
+        if not primary.chapter_title:
+            primary.chapter_title = prev.chapter_title or curr.chapter_title
+
+        secondary.disposition = "merged"
+        secondary.disposition_reason = (
+            f"相邻短切片自动聚合至 {primary.candidate_id}（间隔 {gap:.1f}s，合并后 {combined_dur:.0f}s）"
+        )
+        consolidated[-1] = primary
+        merge_logs.append(
+            {
+                "primary": primary.candidate_id,
+                "merged": secondary.candidate_id,
+                "chapter": primary.chapter_title,
+                "gap_s": round(gap, 1),
+                "combined_s": round(combined_dur, 1),
+            }
+        )
+
+    return consolidated, merge_logs
 
 
 REMIX_SYSTEM = """你是顶级财经与科技视频总编，负责把一部深度长访谈的已定稿精华切片，策展并浓缩成一支结构清晰、论证充分、有叙事节奏的高光集锦。
@@ -596,14 +798,26 @@ def _card_fee_for_item(card_mode: str, card_dur_base: float, has_items: bool, ne
     return 0.0
 
 
+def _blocked_utterance_ids(utterances: list[Utterance], cut_spans: list[tuple[float, float]]) -> set[int]:
+    if not cut_spans:
+        return set()
+    blocked: set[int] = set()
+    for u in utterances:
+        if any(cs < u.end_s - 0.05 and ce > u.start_s + 0.05 for cs, ce in cut_spans):
+            blocked.add(u.id)
+    return blocked
+
+
 def _build_remix_macro_prompt(
     manifest: ProjectManifest,
     cfg: dict[str, Any],
     enabled_clips: list[ClipItem],
     clip_bounds: dict[str, tuple[int, int]],
     user_filtered: bool = True,
+    blocked_utts: set[int] | None = None,
 ) -> tuple[str, int, int, float]:
     utts = manifest.utterances
+    blocked = blocked_utts or set()
     r_cfg = cfg.get("remix", {})
     src_dur = max(60.0, float(manifest.source.duration_s or 600.0))
     max_ratio = float(r_cfg.get("max_duration_ratio", 0.10))
@@ -644,14 +858,28 @@ def _build_remix_macro_prompt(
     for c in enabled_clips:
         allowed_lo, allowed_hi = clip_bounds[c.clip_id]
         lines = []
+        emitted_skip = False
         if allowed_lo < c.start_utt:
             lines.append(f"  [同章前情铺垫（句号 {allowed_lo}..{c.start_utt - 1}，仅当正文缺乏主语/工具背景时从此处起选）]")
             for uid in range(allowed_lo, c.start_utt):
+                if uid in blocked:
+                    if not emitted_skip:
+                        lines.append("  [已屏蔽广告/敏感区间]")
+                        emitted_skip = True
+                    continue
+                emitted_skip = False
                 u = utts[uid]
                 dur_u = max(0.5, u.end_s - u.start_s)
                 lines.append(f"  [句号={u.id} | 单句长{dur_u:.1f}s] {u.zh or u.en}")
             lines.append(f"  [切片正文（句号 {c.start_utt}..{c.end_utt}）]")
+            emitted_skip = False
         for uid in range(c.start_utt, allowed_hi + 1):
+            if uid in blocked:
+                if not emitted_skip:
+                    lines.append("  [已屏蔽广告/敏感区间]")
+                    emitted_skip = True
+                continue
+            emitted_skip = False
             u = utts[uid]
             dur_u = max(0.5, u.end_s - u.start_s)
             sig = f" <<{','.join(u.signal_tags)}>>" if u.signal_tags else ""
@@ -669,10 +897,19 @@ def _build_remix_macro_prompt(
     if not user_filtered:
         for p in manifest.remix_only_pool:
             lines = []
+            emitted_skip = False
             for uid in range(p.start_utt, p.end_utt + 1):
+                if uid in blocked:
+                    if not emitted_skip:
+                        lines.append("  [已屏蔽广告/敏感区间]")
+                        emitted_skip = True
+                    continue
+                emitted_skip = False
                 u = utts[uid]
                 dur_u = max(0.5, u.end_s - u.start_s)
                 lines.append(f"  [句号={u.id} | 单句长{dur_u:.1f}s] {u.zh or u.en}")
+            if not any("[句号=" in ln for ln in lines):
+                continue
             blocks.append(
                 f"### ShortHighlight {p.candidate_id} (可用句号 {p.start_utt}..{p.end_utt} | 分类: {','.join(p.categories)}) | {p.title}\n"
                 f"- 简介: {p.summary}\n"
@@ -762,13 +999,12 @@ def plan_remix_from_clips(
 ) -> ProjectManifest:
     """Plan curated macro-context Remix AFTER clips are finalized (also callable after human edits)."""
     utts = manifest.utterances
-    enabled_clips = [c for c in manifest.clips if c.enabled]
-    user_filtered = bool(enabled_clips)
-    candidate_clips = enabled_clips if user_filtered else list(manifest.clips)
+    candidate_clips, user_filtered = get_remix_source_clips(manifest)
     candidate_pool = [] if user_filtered else list(manifest.remix_only_pool)
     if not candidate_clips and not candidate_pool:
         manifest.remix.items = []
         manifest.remix.editorial_thesis = ""
+        manifest.remix.manual_script_locked = False
         manifest.remix.planned_source_signature = compute_remix_source_signature(manifest)
         manifest.remix.render_hash = compute_remix_render_hash(manifest)
         store.save(manifest)
@@ -784,8 +1020,10 @@ def plan_remix_from_clips(
     for p in candidate_pool:
         clip_bounds[p.candidate_id] = (p.start_utt, p.end_utt)
 
+    active_cuts = get_active_delete_spans(manifest, cfg) if manifest.clean_cut.apply_to_clips else []
+    blocked_utts = _blocked_utterance_ids(utts, active_cuts)
     prompt, _, _, hard_cap_s = _build_remix_macro_prompt(
-        manifest, cfg, candidate_clips, clip_bounds, user_filtered=user_filtered
+        manifest, cfg, candidate_clips, clip_bounds, user_filtered=user_filtered, blocked_utts=blocked_utts
     )
 
     models_cfg = cfg.get("models", {})
@@ -793,6 +1031,7 @@ def plan_remix_from_clips(
     remix_model = models_cfg.get("remix_model") or models_cfg.get("text_model") or "qwen3.8-max"
     text_fallbacks = list(models_cfg.get("text_fallback_models") or DEFAULT_TEXT_FALLBACK_MODELS)
     llm = ClipCutLLM(models_cfg)
+    check_cancelled()
     res = llm.generate_json(
         prompt=prompt,
         model=remix_model,
@@ -907,6 +1146,15 @@ def plan_remix_from_clips(
         ):
             su, eu = cand_su, cand_eu
 
+        # Trim/drop utterances blocked by active ad/political cuts when apply_to_clips is enabled
+        if blocked_utts:
+            while su <= eu and su in blocked_utts:
+                su += 1
+            while eu >= su and eu in blocked_utts:
+                eu -= 1
+            if su > eu:
+                continue
+
         # Safeguard C: trim edge overlap against used_utts; skip if >50% overlapped
         orig_count = max(1, eu - su + 1)
         overlap_count = sum(1 for u_idx in range(su, eu + 1) if u_idx in used_utts)
@@ -933,6 +1181,8 @@ def plan_remix_from_clips(
             video_duration=manifest.source.duration_s,
             cfg=cfg,
         )
+        if active_cuts and not subtract_cut_intervals(s_t, e_t, active_cuts, min_keep_s=4.0):
+            continue
         seg_dur = max(0.5, e_t - s_t)
 
         # Safeguard D: strictly enforce <= 1/10 hard cap without chopping full arguments into 1-sentence fragments
@@ -1024,11 +1274,13 @@ def plan_remix_from_clips(
     manifest.remix.bgm_volume = float(r_cfg.get("bgm_volume", manifest.remix.bgm_volume))
     manifest.remix.sfx_volume = float(r_cfg.get("sfx_volume", manifest.remix.sfx_volume))
     manifest.remix.items = items
+    manifest.remix.manual_script_locked = False
     manifest.remix.planned_source_signature = compute_remix_source_signature(manifest)
     manifest.remix.render_hash = compute_remix_render_hash(manifest)
 
     total_speech_s = sum(max(0.0, it.end_s - it.start_s) for it in items)
     theme_count = len(theme_audit_logs) or len({it.group_label for it in items if it.group_label})
+    check_cancelled()
     store.save(manifest)
     store.append_receipt(
         run_id=run_id,
@@ -1068,8 +1320,10 @@ def run_verify_and_plan_stage(
 
     # 1. Targeted multimodal verification for exciting_dialogue candidates
     _verify_exciting_candidates(manifest, store, cfg, llm, run_id)
+    check_cancelled()
 
-    # 2. Filter rejected pure-exciting candidates
+    # 2. Filter rejected pure-exciting candidates & cut-dominated candidates BEFORE merging
+    active_cuts = get_active_delete_spans(manifest, cfg) if manifest.clean_cut.apply_to_clips else []
     surviving: list[Candidate] = []
     remix_only_pool: list[Candidate] = []
     for c in manifest.candidates:
@@ -1081,22 +1335,45 @@ def run_verify_and_plan_stage(
                 continue
             else:
                 c.categories = other_cats  # type: ignore[arg-type]
+        if active_cuts and utts and 0 <= c.start_utt <= c.end_utt < len(utts):
+            raw_s = utts[c.start_utt].start_s
+            raw_e = utts[c.end_utt].end_s
+            raw_dur = max(0.0, raw_e - raw_s)
+            kept_spans = subtract_cut_intervals(raw_s, raw_e, active_cuts, min_keep_s=0.4)
+            kept_dur = sum(ke - ks for ks, ke in kept_spans)
+            if kept_dur < min(15.0, raw_dur * 0.25):
+                c.disposition = "dropped"
+                c.disposition_reason = "候选区间主要由已识别广告/政治敏感内容构成，已自动过滤"
+                continue
         if c.disposition == "remix_only":
             remix_only_pool.append(c)
         else:
             surviving.append(c)
 
-    # 3. Overlap merge
+    # 3. Overlap merge + adjacent fragment consolidation
     dur_cfg = cfg.get("clip_duration", {})
     iou_thresh = float(dur_cfg.get("overlap_merge_iou", 0.35))
-    min_s = float(dur_cfg.get("min_seconds", 60))
-    max_s = float(dur_cfg.get("max_seconds", 300))
+    min_s = float(dur_cfg.get("min_seconds", 90))
+    max_s = float(dur_cfg.get("max_seconds", 360))
+    short_max_s = float(dur_cfg.get("short_highlight_max_seconds", 75))
 
     merged_cands = _merge_overlapping_candidates(surviving, utts, iou_thresh)
+    merged_cands, adj_merge_logs = _consolidate_adjacent_candidates(merged_cands, utts, manifest, cfg)
+    if adj_merge_logs:
+        store.append_receipt(
+            run_id=run_id,
+            stage="verify_and_plan",
+            actor="system",
+            action="consolidate_adjacent_candidates",
+            summary=f"同章/紧邻碎片自动聚合：合并 {len(adj_merge_logs)} 对短切片，收敛为 {len(merged_cands)} 支完整候选",
+            details={"merges": adj_merge_logs},
+        )
 
     # 4. Sentence completeness + acoustic pause-midpoint snapping + duration checks
     clips: list[ClipItem] = []
     snap_logs: list[dict[str, Any]] = []
+    video_dur_s = float(manifest.source.duration_s or 0.0)
+    short_floor_s = min(short_max_s, 55.0) if (0 < video_dur_s < 1200) else short_max_s
 
     for cand in merged_cands:
         su, eu, comp_notes = ensure_sentence_completeness(cand.start_utt, cand.end_utt, utts)
@@ -1111,10 +1388,20 @@ def run_verify_and_plan_stage(
         )
         dur = e_t - s_t
 
-        # Route very short (<48s) high-impact clips to remix_only_pool rather than padding artificially
-        if dur < min(48.0, min_s * 0.8):
+        if active_cuts:
+            kept_spans = subtract_cut_intervals(s_t, e_t, active_cuts, min_keep_s=0.4)
+            kept_dur = sum(ke - ks for ks, ke in kept_spans)
+            if kept_dur < min(15.0, dur * 0.25):
+                cand.disposition = "dropped"
+                cand.disposition_reason = "候选区间主要由已识别广告/政治敏感内容构成，已自动过滤"
+                continue
+
+        # Route short punchlines/fragments to remix_only_pool rather than cluttering standalone clips
+        if dur < short_floor_s:
             cand.disposition = "remix_only"
-            cand.disposition_reason = f"时长 {dur:.1f}s 短于独立切片下限，转入 Remix 精选池（不硬凑铺垫）"
+            cand.disposition_reason = (
+                f"时长 {dur:.1f}s 短于独立切片下限 ({int(short_floor_s)}s)，转入 Remix 精选池（避免碎片化）"
+            )
             remix_only_pool.append(cand)
             continue
 
@@ -1155,7 +1442,14 @@ def run_verify_and_plan_stage(
             multimodal_status=cand.multimodal.status,
             score=float(cand.score),
         )
-        clip.render_hash = compute_clip_render_hash(clip, manifest.source.render_video)
+        clip_masks = get_overlapping_mask_payload(clip.start_s, clip.end_s, manifest, cfg) if manifest.clean_cut.apply_to_clips else []
+        clip.render_hash = compute_clip_render_hash(
+            clip,
+            manifest.source.render_video,
+            active_cuts,
+            manifest.source.subtitle_sha256,
+            mask_payload=clip_masks,
+        )
         clips.append(clip)
         cand.disposition = "selected"
         cand.disposition_reason = f"定稿为 {clip_id} ({dur:.1f}s)"
@@ -1198,6 +1492,10 @@ def run_verify_and_plan_stage(
             clip.enabled = True
             clip.curation_tag = ""
 
+    manifest.compilation.clip_ids = [c.clip_id for c in clips if c.enabled]
+    manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
+
+    check_cancelled()
     store.save(manifest)
     store.append_receipt(
         run_id=run_id,
@@ -1209,6 +1507,7 @@ def run_verify_and_plan_stage(
     )
 
     # 5. Plan Remix strictly after clips are finalized
+    check_cancelled()
     manifest = plan_remix_from_clips(manifest, store, cfg, run_id)
     return manifest
 
