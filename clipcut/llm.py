@@ -16,21 +16,24 @@ from google.genai import types
 from .cancel import JobCancelledError, check_cancelled, get_current_cancel_token
 
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+GOOGLE_HTTP_TIMEOUT_MS = 120_000
+_DASHSCOPE_MODEL_PREFIXES = ("qwen", "qwq", "qvq", "glm-", "kimi", "deepseek", "minimax/")
 
 DEFAULT_TEXT_FALLBACK_MODELS = [
-    "qwen3.8-max",
-    "qwen4-max",
-    "glm-5.3",
-    "kimi-k3.1-pro",
-    "deepseek-v4-pro",
-    "glm-5.2",
-    "qwen3.8-flash",
+    "dashscope:qwen3.8-max",
+    "dashscope:qwen4-max",
+    "dashscope:glm-5.3",
+    "dashscope:kimi-k3.1-pro",
+    "dashscope:deepseek-v4-pro",
+    "dashscope:glm-5.2",
+    "dashscope:qwen3.8-flash",
     "gemini:gemini-2.5-flash",
+    "gemini:gemini-2.5-flash-lite",
 ]
 DEFAULT_MULTIMODAL_FALLBACK_MODELS = [
-    "qwen3.8-omni-flash",
-    "qwen3.5-omni-plus",
-    "qwen3-vl-plus",
+    "dashscope:qwen3.8-omni-flash",
+    "dashscope:qwen3.5-omni-plus",
+    "dashscope:qwen3-vl-plus",
     "gemini:gemini-2.5-flash",
 ]
 
@@ -134,13 +137,68 @@ def _extract_json(raw: str) -> Any:
 
 
 def parse_provider_model(spec: str, default_provider: str) -> tuple[str, str]:
-    """Parse 'dashscope:qwen3.8-max' or bare 'qwen3.8-max'."""
+    """Parse 'dashscope:qwen3.8-max' or bare model name with provider inference."""
+    def_prov = (default_provider or "dashscope").strip().lower()
+    if def_prov == "bailian":
+        def_prov = "dashscope"
     if ":" in spec:
         prov, mod = spec.split(":", 1)
         prov = prov.strip().lower()
         if prov in ("dashscope", "bailian", "vertex", "gemini"):
             return ("dashscope" if prov == "bailian" else prov), mod.strip()
-    return default_provider, spec.strip()
+    raw = spec.strip()
+    low = raw.lower()
+    if low.startswith(_DASHSCOPE_MODEL_PREFIXES):
+        return "dashscope", raw
+    if low.startswith("gemini-"):
+        return (def_prov if def_prov in ("gemini", "vertex") else "gemini"), raw
+    return def_prov, raw
+
+
+def _is_transient_llm_error(msg: str) -> bool:
+    low = msg.lower()
+    non_retryable = (
+        "404",
+        "not_found",
+        "not found",
+        "403",
+        "permission_denied",
+        "billing",
+        "401",
+        "unauthorized",
+        "unauthenticated",
+        "data_inspection_failed",
+        "inappropriate content",
+        "invalid_argument",
+        "quota",
+    )
+    if any(tok in low for tok in non_retryable):
+        return False
+    transient = (
+        "timeout",
+        "timed out",
+        "readtimeout",
+        "connecttimeout",
+        "503",
+        "unavailable",
+        "500",
+        "internal",
+        "429",
+        "resource_exhausted",
+        "connection reset",
+        "remoteprotocolerror",
+        "server disconnected",
+        "eof",
+        "temporarily",
+    )
+    return any(tok in low for tok in transient)
+
+
+def _sleep_cancellable(seconds: float) -> None:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < deadline:
+        check_cancelled()
+        time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
 
 
 class ClipCutLLM:
@@ -186,6 +244,7 @@ class ClipCutLLM:
                         project=sa_proj,
                         location=self.vertex_location,
                         credentials=creds,
+                        http_options=types.HttpOptions(timeout=GOOGLE_HTTP_TIMEOUT_MS),
                     )
                     return self._vertex_client
                 except Exception:
@@ -199,6 +258,7 @@ class ClipCutLLM:
                 vertexai=True,
                 project=self.vertex_project,
                 location=self.vertex_location,
+                http_options=types.HttpOptions(timeout=GOOGLE_HTTP_TIMEOUT_MS),
             )
             return self._vertex_client
         except Exception:
@@ -212,7 +272,7 @@ class ClipCutLLM:
         try:
             self._gemini_client = genai.Client(
                 api_key=self.gemini_key,
-                http_options=types.HttpOptions(api_version="v1beta"),
+                http_options=types.HttpOptions(api_version="v1beta", timeout=GOOGLE_HTTP_TIMEOUT_MS),
             )
             return self._gemini_client
         except Exception:
@@ -456,9 +516,15 @@ class ClipCutLLM:
 
         errors: list[str] = []
         skip_dashscope = False
-        for prov, mod in attempts:
+        skip_vertex = False
+        idx = 0
+        while idx < len(attempts):
+            prov, mod = attempts[idx]
+            idx += 1
             check_cancelled()
             if skip_dashscope and prov == "dashscope":
+                continue
+            if skip_vertex and prov == "vertex":
                 continue
             try:
                 if prov == "dashscope":
@@ -471,7 +537,23 @@ class ClipCutLLM:
                         media_bytes=media_bytes,
                         media_mime=media_mime,
                     )
-                else:
+                try:
+                    return self._call_google(
+                        provider=prov,
+                        model=mod,
+                        prompt=prompt,
+                        system_instruction=system_instruction,
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                        media_bytes=media_bytes,
+                        media_mime=media_mime,
+                    )
+                except JobCancelledError:
+                    raise
+                except Exception as exc:
+                    if not _is_transient_llm_error(str(exc)):
+                        raise
+                    _sleep_cancellable(2.0)
                     return self._call_google(
                         provider=prov,
                         model=mod,
@@ -486,12 +568,26 @@ class ClipCutLLM:
                 raise
             except Exception as exc:
                 msg = str(exc)
+                low_msg = msg.lower()
                 if prov == "dashscope" and (
                     "data_inspection_failed" in msg
-                    or "inappropriate content" in msg.lower()
+                    or "inappropriate content" in low_msg
                 ):
                     skip_dashscope = True
+                    if self.gemini_key:
+                        for gem_pair in (("gemini", "gemini-2.5-flash"), ("gemini", "gemini-2.5-flash-lite")):
+                            if gem_pair not in attempts:
+                                attempts.append(gem_pair)
+                elif prov == "vertex" and any(
+                    tok in low_msg for tok in ("permission_denied", "billing", "403", "unauthenticated", "401")
+                ):
+                    skip_vertex = True
                 errors.append(f"{prov}:{mod} -> {exc}")
                 continue
 
-        raise RuntimeError("LLM 调用失败（所有配置模型均不可用）:\n" + "\n".join(errors[-5:]))
+        shown = (
+            errors
+            if len(errors) <= 8
+            else errors[:4] + [f"...（省略 {len(errors) - 7} 条中间错误）..."] + errors[-3:]
+        )
+        raise RuntimeError("LLM 调用失败（所有配置模型均不可用）:\n" + "\n".join(shown))

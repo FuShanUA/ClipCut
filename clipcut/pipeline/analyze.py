@@ -121,7 +121,7 @@ def _build_pass1_prompt(manifest: ProjectManifest, transcript_text: str) -> str:
 
 【任务要求】
 1. `primary_topics`：提炼本视频的 1~4 个核心主话题/主角实体（例如若整期访谈就是采访 Palantir CEO 或英伟达高管，则必须把 "Palantir" / "英伟达" / "NVIDIA" 写入 `primary_topics`，供后续热点去重使用）。
-2. `meta`：提炼规范中文信息 `guest_zh`、`channel_zh`、`original_theme_zh`。
+2. `meta`：提炼规范中文信息 `guest_zh`、`channel_zh`、`original_theme_zh` 与 `full_summary_zh`。
 3. `chapter_audits`：如果原视频有章节，逐一审视每个章节；对于前后较短的片花（Teaser）、开场客套寒暄、赞助广告（Sponsor）、片尾致谢，标为 `"skip"` 并写明理由；有实质内容的标为 `"keep"`。如果原视频无章节，可留空数组 `[]`。
 4. `topic_map`：按时间顺序把整部视频切成首尾相接、覆盖 u0000 到 u{n_utts - 1:04d} 的**完整宏观叙事单元**清单，总计严格控制在 **{t_min}~{t_max} 个话题**，实质话题一般 **2~7 分钟**：
    - 同一核心论点下的连续追问、举例佐证、对比论证与推论必须归在同一个话题中，严禁拆成多个 1 分钟左右的碎片。
@@ -134,7 +134,8 @@ def _build_pass1_prompt(manifest: ProjectManifest, transcript_text: str) -> str:
   "meta": {{
     "guest_zh": "嘉宾中文名 (英文名)",
     "channel_zh": "频道中文名",
-    "original_theme_zh": "原视频核心中文主题"
+    "original_theme_zh": "原视频核心中文主题",
+    "full_summary_zh": "120~220字面向观众的简体中文全片内容提炼介绍，概括人物/节目背景、核心议题与主要观点，自然连贯，严禁出现字幕句数、片段数、广告/脱敏/剪辑等技术参数"
   }},
   "chapter_audits": [
     {{
@@ -331,6 +332,22 @@ def run_analyze_stage(
     manifest.metadata.guest_zh = str(meta1.get("guest_zh") or manifest.metadata.guest_zh or "")
     manifest.metadata.channel_zh = str(meta1.get("channel_zh") or manifest.metadata.channel_zh or "")
     manifest.metadata.original_theme_zh = str(meta1.get("original_theme_zh") or manifest.metadata.original_title or "")
+    manifest.metadata.full_summary_zh = str(
+        meta1.get("full_summary_zh") or manifest.metadata.full_summary_zh or ""
+    ).strip()
+    if manifest.cut_segments or manifest.clean_cut.scanned_at:
+        from .content_filter import compute_clean_cut_render_hash
+        from .verify_and_plan import build_default_clean_cut_title, is_untranslated_clean_cut_title
+
+        if is_untranslated_clean_cut_title(manifest, manifest.clean_cut.title):
+            cand_cc_title = build_default_clean_cut_title(manifest)
+            if cand_cc_title != manifest.clean_cut.title:
+                cc = manifest.clean_cut
+                was_up_to_date = bool(cc.output_file and cc.render_hash == cc.last_rendered_hash)
+                cc.title = cand_cc_title
+                cc.render_hash = compute_clean_cut_render_hash(manifest, cfg)
+                if was_up_to_date:
+                    cc.last_rendered_hash = cc.render_hash
 
     # Map chapter audits
     ch_by_idx = {c.index: c for c in manifest.metadata.chapters}

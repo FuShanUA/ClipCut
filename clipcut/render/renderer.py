@@ -19,25 +19,30 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from ..adapters.ingest import _find_best_info_json, extract_published_date
 from ..assets_gen import ensure_default_assets
-from ..cancel import check_cancelled
+from ..cancel import check_cancelled, run_cancellable_subprocess
 from ..config import load_editorial_config, load_local_config
 from ..models import ClipItem, ProjectManifest
 from ..pipeline.content_filter import (
     build_masked_ass_file,
     compute_clean_cut_render_hash,
     describe_applied_filter,
+    ensure_precise_terms_if_needed,
     get_active_cut_segments,
     get_active_cut_spans,
     get_active_delete_spans,
     get_active_mask_segments,
     get_overlapping_mask_payload,
     has_clean_source_video,
+    is_visual_ocr_segment,
     merge_spans,
     resolve_mask_audio_spans,
+    resolve_visual_mask_regions,
     should_use_precise_copy,
     subtract_cut_intervals,
 )
 from ..pipeline.verify_and_plan import (
+    GENERIC_COMPILATION_TITLES,
+    build_default_compilation_title,
     compute_clip_render_hash,
     compute_compilation_render_hash,
     compute_remix_render_hash,
@@ -60,8 +65,96 @@ from .frame_selector import (
     select_best_frame_for_interval,
 )
 
-COVER_TEMPLATE_VERSION = "v2.3-tiffany-guest"
-REMIX_CARD_TEMPLATE_VERSION = "v2-vision-pip"
+COVER_TEMPLATE_VERSION = "v2.4-smart-wrap"
+REMIX_CARD_TEMPLATE_VERSION = "v3-top-nav-bar"
+
+NAV_COLOR_PRESETS: dict[str, dict[str, Any]] = {
+    "tiffany": {"label": "蒂芙尼青", "hex": "#0ABAB5", "rgb": (10, 186, 181)},
+    "amber": {"label": "琥珀金", "hex": "#F59E0B", "rgb": (245, 158, 11)},
+    "cobalt": {"label": "钴蓝科技", "hex": "#3B82F6", "rgb": (59, 130, 246)},
+    "crimson": {"label": "绯红醒目", "hex": "#EF4444", "rgb": (239, 68, 68)},
+    "emerald": {"label": "翡翠绿", "hex": "#10B981", "rgb": (16, 185, 129)},
+    "violet": {"label": "紫罗兰", "hex": "#8B5CF6", "rgb": (139, 92, 246)},
+}
+
+
+def _normalize_hex_color(raw: str | None) -> str | None:
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    if not s.startswith("#"):
+        s = "#" + s
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", s):
+        return s.upper()
+    return None
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    norm = _normalize_hex_color(hex_color) or "#0ABAB5"
+    return (int(norm[1:3], 16), int(norm[3:5], 16), int(norm[5:7], 16))
+
+
+def _blend_rgb(c1: tuple[int, int, int], c2: tuple[int, int, int], t: float) -> tuple[int, int, int]:
+    t = max(0.0, min(1.0, float(t)))
+    return (
+        int(round(c1[0] * (1.0 - t) + c2[0] * t)),
+        int(round(c1[1] * (1.0 - t) + c2[1] * t)),
+        int(round(c1[2] * (1.0 - t) + c2[2] * t)),
+    )
+
+
+def resolve_navigation_settings(cfg: dict[str, Any] | None = None) -> dict[str, str]:
+    nav = (cfg or {}).get("navigation", {}) or {}
+    valid_styles = ("top_nav", "both", "title_card")
+    base_style = str(nav.get("style") or "top_nav").strip().lower()
+    if base_style not in valid_styles:
+        base_style = "top_nav"
+    remix_style = str(nav.get("remix_style") or base_style).strip().lower()
+    if remix_style not in valid_styles:
+        remix_style = base_style
+    compilation_style = str(nav.get("compilation_style") or base_style).strip().lower()
+    if compilation_style not in valid_styles:
+        compilation_style = base_style
+    screen_layout = str(nav.get("screen_layout") or "portrait").strip().lower()
+    if screen_layout not in ("portrait", "landscape"):
+        screen_layout = "portrait"
+    scheme = str(nav.get("color_scheme") or "tiffany").strip().lower()
+    if scheme not in NAV_COLOR_PRESETS and scheme != "custom":
+        scheme = "tiffany"
+    custom_accent = _normalize_hex_color(nav.get("custom_accent")) or "#0ABAB5"
+    return {
+        "style": base_style,
+        "remix_style": remix_style,
+        "compilation_style": compilation_style,
+        "screen_layout": screen_layout,
+        "color_scheme": scheme,
+        "custom_accent": custom_accent,
+    }
+
+
+def resolve_nav_palette(color_scheme: str = "tiffany", custom_accent: str = "#0ABAB5") -> dict[str, Any]:
+    sc = str(color_scheme or "tiffany").strip().lower()
+    if sc == "custom":
+        accent_rgb = _hex_to_rgb(custom_accent)
+    elif sc in NAV_COLOR_PRESETS:
+        accent_rgb = NAV_COLOR_PRESETS[sc]["rgb"]
+    else:
+        accent_rgb = NAV_COLOR_PRESETS["tiffany"]["rgb"]
+
+    accent_light = _blend_rgb(accent_rgb, (255, 255, 255), 0.45)
+    accent_bright = _blend_rgb(accent_rgb, (255, 255, 255), 0.68)
+    done_bg = _blend_rgb((16, 22, 32), accent_rgb, 0.22)
+    lum = (0.299 * accent_rgb[0] + 0.587 * accent_rgb[1] + 0.114 * accent_rgb[2]) / 255.0
+    active_text = (15, 23, 42, 255) if lum > 0.68 else (255, 255, 255, 255)
+    active_shadow = (255, 255, 255, 70) if lum > 0.68 else (0, 20, 28, 130)
+    return {
+        "accent_rgb": accent_rgb,
+        "accent_light": accent_light,
+        "accent_bright": accent_bright,
+        "done_bg": done_bg,
+        "active_text": active_text,
+        "active_shadow": active_shadow,
+    }
 _AUTOSUB_COVER_UTILS_PATH: Path | None = None
 
 CATEGORY_LABELS_ZH = {
@@ -121,16 +214,7 @@ def build_clip_filename(clip: ClipItem, manifest: ProjectManifest, published_dat
 
 def _estimate_remix_duration_s(manifest: ProjectManifest) -> float:
     enabled_items = [it for it in sorted(manifest.remix.items, key=lambda x: x.order) if it.enabled]
-    speech_s = sum(max(0.0, it.end_s - it.start_s) for it in enabled_items)
-    last_gk: str | None = None
-    cards = 0
-    for idx, it in enumerate(enabled_items):
-        gk = remix_item_group_key(it)
-        if should_insert_title_card(manifest.remix.card_mode, idx, gk, last_gk):
-            cards += 1
-        last_gk = gk
-    card_dur = 0.0 if manifest.remix.card_mode == "none" else float(manifest.remix.card_duration_s or 1.4)
-    return speech_s + cards * card_dur
+    return sum(max(0.0, it.end_s - it.start_s) for it in enabled_items)
 
 
 def build_remix_filename(manifest: ProjectManifest, published_date: str = "", duration_s: float | None = None) -> str:
@@ -142,14 +226,31 @@ def build_remix_filename(manifest: ProjectManifest, published_date: str = "", du
     return "_".join(parts) + ".mp4"
 
 
+def _resolve_compilation_effective_title(
+    manifest: ProjectManifest,
+    *,
+    persist: bool = False,
+) -> tuple[str, str]:
+    """Return (display_title, effective_cover_title), filling generic placeholder via build_default_compilation_title."""
+    raw_t = str(manifest.compilation.title or "").strip()
+    if raw_t in GENERIC_COMPILATION_TITLES:
+        disp_t = build_default_compilation_title(manifest)
+        if persist and disp_t not in GENERIC_COMPILATION_TITLES:
+            manifest.compilation.title = disp_t
+    else:
+        disp_t = raw_t
+    eff_t = (manifest.compilation.cover_title or disp_t or "切片精选集").strip()
+    return disp_t, eff_t
+
+
 def build_compilation_filename(manifest: ProjectManifest, published_date: str = "", duration_s: float | None = None) -> str:
     ch = _clean_file_token(manifest.metadata.channel_zh or manifest.metadata.channel or "", 24)
-    title = _clean_file_token(manifest.compilation.title or "切片精选集", 36)
+    disp_t, _ = _resolve_compilation_effective_title(manifest, persist=False)
+    title = _clean_file_token(disp_t or "切片精选集", 36)
     dt = _clean_file_token(published_date or manifest.metadata.published_date or "", 12)
     enabled_clips = get_compilation_clips(manifest)
-    card_dur = float(manifest.compilation.card_duration_s or 1.8)
     dur_val = duration_s if (duration_s is not None and duration_s > 0) else (
-        sum(max(0.0, c.end_s - c.start_s) for c in enabled_clips) + len(enabled_clips) * card_dur
+        sum(max(0.0, c.end_s - c.start_s) for c in enabled_clips)
     )
     parts = ["00", "Compilation"] + [p for p in (ch, title, dt, _fmt_ts_token(dur_val)) if p]
     return "_".join(parts) + ".mp4"
@@ -300,6 +401,7 @@ def compute_cover_hash(
     manifest: ProjectManifest,
     cfg: dict[str, Any],
     published_date: str,
+    theme: str = "tiffany",
 ) -> str:
     c_cfg = cfg.get("cover", {})
     payload = {
@@ -316,6 +418,14 @@ def compute_cover_hash(
         "style": c_cfg.get("style", "natural"),
         "prefer_two_shot": bool(c_cfg.get("prefer_two_shot", True)),
     }
+    if theme != "tiffany":
+        payload["theme"] = theme
+    if theme != "crimson":
+        nav_s = resolve_navigation_settings(cfg)
+        if nav_s["color_scheme"] != "tiffany":
+            payload["color_scheme"] = nav_s["color_scheme"]
+            if nav_s["color_scheme"] == "custom":
+                payload["custom_accent"] = nav_s["custom_accent"]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
@@ -335,12 +445,117 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: Any, max_width: int) 
     return lines
 
 
+_NO_LINE_START_CHARS = set("，,。.:：;；!！?？、)）]】》」』”’·")
+_BREAK_AFTER_CHARS = set("：:，,、；;！？!?—-· ")
+_OPEN_BRACKETS = set("（(【[《「")
+_CLOSE_BRACKETS = set("）)】]》」")
+
+
+def _wrap_title_smart(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: Any,
+    max_width: int,
+    max_lines: int = 2,
+    stroke_width: int = 0,
+) -> list[str]:
+    """
+    Editorial CJK/Latin title line wrapper:
+    - Fits on 1 line when possible.
+    - Prefers at most 2 lines; avoids 1-2 char dangling orphans on either line.
+    - Never splits inside a parenthetical like （中长集锦）/（速览混剪）/（完整版）;
+      when line 1 would end with an opening bracket + 1-2 chars, breaks cleanly right before the bracket.
+    - Prefers semantic punctuation breaks and avoids splitting ASCII words/numbers.
+    """
+    s = str(text or "").strip()
+    if not s:
+        return [""]
+
+    def _w(piece: str) -> float:
+        if not piece:
+            return 0.0
+        bb = draw.textbbox((0, 0), piece, font=font, stroke_width=stroke_width)
+        return float(bb[2] - bb[0])
+
+    if _w(s) <= max_width:
+        return [s]
+
+    if max_lines <= 1:
+        return _wrap_text(draw, s, font, max_width)
+
+    # Search all valid 2-line splits (left fits <= max_width AND right fits <= max_width)
+    best_split: tuple[str, str] | None = None
+    best_score = -1e9
+    n = len(s)
+
+    # Precompute bracket nesting depth at each split position
+    bracket_depth = [0] * (n + 1)
+    depth = 0
+    for idx, ch in enumerate(s):
+        if ch in _OPEN_BRACKETS:
+            depth += 1
+        elif ch in _CLOSE_BRACKETS:
+            depth = max(0, depth - 1)
+        bracket_depth[idx + 1] = depth
+
+    for i in range(1, n):
+        left = s[:i].rstrip()
+        right = s[i:].lstrip()
+        if not left or not right:
+            continue
+        wl = _w(left)
+        wr = _w(right)
+        if wl > max_width or wr > max_width:
+            continue
+
+        score = 0.0
+        # 1. Strongly avoid splitting inside brackets (e.g. "（中" + "长集锦）")
+        if bracket_depth[i] > 0:
+            score -= 60.0
+        # 2. Strongly prefer breaking right before an opening bracket (e.g. before "（中长集锦）")
+        if right[0] in _OPEN_BRACKETS:
+            score += 45.0
+        # 3. Never start line 2 with closing/trailing punctuation
+        if right[0] in _NO_LINE_START_CHARS:
+            score -= 80.0
+        # 4. Never split in the middle of an ASCII word or number
+        if left[-1].isascii() and left[-1].isalnum() and right[0].isascii() and right[0].isalnum():
+            score -= 55.0
+        # 5. Strongly avoid 1-2 char dangling orphans on either line
+        if len(right) <= 2:
+            score -= 50.0
+        elif len(right) == 3 and right[0] not in _OPEN_BRACKETS:
+            score -= 14.0
+        if len(left) <= 2:
+            score -= 45.0
+        # 6. Bonus for breaking right after natural punctuation
+        if left[-1] in _BREAK_AFTER_CHARS:
+            score += 24.0
+        # 7. Visual balance (slightly prefer line 1 >= line 2 editorial pyramid)
+        balance_diff = abs(wl - wr) / max(1.0, float(max_width))
+        score -= balance_diff * 22.0
+        if wr > wl * 1.18:
+            score -= 8.0
+
+        if score > best_score:
+            best_score = score
+            best_split = (left, right)
+
+    if best_split is not None:
+        return [best_split[0], best_split[1]]
+
+    # Does not fit in 2 lines at this font size — return greedy wrap (>2 lines) so caller shrinks font
+    return _wrap_text(draw, s, font, max_width)
+
+
 def _run_ffmpeg_encode(cmd_vt: list[str], cmd_x264: list[str], use_vt: bool) -> tuple[bool, str, str]:
+    check_cancelled()
     if use_vt:
-        res = subprocess.run(cmd_vt, capture_output=True, text=True)
+        res = run_cancellable_subprocess(cmd_vt, capture_output=True, text=True)
         if res.returncode == 0:
             return True, "h264_videotoolbox", ""
-    res2 = subprocess.run(cmd_x264, capture_output=True, text=True)
+        check_cancelled()
+    res2 = run_cancellable_subprocess(cmd_x264, capture_output=True, text=True)
     if res2.returncode == 0:
         return True, "libx264", ""
     return False, "failed", res2.stderr[-600:]
@@ -437,8 +652,9 @@ def _cut_media_precise_copy(source_video: Path, keep_spans: list[tuple[float, fl
         v_parts: list[Path] = []
         a_parts: list[Path] = []
         for idx, pl in enumerate(plans):
+            check_cancelled()
             vp = tmp_dir / f"v_{idx:03d}{ext}"
-            r_v = subprocess.run(
+            r_v = run_cancellable_subprocess(
                 [
                     "ffmpeg", "-y", "-v", "error", "-seek2any", "1", "-ss", f"{pl['v_seek']:.6f}",
                     "-i", str(source_video), "-map", "0:v:0", "-frames:v", str(pl["v_count"]),
@@ -452,7 +668,7 @@ def _cut_media_precise_copy(source_video: Path, keep_spans: list[tuple[float, fl
             v_parts.append(vp)
             if pl["a_start"] is not None:
                 ap = tmp_dir / f"a_{idx:03d}.mka"
-                r_a = subprocess.run(
+                r_a = run_cancellable_subprocess(
                     [
                         "ffmpeg", "-y", "-v", "error", "-i", str(source_video),
                         "-ss", f"{pl['a_start']:.6f}", "-map", "0:a:0", "-frames:a", str(pl["a_count"]),
@@ -480,7 +696,7 @@ def _cut_media_precise_copy(source_video: Path, keep_spans: list[tuple[float, fl
                 "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(v_list),
                 "-map", "0:v:0", "-an", "-c", "copy", "-movflags", "+faststart", str(out_path),
             ]
-        r_m = subprocess.run(mux_cmd, capture_output=True, text=True)
+        r_m = run_cancellable_subprocess(mux_cmd, capture_output=True, text=True)
         if r_m.returncode != 0 or not out_path.exists() or out_path.stat().st_size <= 1024:
             raise RuntimeError(r_m.stderr[-300:] or "mux failed")
 
@@ -495,29 +711,179 @@ def _span_needs_mask(ks: float, ke: float, mask_spans: list[tuple[float, float]]
     return any(min(float(ke), float(me)) - max(float(ks), float(ms)) > 0.05 for ms, me in mask_spans)
 
 
+def _span_needs_visual_mask(
+    ks: float,
+    ke: float,
+    visual_regions: list[dict[str, Any]] | None,
+) -> bool:
+    if not visual_regions or ke <= ks:
+        return False
+    return any(
+        min(float(ke), float(r.get("end_s", 0.0))) - max(float(ks), float(r.get("start_s", 0.0))) > 0.05
+        and bool(r.get("boxes"))
+        for r in visual_regions
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _probe_video_wh(video_path_str: str, fallback_w: int, fallback_h: int) -> tuple[int, int]:
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0:s=x",
+                video_path_str,
+            ],
+            text=True,
+            timeout=10,
+        ).strip()
+        first = out.splitlines()[0].strip() if out else ""
+        if "x" in first:
+            ws, hs = first.split("x", 1)
+            w_val, h_val = int(ws), int(hs)
+            if w_val >= 32 and h_val >= 32:
+                return (w_val & ~1), (h_val & ~1)
+    except Exception:
+        pass
+    return max(32, int(fallback_w) & ~1), max(32, int(fallback_h) & ~1)
+
+
+def _build_visual_blur_filter_chain(
+    in_label: str,
+    out_label: str,
+    regions: list[dict[str, Any]],
+    video_w: int,
+    video_h: int,
+    *,
+    time_offset: float = 0.0,
+    span_start: float = 0.0,
+    span_end: float = 0.0,
+) -> str:
+    """Build chained FFmpeg split/crop/mosaic+boxblur/overlay filters for on-screen regions."""
+    vw = max(32, int(video_w) & ~1)
+    vh = max(32, int(video_h) & ~1)
+    grouped: dict[tuple[int, int, int, int], dict[str, Any]] = {}
+
+    for r in regions:
+        rs = max(float(span_start), float(r.get("start_s", 0.0)))
+        re_t = min(float(span_end), float(r.get("end_s", 0.0)))
+        if re_t - rs <= 0.05:
+            continue
+        ls = max(0.0, rs - float(time_offset))
+        le = max(ls + 0.05, re_t - float(time_offset))
+        for b in r.get("boxes") or []:
+            try:
+                bx = float(b["x"])
+                by = float(b["y"])
+                bw = float(b["w"])
+                bh = float(b["h"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            pw = min(vw, max(16, (int(round(bw * vw)) + 1) & ~1))
+            ph = min(vh, max(16, (int(round(bh * vh)) + 1) & ~1))
+            px = max(0, int(round(bx * vw)) & ~1)
+            py = max(0, int(round(by * vh)) & ~1)
+            if px + pw > vw:
+                px = max(0, (vw - pw) & ~1)
+            if py + ph > vh:
+                py = max(0, (vh - ph) & ~1)
+            qkey = (px // 8, py // 8, pw // 8, ph // 8)
+            entry = grouped.get(qkey)
+            if entry is None:
+                grouped[qkey] = {"x0": px, "y0": py, "x1": px + pw, "y1": py + ph, "spans": [(ls, le)]}
+            else:
+                entry["x0"] = min(entry["x0"], px)
+                entry["y0"] = min(entry["y0"], py)
+                entry["x1"] = max(entry["x1"], px + pw)
+                entry["y1"] = max(entry["y1"], py + ph)
+                entry["spans"].append((ls, le))
+
+    if not grouped:
+        return f"{in_label}null{out_label}"
+
+    stages: list[str] = [f"{in_label}format=yuv420p[vb_in]"]
+    cur = "[vb_in]"
+    items = list(grouped.values())
+    for idx, entry in enumerate(items):
+        px = max(0, int(entry["x0"]) & ~1)
+        py = max(0, int(entry["y0"]) & ~1)
+        pw = min(vw - px, max(16, (int(entry["x1"]) - px + 1) & ~1))
+        ph = min(vh - py, max(16, (int(entry["y1"]) - py + 1) & ~1))
+        spans = merge_spans(entry["spans"], max_gap_s=0.1)
+        cond = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in spans)
+        mw = max(4, (pw // 14) & ~1)
+        mh = max(4, (ph // 14) & ~1)
+        lr = max(1, min(10, pw // 4, ph // 4))
+        cr = max(1, min(6, pw // 8, ph // 8))
+        nxt = out_label if idx == len(items) - 1 else f"[vb_o{idx}]"
+        stages.append(f"{cur}split=2[vb_s{idx}][vb_p{idx}]")
+        stages.append(
+            f"[vb_p{idx}]crop=w={pw}:h={ph}:x={px}:y={py},"
+            f"scale=w={mw}:h={mh}:flags=area,"
+            f"scale=w={pw}:h={ph}:flags=neighbor,"
+            f"boxblur=luma_radius={lr}:luma_power=2:chroma_radius={cr}:chroma_power=1[vb_b{idx}]"
+        )
+        stages.append(f"[vb_s{idx}][vb_b{idx}]overlay=x={px}:y={py}:enable='{cond}'{nxt}")
+        cur = nxt
+    return ";".join(stages)
+
+
 def _prepare_mask_render_context(
     manifest: ProjectManifest,
     work_dir: Path,
     hash_key: str = "",
     cfg: dict[str, Any] | None = None,
-) -> tuple[Path | None, Path | None, list[tuple[float, float]], list[tuple[float, float]]]:
+    store: ProjectStore | None = None,
+) -> tuple[Path | None, Path | None, list[tuple[float, float]], list[tuple[float, float]], list[dict[str, Any]]]:
     mask_segs = get_active_mask_segments(manifest, cfg)
-    if not mask_segs or not has_clean_source_video(manifest):
-        return None, None, [], []
-    clean_video = Path(manifest.source.analysis_video).expanduser()
-    masked_ass = build_masked_ass_file(manifest, mask_segs, work_dir, hash_key=hash_key)
+    if not mask_segs:
+        return None, None, [], [], []
+    if store is not None:
+        ensure_precise_terms_if_needed(manifest, store, cfg)
+        mask_segs = get_active_mask_segments(manifest, cfg)
+    visual_mask_regions = resolve_visual_mask_regions(manifest, mask_segs)
+    has_clean = has_clean_source_video(manifest)
+    clean_video: Path | None = Path(manifest.source.analysis_video).expanduser() if has_clean else None
+    masked_ass: Path | None = (
+        build_masked_ass_file(
+            manifest,
+            mask_segs,
+            work_dir,
+            hash_key=hash_key,
+            allow_visual_passthrough=bool(visual_mask_regions),
+        )
+        if has_clean
+        else None
+    )
     if masked_ass is None or not masked_ass.is_file():
-        return None, None, [], []
-    audio_mask_spans = resolve_mask_audio_spans(manifest, mask_segs)
-    mask_spans = merge_spans([(s.start_s, s.end_s) for s in mask_segs], max_gap_s=0.15)
-    return clean_video, masked_ass, audio_mask_spans, mask_spans
+        clean_video = None
+        masked_ass = None
+    audio_mask_spans = (
+        resolve_mask_audio_spans(manifest, mask_segs)
+        if (clean_video is not None and masked_ass is not None)
+        else []
+    )
+    mask_spans = merge_spans(
+        [(s.start_s, s.end_s) for s in mask_segs if not is_visual_ocr_segment(s)],
+        max_gap_s=0.15,
+    )
+    if clean_video is None and not visual_mask_regions:
+        return None, None, [], [], []
+    return clean_video, masked_ass, audio_mask_spans, mask_spans, visual_mask_regions
 
 
 def _render_masked_span(
-    clean_video: Path,
+    video_input: Path,
     span_start: float,
     span_end: float,
-    masked_ass_path: Path,
+    masked_ass_path: Path | None,
     audio_mask_spans: list[tuple[float, float]] | None,
     out_path: Path,
     *,
@@ -526,25 +892,65 @@ def _render_masked_span(
     vf_extra: str = "",
     af_prefix: str = "",
     apply_edge_fade: bool = True,
+    visual_mask_regions: list[dict[str, Any]] | None = None,
+    video_size: tuple[int, int] = (1920, 1080),
+    overlay_png: Path | None = None,
 ) -> tuple[bool, str, str]:
-    """Burn redacted ASS onto clean video and mute + 880Hz bleep masked words in audio."""
+    """Apply local visual box blur and/or burn redacted ASS onto clean video + bleep masked words."""
     start_s = max(0.0, float(span_start))
-    dur = max(0.2, float(span_end) - start_s)
+    end_s = max(start_s + 0.2, float(span_end))
+    dur = max(0.2, end_s - start_s)
     local_raw = [
         (max(0.0, float(s) - start_s), min(dur, float(e) - start_s))
         for s, e in (audio_mask_spans or [])
-        if float(e) > start_s and float(s) < float(span_end)
+        if float(e) > start_s and float(s) < end_s
     ]
     local_masks = merge_spans([(round(s, 3), round(e, 3)) for s, e in local_raw if e - s > 0.02], max_gap_s=0.05)
 
-    escaped_ass = _escape_ass_filter_path(masked_ass_path)
-    v_parts = [f"subtitles=filename='{escaped_ass}'", "setpts=PTS-STARTPTS"]
+    use_ass = masked_ass_path is not None and masked_ass_path.is_file()
+    vis_overlapping = [
+        r
+        for r in (visual_mask_regions or [])
+        if min(end_s, float(r.get("end_s", 0.0))) - max(start_s, float(r.get("start_s", 0.0))) > 0.05
+        and bool(r.get("boxes"))
+    ]
+
+    v_prefix = ""
+    v_in_label = "[0:v]"
+    if vis_overlapping:
+        vw, vh = _probe_video_wh(str(video_input), video_size[0], video_size[1])
+        time_off = 0.0 if use_ass else start_s
+        v_prefix = _build_visual_blur_filter_chain(
+            "[0:v]",
+            "[vvis]",
+            vis_overlapping,
+            vw,
+            vh,
+            time_offset=time_off,
+            span_start=start_s,
+            span_end=end_s,
+        )
+        v_in_label = "[vvis]"
+
+    use_overlay = overlay_png is not None and overlay_png.is_file()
+    v_parts: list[str] = []
+    if use_ass and masked_ass_path is not None:
+        escaped_ass = _escape_ass_filter_path(masked_ass_path)
+        v_parts.append(f"subtitles=filename='{escaped_ass}'")
+        v_parts.append("setpts=PTS-STARTPTS")
     if vf_extra:
         v_parts.append(vf_extra.strip(", "))
-    v_parts.append("format=yuv420p")
-    v_chain = f"[0:v]{','.join(v_parts)}[vout]"
+    if use_overlay:
+        if v_parts:
+            v_tail = f"{v_in_label}{','.join(v_parts)}[vbase];[vbase][1:v]overlay=0:0:eof_action=repeat,format=yuv420p[vout]"
+        else:
+            v_tail = f"{v_in_label}[1:v]overlay=0:0:eof_action=repeat,format=yuv420p[vout]"
+    else:
+        v_parts.append("format=yuv420p")
+        v_tail = f"{v_in_label}{','.join(v_parts)}[vout]"
+    v_chain = f"{v_prefix};{v_tail}" if v_prefix else v_tail
 
-    a_parts = ["asetpts=PTS-STARTPTS"]
+    a_parts = ["asetpts=PTS-STARTPTS"] if use_ass else []
     if af_prefix:
         a_parts.append(af_prefix.strip(", "))
     if apply_edge_fade:
@@ -563,7 +969,8 @@ def _render_masked_span(
             f"[amuted][abeep]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
         )
     else:
-        a_chain = f"[0:a]{','.join(a_parts)}[aout]"
+        a_filter = ",".join(a_parts) if a_parts else "anull"
+        a_chain = f"[0:a]{a_filter}[aout]"
 
     fc = f"{v_chain};{a_chain}"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -574,28 +981,34 @@ def _render_masked_span(
         "error",
         "-ss",
         f"{start_s:.3f}",
-        "-copyts",
-        "-i",
-        str(clean_video),
-        "-t",
-        f"{dur:.3f}",
-        "-filter_complex",
-        fc,
-        "-map",
-        "[vout]",
-        "-map",
-        "[aout]",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ar",
-        "44100",
-        "-ac",
-        "2",
-        "-movflags",
-        "+faststart",
     ]
+    if use_ass:
+        base.append("-copyts")
+    base.extend(["-i", str(video_input)])
+    if use_overlay and overlay_png is not None:
+        base.extend(["-i", str(overlay_png)])
+    base.extend(
+        [
+            "-t",
+            f"{dur:.3f}",
+            "-filter_complex",
+            fc,
+            "-map",
+            "[vout]",
+            "-map",
+            "[aout]",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+        ]
+    )
     cmd_vt = base + ["-c:v", "h264_videotoolbox", "-q:v", "60", str(out_path)]
     cmd_x264 = base + ["-c:v", "libx264", "-preset", "fast", "-crf", "18", str(out_path)]
     return _run_ffmpeg_encode(cmd_vt, cmd_x264, use_vt)
@@ -615,18 +1028,21 @@ def _render_multi_span_video(
     masked_ass_path: Path | None = None,
     audio_mask_spans: list[tuple[float, float]] | None = None,
     mask_spans: list[tuple[float, float]] | None = None,
+    visual_mask_regions: list[dict[str, Any]] | None = None,
+    video_size: tuple[int, int] = (1920, 1080),
 ) -> tuple[bool, str, str]:
     """Render kept time intervals into out_path (precise stream-copy or VT re-encode + concat)."""
     if not keep_spans:
         return False, "skipped", "无有效保留视频区间"
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    has_masked_part = bool(
+    has_text_masked_part = bool(
         clean_video is not None
         and masked_ass_path is not None
         and any(_span_needs_mask(ks, ke, mask_spans) for ks, ke in keep_spans)
     )
-    if precise_copy and not has_masked_part:
+    has_vis_masked_part = any(_span_needs_visual_mask(ks, ke, visual_mask_regions) for ks, ke in keep_spans)
+    if precise_copy and not has_text_masked_part and not has_vis_masked_part:
         try:
             _cut_media_precise_copy(source_video, keep_spans, out_path)
             return True, "precise_copy", ""
@@ -642,17 +1058,24 @@ def _render_multi_span_video(
         start_s = max(0.0, float(s))
         end_s = max(start_s + 0.2, float(e))
         seg_mp4 = tmp_dir / f"span_{uuid.uuid4().hex[:6]}_{idx:03d}.mp4"
-        if clean_video is not None and masked_ass_path is not None and _span_needs_mask(start_s, end_s, mask_spans):
+        need_text = bool(
+            clean_video is not None and masked_ass_path is not None and _span_needs_mask(start_s, end_s, mask_spans)
+        )
+        need_vis = _span_needs_visual_mask(start_s, end_s, visual_mask_regions)
+        if need_text or need_vis:
+            use_clean = clean_video is not None and masked_ass_path is not None
             ok, enc, err = _render_masked_span(
-                clean_video,
+                clean_video if use_clean and clean_video is not None else source_video,
                 start_s,
                 end_s,
-                masked_ass_path,
-                audio_mask_spans,
+                masked_ass_path if use_clean else None,
+                audio_mask_spans if use_clean else None,
                 seg_mp4,
                 fade_ms=fade_ms,
                 use_vt=use_vt,
                 apply_edge_fade=True,
+                visual_mask_regions=visual_mask_regions,
+                video_size=video_size,
             )
         else:
             dur = max(0.2, end_s - start_s)
@@ -678,7 +1101,7 @@ def _render_multi_span_video(
 
     concat_txt = tmp_dir / f"concat_{uuid.uuid4().hex[:6]}.txt"
     concat_txt.write_text("\n".join(_format_concat_file_entry(p, tmp_dir) for p in part_files) + "\n", encoding="utf-8")
-    r_cat = subprocess.run(
+    r_cat = run_cancellable_subprocess(
         [
             "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
             "-i", str(concat_txt), "-c", "copy", "-movflags", "+faststart", str(out_path),
@@ -687,7 +1110,7 @@ def _render_multi_span_video(
         text=True,
     )
     if r_cat.returncode != 0:
-        r_cat = subprocess.run(
+        r_cat = run_cancellable_subprocess(
             [
                 "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
                 "-i", str(concat_txt), "-c:v", "libx264", "-preset", "fast", "-crf", "18",
@@ -717,6 +1140,8 @@ def _render_single_clip(
     masked_ass_path: Path | None = None,
     audio_mask_spans: list[tuple[float, float]] | None = None,
     mask_spans: list[tuple[float, float]] | None = None,
+    visual_mask_regions: list[dict[str, Any]] | None = None,
+    video_size: tuple[int, int] = (1920, 1080),
 ) -> tuple[bool, str, str]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     start_s = max(0.0, clip.start_s)
@@ -725,9 +1150,12 @@ def _render_single_clip(
     if not keep_spans:
         return False, "skipped", "切片已被广告/政治敏感区间完全覆盖"
     needs_mask = bool(
-        clean_video is not None
-        and masked_ass_path is not None
-        and any(_span_needs_mask(ks, ke, mask_spans) for ks, ke in keep_spans)
+        (
+            clean_video is not None
+            and masked_ass_path is not None
+            and any(_span_needs_mask(ks, ke, mask_spans) for ks, ke in keep_spans)
+        )
+        or any(_span_needs_visual_mask(ks, ke, visual_mask_regions) for ks, ke in keep_spans)
     )
     is_trimmed = (
         len(keep_spans) > 1
@@ -748,6 +1176,8 @@ def _render_single_clip(
             masked_ass_path=masked_ass_path,
             audio_mask_spans=audio_mask_spans,
             mask_spans=mask_spans,
+            visual_mask_regions=visual_mask_regions,
+            video_size=video_size,
         )
 
     dur = max(0.5, end_s - start_s)
@@ -792,6 +1222,7 @@ def _draw_top_badges(
     dur_text: str,
     faces: list[FaceBox] | None = None,
     theme: str = "tiffany",
+    accent_rgb: tuple[int, int, int] | None = None,
 ) -> None:
     w, h = img.size
     min_dim = min(w, h)
@@ -808,7 +1239,11 @@ def _draw_top_badges(
     pill_h = bh + pad_by * 2
     radius = max(10, int(min_dim * 0.012))
 
-    if theme == "tiffany":
+    if theme in ("tiffany", "crimson"):
+        base_rgb = (216, 24, 24) if theme == "crimson" else (accent_rgb or (12, 174, 168))
+        pill_fill = (*base_rgb, 246)
+        pill_outline = (*_blend_rgb(base_rgb, (255, 255, 255), 0.90), 250)
+        pill_text_shadow = (*_blend_rgb(base_rgb, (0, 0, 0), 0.72), 185)
         draw.rounded_rectangle(
             [bx + 3, by + 4, bx + bw + pad_bx * 2 + 3, by + pill_h + 4],
             radius=radius,
@@ -817,11 +1252,11 @@ def _draw_top_badges(
         draw.rounded_rectangle(
             [bx, by, bx + bw + pad_bx * 2, by + pill_h],
             radius=radius,
-            fill=(12, 174, 168, 246),
-            outline=(244, 255, 254, 250),
+            fill=pill_fill,
+            outline=pill_outline,
             width=3,
         )
-        draw.text((bx + pad_bx - b_box[0] + 1, by + pad_by - b_box[1] + 1), badge_text, font=badge_font, fill=(4, 48, 52, 180))
+        draw.text((bx + pad_bx - b_box[0] + 1, by + pad_by - b_box[1] + 1), badge_text, font=badge_font, fill=pill_text_shadow)
         draw.text((bx + pad_bx - b_box[0], by + pad_by - b_box[1]), badge_text, font=badge_font, fill=(255, 255, 255, 255))
     else:
         draw.rounded_rectangle(
@@ -837,7 +1272,10 @@ def _draw_top_badges(
     dw = d_box[2] - d_box[0]
     tr_overlap = any((f.x + f.w) > 0.78 and f.y < 0.16 for f in (faces or []))
     dx = (bx + bw + pad_bx * 2 + 12) if tr_overlap else (w - pad_x - dw - pad_bx * 2)
-    if theme == "tiffany":
+    if theme in ("tiffany", "crimson"):
+        base_rgb = (216, 24, 24) if theme == "crimson" else (accent_rgb or (12, 174, 168))
+        dur_fill = (*_blend_rgb(base_rgb, (0, 0, 0), 0.78), 236)
+        dur_outline = (*_blend_rgb(base_rgb, (255, 255, 255), 0.18), 255)
         draw.rounded_rectangle(
             [dx + 3, by + 4, dx + dw + pad_bx * 2 + 3, by + pill_h + 4],
             radius=radius,
@@ -846,8 +1284,8 @@ def _draw_top_badges(
         draw.rounded_rectangle(
             [dx, by, dx + dw + pad_bx * 2, by + pill_h],
             radius=radius,
-            fill=(7, 36, 42, 236),
-            outline=(32, 212, 204, 255),
+            fill=dur_fill,
+            outline=dur_outline,
             width=3,
         )
         draw.text((dx + pad_bx - d_box[0], by + pad_by - d_box[1]), dur_text, font=badge_font, fill=(255, 255, 255, 255))
@@ -876,6 +1314,7 @@ def _draw_frosted_glass_box(
     title_color: tuple[int, int, int, int] | None = None,
     max_title_ratio: float | None = None,
     theme: str = "tiffany",
+    accent_rgb: tuple[int, int, int] | None = None,
 ) -> Image.Image:
     """
     Composite a centered, high-contrast elevated card near the bottom.
@@ -888,9 +1327,11 @@ def _draw_frosted_glass_box(
     probe_draw = ImageDraw.Draw(base_img)
 
     is_tiffany = theme == "tiffany"
-    stroke_w = max(2, int(min_dim * 0.0024)) if is_tiffany else 2
-    stroke_fill = (5, 44, 48, 240) if is_tiffany else (0, 0, 0, 225)
-    eff_title_color = title_color or ((255, 255, 255, 255) if is_tiffany else (254, 232, 84, 255))
+    is_crimson = theme == "crimson"
+    is_bright_card = is_tiffany or is_crimson
+    stroke_w = max(2, int(min_dim * 0.0024)) if is_bright_card else 2
+    stroke_fill = (5, 44, 48, 240) if is_tiffany else ((72, 6, 10, 240) if is_crimson else (0, 0, 0, 225))
+    eff_title_color = title_color or ((255, 255, 255, 255) if is_bright_card else (254, 232, 84, 255))
 
     if ar >= 1.5:
         max_lines = 2
@@ -909,24 +1350,28 @@ def _draw_frosted_glass_box(
             init_ratio = min(init_ratio, max_title_ratio)
         title_font_sz = int(w * init_ratio)
     else:
-        max_lines = 3
+        max_lines = 2
         max_width_ratio = max(max_width_ratio, 0.92)
         min_width_ratio = max(min_width_ratio, 0.78)
-        init_ratio = 0.090 if len(title) <= 12 else 0.078
+        init_ratio = 0.086 if len(title) <= 12 else 0.072
         if max_title_ratio is not None:
             init_ratio = min(init_ratio, max_title_ratio)
         title_font_sz = int(w * init_ratio)
 
-    min_font_sz = max(24, int(min_dim * 0.036))
+    min_font_sz = max(22, int(min_dim * 0.030))
     title_font_sz = max(min_font_sz, title_font_sz)
     pad_x_inner = max(36, int(w * 0.038))
     max_text_w = max(120, int(w * max_width_ratio) - pad_x_inner * 2)
 
     title_font = _load_cjk_font(title_font_sz, weight="heavy")
-    while len(_wrap_text(probe_draw, title, title_font, max_text_w)) > max_lines and title_font_sz > min_font_sz:
+    while (
+        len(_wrap_title_smart(probe_draw, title, title_font, max_text_w, max_lines=max_lines, stroke_width=stroke_w))
+        > max_lines
+        and title_font_sz > min_font_sz
+    ):
         title_font_sz = max(min_font_sz, title_font_sz - 3)
         title_font = _load_cjk_font(title_font_sz, weight="heavy")
-    lines = _wrap_text(probe_draw, title, title_font, max_text_w)
+    lines = _wrap_title_smart(probe_draw, title, title_font, max_text_w, max_lines=max_lines, stroke_width=stroke_w)
 
     meta_text = "  ·  ".join(meta_parts)
     meta_font_sz = max(18, int(min_dim * 0.030))
@@ -983,16 +1428,33 @@ def _draw_frosted_glass_box(
     mask = Image.new("L", (box_w, box_h), 0)
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, box_w, box_h], radius=radius, fill=255)
 
-    patch = base_img.crop((bx0, by0, bx1, by1)).filter(ImageFilter.GaussianBlur(radius=8 if is_tiffany else 10))
-    if is_tiffany:
-        # Luminous Tiffany Blue vertical gradient fill + deep-teal recessed bottom strip
+    patch = base_img.crop((bx0, by0, bx1, by1)).filter(ImageFilter.GaussianBlur(radius=8 if is_bright_card else 10))
+    if is_bright_card:
+        # Luminous vertical gradient fill ('tiffany' cyan or 'crimson' red for Clean Cut)
         yg = np.linspace(0.0, 1.0, box_h, dtype=np.float32)[:, None]
         grad_arr = np.zeros((box_h, box_w, 4), dtype=np.uint8)
         top_a = float(240 if bg_alpha is None else bg_alpha)
         bot_a = float(min(252, int(top_a + 6)))
-        grad_arr[:, :, 0] = np.clip(24.0 * (1.0 - yg) + 10.0 * yg, 0, 255).astype(np.uint8)
-        grad_arr[:, :, 1] = np.clip(198.0 * (1.0 - yg) + 154.0 * yg, 0, 255).astype(np.uint8)
-        grad_arr[:, :, 2] = np.clip(190.0 * (1.0 - yg) + 152.0 * yg, 0, 255).astype(np.uint8)
+        if is_crimson:
+            r0, r1 = 224.0, 168.0
+            g0, g1 = 28.0, 12.0
+            b0, b1 = 32.0, 18.0
+            off_fill = (26, 4, 6, 225)
+        elif accent_rgb is not None:
+            top_rgb = _blend_rgb(accent_rgb, (255, 255, 255), 0.10)
+            bot_rgb = _blend_rgb(accent_rgb, (0, 0, 0), 0.22)
+            r0, r1 = float(top_rgb[0]), float(bot_rgb[0])
+            g0, g1 = float(top_rgb[1]), float(bot_rgb[1])
+            b0, b1 = float(top_rgb[2]), float(bot_rgb[2])
+            off_fill = (*_blend_rgb(accent_rgb, (0, 0, 0), 0.86), 225)
+        else:
+            r0, r1 = 24.0, 10.0
+            g0, g1 = 198.0, 154.0
+            b0, b1 = 190.0, 152.0
+            off_fill = (3, 14, 18, 225)
+        grad_arr[:, :, 0] = np.clip(r0 * (1.0 - yg) + r1 * yg, 0, 255).astype(np.uint8)
+        grad_arr[:, :, 1] = np.clip(g0 * (1.0 - yg) + g1 * yg, 0, 255).astype(np.uint8)
+        grad_arr[:, :, 2] = np.clip(b0 * (1.0 - yg) + b1 * yg, 0, 255).astype(np.uint8)
         grad_arr[:, :, 3] = np.clip(top_a * (1.0 - yg) + bot_a * yg, 0, 255).astype(np.uint8)
         tint_layer = Image.fromarray(grad_arr, mode="RGBA")
         frosted = Image.alpha_composite(patch, tint_layer)
@@ -1013,7 +1475,7 @@ def _draw_frosted_glass_box(
         ImageDraw.Draw(off_shadow).rounded_rectangle(
             [max(0, bx0 + off_x), max(0, by0 + off_y), min(w - 1, bx1 + off_x), min(h - 1, by1 + off_y)],
             radius=radius,
-            fill=(3, 14, 18, 225),
+            fill=off_fill,
         )
         off_shadow = off_shadow.filter(ImageFilter.GaussianBlur(radius=6))
         out = Image.alpha_composite(out, off_shadow)
@@ -1032,10 +1494,11 @@ def _draw_frosted_glass_box(
         out = Image.alpha_composite(base_img.copy(), shadow_layer)
 
     div_y_abs = by0 + pad_top + len(lines) * line_h + max(4, div_gap // 2 - 2)
-    if is_tiffany and meta_parts:
+    if is_bright_card and meta_parts:
         strip_y0 = max(0, min(box_h - 1, div_y_abs - by0))
         strip_layer = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
-        ImageDraw.Draw(strip_layer).rectangle([0, strip_y0, box_w, box_h], fill=(5, 62, 66, 165))
+        strip_fill = (84, 8, 14, 175) if is_crimson else (5, 62, 66, 165)
+        ImageDraw.Draw(strip_layer).rectangle([0, strip_y0, box_w, box_h], fill=strip_fill)
         frosted = Image.alpha_composite(frosted, strip_layer)
 
     out.paste(frosted, (bx0, by0), mask)
@@ -1043,9 +1506,15 @@ def _draw_frosted_glass_box(
 
     # Frame outline + centered top accent bar
     eff_border_w = border_width if border_width is not None else (
-        max(5, int(min_dim * 0.0056)) if is_tiffany else max(3, int(min_dim * 0.0038))
+        max(5, int(min_dim * 0.0056)) if is_bright_card else max(3, int(min_dim * 0.0038))
     )
-    outline_col = (244, 255, 254, 255) if is_tiffany else (245, 158, 11, 255)
+    eff_accent = accent_rgb or (245, 158, 11)
+    eff_accent_light = _blend_rgb(eff_accent, (255, 255, 255), 0.35)
+    outline_col = (
+        (255, 244, 244, 255)
+        if is_crimson
+        else ((244, 255, 254, 255) if is_tiffany else (*eff_accent, 255))
+    )
     draw.rounded_rectangle(
         [bx0, by0, bx1, by1],
         radius=radius,
@@ -1054,7 +1523,7 @@ def _draw_frosted_glass_box(
     )
     pill_w = max(56, int(box_w * 0.08))
     pill_h = max(4, int(min_dim * 0.0048))
-    pill_fill = (255, 255, 255, 235) if is_tiffany else (253, 224, 71, 255)
+    pill_fill = (255, 255, 255, 235) if is_bright_card else (*eff_accent_light, 255)
     draw.rounded_rectangle(
         [w // 2 - pill_w // 2, by0 + 10, w // 2 + pill_w // 2, by0 + 10 + pill_h],
         radius=pill_h // 2,
@@ -1063,8 +1532,8 @@ def _draw_frosted_glass_box(
 
     # Centered title lines
     y_cursor = by0 + pad_top
-    shadow_col = (3, 28, 32, 200) if is_tiffany else (0, 0, 0, 210)
-    sh_dx, sh_dy = (4, 4) if is_tiffany else (3, 3)
+    shadow_col = (42, 4, 8, 205) if is_crimson else ((3, 28, 32, 200) if is_tiffany else (0, 0, 0, 210))
+    sh_dx, sh_dy = (4, 4) if is_bright_card else (3, 3)
     for ln in lines:
         lb = draw.textbbox((0, 0), ln, font=title_font, stroke_width=stroke_w)
         lw = lb[2] - lb[0]
@@ -1078,8 +1547,12 @@ def _draw_frosted_glass_box(
     if meta_parts:
         div_y = y_cursor + max(4, div_gap // 2 - 2)
         div_margin = max(28, int(box_w * 0.055))
-        div_col = (235, 255, 253, 215) if is_tiffany else (245, 158, 11, 155)
-        draw.line([(bx0 + div_margin, div_y), (bx1 - div_margin, div_y)], fill=div_col, width=2 if is_tiffany else max(1, eff_border_w // 2))
+        div_col = (
+            (255, 235, 235, 215)
+            if is_crimson
+            else ((235, 255, 253, 215) if is_tiffany else (*eff_accent, 155))
+        )
+        draw.line([(bx0 + div_margin, div_y), (bx1 - div_margin, div_y)], fill=div_col, width=2 if is_bright_card else max(1, eff_border_w // 2))
         meta_y = y_cursor + div_gap
         mb_full = draw.textbbox((0, 0), meta_text, font=meta_font)
         total_mw = mb_full[2] - mb_full[0]
@@ -1087,8 +1560,8 @@ def _draw_frosted_glass_box(
         my = meta_y - mb_full[1]
         sep = "  ·  "
         sep_w = draw.textbbox((0, 0), sep, font=meta_font)[2] - draw.textbbox((0, 0), sep, font=meta_font)[0]
-        sep_col = (254, 240, 138, 255) if is_tiffany else (251, 191, 36, 255)
-        meta_text_col = (255, 255, 255, 255) if is_tiffany else (248, 250, 252, 255)
+        sep_col = (254, 240, 138, 255) if is_bright_card else (*eff_accent_light, 255)
+        meta_text_col = (255, 255, 255, 255) if is_bright_card else (248, 250, 252, 255)
         for idx, part in enumerate(meta_parts):
             pb = draw.textbbox((0, 0), part, font=meta_font)
             pw = pb[2] - pb[0]
@@ -1112,8 +1585,12 @@ def render_natural_cover_image(
     dur_text: str,
     title: str,
     meta_parts: list[str],
+    theme: str = "tiffany",
+    color_scheme: str = "tiffany",
+    custom_accent: str = "#0ABAB5",
 ) -> Image.Image:
-    """Render natural-portrait cover with guest-locked crop (or 4:3 cinema fit-width for two-shots) + Tiffany card."""
+    """Render natural-portrait cover with guest-locked crop (or 4:3 cinema fit-width for two-shots) + themed card."""
+    cover_accent = None if theme == "crimson" else resolve_nav_palette(color_scheme, custom_accent)["accent_rgb"]
     orig_w, orig_h = frame_img.size
     ar = width / max(1, height)
     s_ar = orig_w / max(1, orig_h)
@@ -1143,7 +1620,7 @@ def render_natural_cover_image(
         s_draw.line([(0, y), (width, y)], fill=(5, 7, 12, alpha))
     bg = Image.alpha_composite(bg, scrim)
 
-    _draw_top_badges(bg, badge_text=badge_text, dur_text=dur_text, faces=safe_faces, theme="tiffany")
+    _draw_top_badges(bg, badge_text=badge_text, dur_text=dur_text, faces=safe_faces, theme=theme, accent_rgb=cover_accent)
     return _draw_frosted_glass_box(
         bg,
         title=title,
@@ -1152,7 +1629,8 @@ def render_natural_cover_image(
         bottom_margin_ratio=0.032,
         min_width_ratio=0.64,
         max_width_ratio=0.92,
-        theme="tiffany",
+        theme=theme,
+        accent_rgb=cover_accent,
     )
 
 
@@ -1167,11 +1645,17 @@ def compose_pip_card_image(
     left_meta_lines: list[str],
     portrait_frame: SelectedFrame | None = None,
     enable_pip: bool = True,
+    color_scheme: str = "amber",
+    custom_accent: str = "#0ABAB5",
 ) -> Image.Image:
     """
-    Compose the dark charcoal + amber-gold editorial card, embedding a ~52.6% area
-    16:9 portrait / two-shot Picture-in-Picture window on upper-right when available.
+    Compose the dark charcoal editorial card with customizable color scheme,
+    embedding a ~52.6% area 16:9 portrait / two-shot Picture-in-Picture window on upper-right when available.
     """
+    pal = resolve_nav_palette(color_scheme, custom_accent)
+    accent_rgb = pal["accent_rgb"]
+    accent_light = pal["accent_light"]
+    accent_bright = pal["accent_bright"]
     # Vertical charcoal gradient background + subtle warm amber aura behind PiP
     y_grad = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]
     r_ch = (13.0 * (1.0 - y_grad) + 7.0 * y_grad)
@@ -1188,6 +1672,67 @@ def compose_pip_card_image(
     canvas = Image.fromarray(rgb, mode="RGB").convert("RGBA")
 
     has_pip = enable_pip and portrait_frame is not None and portrait_frame.image_path.exists()
+    if height > width:
+        # Dedicated 9:16 portrait editorial title card layout
+        draw = ImageDraw.Draw(canvas)
+        pad_x = int(width * 0.065)
+        bar_y = int(height * 0.13)
+        draw.rectangle([pad_x, bar_y, pad_x + int(width * 0.10), bar_y + 7], fill=(*accent_rgb, 255))
+        grp_font = _load_cjk_font(max(30, int(width * 0.036)), weight="bold")
+        grp_text = f"{index_text} · {group_label}" if index_text else (group_label or "高光精选")
+        draw.text((pad_x, bar_y + 22), grp_text, font=grp_font, fill=(*accent_bright, 255))
+        if left_meta_lines:
+            sub_font = _load_cjk_font(max(22, int(width * 0.025)), weight="medium")
+            sub_str = "  ·  ".join(x for x in left_meta_lines if str(x or "").strip())
+            if sub_str:
+                draw.text((pad_x, bar_y + 76), sub_str, font=sub_font, fill=(168, 182, 204, 235))
+
+        if has_pip and portrait_frame is not None:
+            pip_x0 = pad_x
+            pip_x1 = width - pad_x
+            pip_w = pip_x1 - pip_x0
+            pip_h = int(round(pip_w * 9 / 16))
+            pip_y0 = int(height * 0.27)
+            pip_y1 = pip_y0 + pip_h
+            radius = max(16, int(width * 0.022))
+
+            shadow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            ImageDraw.Draw(shadow).rounded_rectangle(
+                [pip_x0 - 8, pip_y0 - 4, pip_x1 + 8, pip_y1 + 12],
+                radius=radius + 4,
+                fill=(0, 0, 0, 160),
+            )
+            shadow = shadow.filter(ImageFilter.GaussianBlur(radius=16))
+            canvas = Image.alpha_composite(canvas, shadow)
+
+            with Image.open(portrait_frame.image_path) as raw_im:
+                pip_img = crop_pip_portrait(raw_im.convert("RGBA"), pip_w, pip_h, portrait_frame.faces)
+            pip_mask = Image.new("L", (pip_w, pip_h), 0)
+            ImageDraw.Draw(pip_mask).rounded_rectangle([0, 0, pip_w, pip_h], radius=radius, fill=255)
+            canvas.paste(pip_img, (pip_x0, pip_y0), pip_mask)
+
+            ImageDraw.Draw(canvas).rounded_rectangle(
+                [pip_x0, pip_y0, pip_x1, pip_y1],
+                radius=radius,
+                outline=(*accent_rgb, 225),
+                width=max(3, int(width * 0.0036)),
+            )
+
+        return _draw_frosted_glass_box(
+            canvas,
+            title=card_title or group_label,
+            meta_parts=meta_parts,
+            faces=None,
+            bottom_margin_ratio=0.14,
+            min_width_ratio=0.84,
+            max_width_ratio=0.90,
+            bg_alpha=236,
+            border_width=max(3, int(min(width, height) * 0.004)),
+            max_title_ratio=0.056,
+            theme="obsidian",
+            accent_rgb=accent_rgb,
+        )
+
     if has_pip and portrait_frame is not None:
         pip_x0 = int(width * 0.220)
         pip_y0 = int(height * 0.048)
@@ -1218,7 +1763,7 @@ def compose_pip_card_image(
         draw.rounded_rectangle(
             [pip_x0, pip_y0, pip_x1, pip_y1],
             radius=radius,
-            outline=(245, 158, 11, 195),
+            outline=(*accent_rgb, 210),
             width=max(2, int(height * 0.0024)),
         )
 
@@ -1228,17 +1773,17 @@ def compose_pip_card_image(
         if index_text:
             idx_font = _load_cjk_font(max(36, int(height * 0.092)), weight="heavy")
             ib = draw.textbbox((0, 0), index_text, font=idx_font)
-            draw.text((rail_x - ib[0], pip_y0 - ib[1]), index_text, font=idx_font, fill=(245, 158, 11, 255))
+            draw.text((rail_x - ib[0], pip_y0 - ib[1]), index_text, font=idx_font, fill=(*accent_rgb, 255))
             rule_y = pip_y0 + (ib[3] - ib[1]) + int(height * 0.022)
         else:
             rule_y = pip_y0 + int(height * 0.015)
-        draw.rectangle([rail_x, rule_y, rail_x + int(width * 0.036), rule_y + 5], fill=(251, 191, 36, 255))
+        draw.rectangle([rail_x, rule_y, rail_x + int(width * 0.036), rule_y + 5], fill=(*accent_light, 255))
 
         grp_font = _load_cjk_font(max(20, int(height * 0.030)), weight="bold")
         grp_lines = _wrap_text(draw, group_label or "高光精选", grp_font, rail_w)[:3]
         gy = rule_y + int(height * 0.024)
         for gl in grp_lines:
-            draw.text((rail_x, gy), gl, font=grp_font, fill=(253, 230, 138, 255))
+            draw.text((rail_x, gy), gl, font=grp_font, fill=(*accent_bright, 255))
             gy += int(height * 0.042)
 
         sub_font = _load_cjk_font(max(15, int(height * 0.020)), weight="medium")
@@ -1262,15 +1807,16 @@ def compose_pip_card_image(
             border_width=max(3, int(min(width, height) * 0.0038)),
             max_title_ratio=0.068,
             theme="obsidian",
+            accent_rgb=accent_rgb,
         )
 
-    # Fallback: classic dark charcoal + amber-gold editorial card without PiP
+    # Fallback: classic dark charcoal editorial card without PiP
     draw = ImageDraw.Draw(canvas)
     margin_x = int(width * 0.12)
-    draw.rectangle([margin_x, int(height * 0.30), margin_x + int(width * 0.055), int(height * 0.30) + 5], fill=(245, 158, 11))
+    draw.rectangle([margin_x, int(height * 0.30), margin_x + int(width * 0.055), int(height * 0.30) + 5], fill=accent_rgb)
     tag_font = _load_cjk_font(max(24, int(height * 0.032)), weight="bold")
     tag_str = f"{index_text}  /  {group_label or 'HIGHLIGHT'}" if index_text else (group_label or "HIGHLIGHT")
-    draw.text((margin_x, int(height * 0.33)), tag_str, font=tag_font, fill=(251, 191, 36))
+    draw.text((margin_x, int(height * 0.33)), tag_str, font=tag_font, fill=accent_light)
     return _draw_frosted_glass_box(
         canvas,
         title=card_title or group_label,
@@ -1283,6 +1829,7 @@ def compose_pip_card_image(
         border_width=max(3, int(min(width, height) * 0.0038)),
         max_title_ratio=0.068,
         theme="obsidian",
+        accent_rgb=accent_rgb,
     )
 
 
@@ -1421,6 +1968,9 @@ def _render_cover_image_at_size(
     index_text: str,
     group_label: str,
     left_meta_lines: list[str],
+    theme: str = "tiffany",
+    color_scheme: str = "tiffany",
+    custom_accent: str = "#0ABAB5",
 ) -> Image.Image:
     if style == "editorial_pip" and width >= height:
         return compose_pip_card_image(
@@ -1433,6 +1983,8 @@ def _render_cover_image_at_size(
             left_meta_lines=left_meta_lines,
             portrait_frame=selected,
             enable_pip=True,
+            color_scheme=color_scheme,
+            custom_accent=custom_accent,
         )
     with Image.open(selected.image_path) as raw_im:
         return render_natural_cover_image(
@@ -1444,6 +1996,9 @@ def _render_cover_image_at_size(
             dur_text=dur_text,
             title=title,
             meta_parts=meta_parts,
+            theme=theme,
+            color_scheme=color_scheme,
+            custom_accent=custom_accent,
         )
 
 
@@ -1461,6 +2016,9 @@ def sync_existing_platform_covers(
     left_meta_lines: list[str],
     published_date: str,
     hero_pool: list[SelectedFrame] | None = None,
+    theme: str = "tiffany",
+    color_scheme: str = "tiffany",
+    custom_accent: str = "#0ABAB5",
 ) -> list[Path]:
     """Refresh any existing AutoSub platform cover siblings in place from clean raw portrait frames."""
     written: list[Path] = []
@@ -1482,6 +2040,9 @@ def sync_existing_platform_covers(
             index_text=index_text,
             group_label=group_label,
             left_meta_lines=left_meta_lines,
+            theme=theme,
+            color_scheme=color_scheme,
+            custom_accent=custom_accent,
         )
         _save_cover_jpeg(img, p, comment=build_autosub_cover_comment(title, orient, video_path, published_date))
         written.append(p)
@@ -1610,6 +2171,7 @@ def _compose_clip_cover_image(
     index_text = f"#{clip.index:02d}"
     left_meta = [f"时长 {dur_text}", manifest.metadata.channel_zh or manifest.metadata.channel or ""]
 
+    nav_s = resolve_navigation_settings(cfg)
     w = manifest.source.width or 1920
     h = manifest.source.height or 1080
     out_img = _render_cover_image_at_size(
@@ -1624,6 +2186,8 @@ def _compose_clip_cover_image(
         index_text=index_text,
         group_label=cats_zh,
         left_meta_lines=left_meta,
+        color_scheme=nav_s["color_scheme"],
+        custom_accent=nav_s["custom_accent"],
     )
     _save_cover_jpeg(out_img, cover_path)
     sync_existing_platform_covers(
@@ -1639,6 +2203,8 @@ def _compose_clip_cover_image(
         left_meta_lines=left_meta,
         published_date=published_date,
         hero_pool=hero_pool,
+        color_scheme=nav_s["color_scheme"],
+        custom_accent=nav_s["custom_accent"],
     )
     return True
 
@@ -1717,6 +2283,7 @@ def _generate_remix_cover(
     badge_text = "REMIX  ·  高光集锦"
     left_meta = [f"总长 {dur_text}", f"共 {len(enabled_items)} 段精华"]
 
+    nav_s = resolve_navigation_settings(cfg)
     out_img = _render_cover_image_at_size(
         selected=picked,
         width=w,
@@ -1729,6 +2296,8 @@ def _generate_remix_cover(
         index_text="REMIX",
         group_label="高光集锦",
         left_meta_lines=left_meta,
+        color_scheme=nav_s["color_scheme"],
+        custom_accent=nav_s["custom_accent"],
     )
     _save_cover_jpeg(out_img, cover_path)
     sync_existing_platform_covers(
@@ -1744,6 +2313,8 @@ def _generate_remix_cover(
         left_meta_lines=left_meta,
         published_date=published_date,
         hero_pool=hero_pool,
+        color_scheme=nav_s["color_scheme"],
+        custom_accent=nav_s["custom_accent"],
     )
     return True
 
@@ -1775,39 +2346,46 @@ def _generate_compilation_cover(
     dur_s = total_duration_s if (total_duration_s is not None and total_duration_s > 0) else sum(c.end_s - c.start_s for c in enabled_clips)
     dur_text = _fmt_dur(dur_s)
     meta_parts = _build_cover_meta_parts(manifest, published_date)
-    comp_title = (manifest.compilation.cover_title or manifest.compilation.title or "切片精选集").strip()
+    w = manifest.source.width or 1920
+    h = manifest.source.height or 1080
+    _, comp_title = _resolve_compilation_effective_title(manifest, persist=True)
     badge_text = "COMPILATION  ·  精选合辑"
     left_meta = [f"总长 {dur_text}", f"精选 {len(enabled_clips)} 支切片"]
 
+    nav_s = resolve_navigation_settings(cfg)
     out_img = _render_cover_image_at_size(
         selected=picked,
-        clean_img_path=picked.image_path,
+        width=w,
+        height=h,
         badge_text=badge_text,
-        title_text=comp_title,
+        dur_text=dur_text,
+        title=comp_title,
         meta_parts=meta_parts,
+        style=style,
+        index_text="合辑",
+        group_label="精选合辑",
         left_meta_lines=left_meta,
-        target_size=(1920, 1080),
-        cfg=cfg,
-        is_remix=True,
+        color_scheme=nav_s["color_scheme"],
+        custom_accent=nav_s["custom_accent"],
     )
-    if out_img:
-        _save_cover_jpeg(out_img, cover_path)
-        sync_existing_platform_covers(
-            selected=picked,
-            cover_path=cover_path,
-            badge_text=badge_text,
-            dur_text=dur_text,
-            title=comp_title,
-            meta_parts=meta_parts,
-            style=style,
-            index_text="合辑",
-            group_label="精选合辑",
-            left_meta_lines=left_meta,
-            published_date=published_date,
-            hero_pool=hero_pool,
-        )
-        return True
-    return False
+    _save_cover_jpeg(out_img, cover_path)
+    sync_existing_platform_covers(
+        selected=picked,
+        cover_path=cover_path,
+        badge_text=badge_text,
+        dur_text=dur_text,
+        title=comp_title,
+        meta_parts=meta_parts,
+        style=style,
+        index_text="合辑",
+        group_label="精选合辑",
+        left_meta_lines=left_meta,
+        published_date=published_date,
+        hero_pool=hero_pool,
+        color_scheme=nav_s["color_scheme"],
+        custom_accent=nav_s["custom_accent"],
+    )
+    return True
 
 
 def _generate_clean_cut_cover(
@@ -1858,6 +2436,7 @@ def _generate_clean_cut_cover(
         index_text="净版",
         group_label="净版全片",
         left_meta_lines=left_meta,
+        theme="crimson",
     )
     _save_cover_jpeg(out_img, cover_path)
     sync_existing_platform_covers(
@@ -1873,6 +2452,7 @@ def _generate_clean_cut_cover(
         left_meta_lines=left_meta,
         published_date=published_date,
         hero_pool=hero_pool,
+        theme="crimson",
     )
     return True
 
@@ -1947,7 +2527,7 @@ def sync_platform_covers_for_target(
             hero_pool=hero_pool,
             prefer_two_shot=prefer_two_shot,
         )
-        stored_title = (manifest.compilation.cover_title or manifest.compilation.title or "切片精选集").strip()
+        _, stored_title = _resolve_compilation_effective_title(manifest, persist=False)
         dur_text = _fmt_dur(est_dur_s)
         badge_text = "COMPILATION  ·  精选合辑"
         index_text = "合辑"
@@ -2010,6 +2590,7 @@ def sync_platform_covers_for_target(
         return []
 
     effective_title = (cover_title_override or "").strip() or stored_title
+    cover_theme = "crimson" if target == "clean_cut" else "tiffany"
     cover_jpg = target_mp4.with_suffix(".jpg")
     written: list[Path] = []
     seen_specs: set[str] = set()
@@ -2021,6 +2602,7 @@ def sync_platform_covers_for_target(
         elif plat == "wechat":
             spec_keys.extend(["wechat", "wechat_share"])
 
+    nav_s = resolve_navigation_settings(cfg)
     for key in spec_keys:
         if key in seen_specs or key not in _PLATFORM_COVER_SPECS:
             continue
@@ -2040,6 +2622,9 @@ def sync_platform_covers_for_target(
             index_text=index_text,
             group_label=group_label,
             left_meta_lines=left_meta_lines,
+            theme=cover_theme,
+            color_scheme=nav_s["color_scheme"],
+            custom_accent=nav_s["custom_accent"],
         )
         _save_cover_jpeg(img, out_path, comment=build_autosub_cover_comment(effective_title, orient, target_mp4, published_date))
         written.append(out_path)
@@ -2057,6 +2642,9 @@ def sync_platform_covers_for_target(
             index_text=index_text,
             group_label=group_label,
             left_meta_lines=left_meta_lines,
+            theme=cover_theme,
+            color_scheme=nav_s["color_scheme"],
+            custom_accent=nav_s["custom_accent"],
         )
         _save_cover_jpeg(img, cover_jpg)
         written.append(cover_jpg)
@@ -2128,7 +2716,7 @@ def refresh_single_cover(
             else (output_dir / build_compilation_filename(manifest, published_date, duration_s=est_dur_s))
         )
         cover_jpg = target_mp4.with_suffix(".jpg")
-        effective_title = (manifest.compilation.cover_title or manifest.compilation.title or "切片精选集").strip()
+        _, effective_title = _resolve_compilation_effective_title(manifest, persist=True)
         exp_hash = compute_cover_hash(
             key="compilation",
             title=effective_title,
@@ -2180,6 +2768,7 @@ def refresh_single_cover(
             manifest=manifest,
             cfg=cfg,
             published_date=published_date,
+            theme="crimson",
         )
         ok = _generate_clean_cut_cover(
             manifest=manifest,
@@ -2237,6 +2826,490 @@ def refresh_single_cover(
     return None
 
 
+def _truncate_text_to_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    max_width: float,
+) -> str:
+    s = str(text or "").strip()
+    if not s or max_width <= 8:
+        return ""
+    if draw.textlength(s, font=font) <= max_width:
+        return s
+    ell = "…"
+    ell_w = draw.textlength(ell, font=font)
+    if ell_w >= max_width:
+        return ""
+    lo, hi = 0, len(s)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if draw.textlength(s[:mid], font=font) + ell_w <= max_width:
+            lo = mid
+        else:
+            hi = mid - 1
+    return (s[:lo].rstrip() + ell) if lo > 0 else ell
+
+
+def compose_nav_bar_overlay_image(
+    *,
+    width: int,
+    height: int,
+    labels: list[str],
+    active_index: int,
+    color_scheme: str = "tiffany",
+    custom_accent: str = "#0ABAB5",
+) -> Image.Image:
+    """Render a persistent top chapter navigation bar RGBA strip highlighting the active segment."""
+    clean_labels = [str(x or "").strip() or f"分段 {i + 1}" for i, x in enumerate(labels)]
+    n = len(clean_labels)
+    nav_h = max(68, int(round(height * 0.076)))
+    img = Image.new("RGBA", (width, nav_h), (0, 0, 0, 0))
+    if n == 0:
+        return img
+
+    pal = resolve_nav_palette(color_scheme, custom_accent)
+    accent_rgb = pal["accent_rgb"]
+    accent_bright = pal["accent_bright"]
+    done_bg = pal["done_bg"]
+    active_text = pal["active_text"]
+    active_shadow = pal["active_shadow"]
+
+    draw = ImageDraw.Draw(img)
+    # Frosted dark bar background + subtle bottom hairline
+    draw.rectangle([(0, 0), (width, nav_h)], fill=(11, 15, 24, 224))
+    draw.line([(0, nav_h - 1), (width, nav_h - 1)], fill=(72, 86, 108, 225), width=1)
+
+    pad_x = max(14, int(round(width * 0.011)))
+    pad_y = max(8, int(round(nav_h * 0.12)))
+    gap = max(7, int(round(width * 0.005)))
+    usable_w = max(1, width - 2 * pad_x - gap * (n - 1))
+    slot_w = usable_w / n
+    radius = max(8, int(round((nav_h - 2 * pad_y) * 0.24)))
+
+    if n <= 5:
+        font_px = max(24, int(round(nav_h * 0.42)))
+    elif n <= 8:
+        font_px = max(21, int(round(nav_h * 0.36)))
+    else:
+        font_px = max(19, int(round(nav_h * 0.31)))
+    font_active = _load_cjk_font(font_px, weight="bold")
+    font_idle = _load_cjk_font(font_px, weight="medium")
+
+    clamped_active = max(0, min(active_index, n - 1))
+    inner_pad_x = max(10, int(round(slot_w * 0.045)))
+    y0 = pad_y
+    y1 = nav_h - pad_y
+    text_layer = Image.new("RGBA", (width, nav_h), (0, 0, 0, 0))
+    text_draw = ImageDraw.Draw(text_layer)
+
+    for i, raw_label in enumerate(clean_labels):
+        x0 = int(round(pad_x + i * (slot_w + gap)))
+        x1 = int(round(pad_x + (i + 1) * slot_w + i * gap))
+        if x1 <= x0 + 4:
+            continue
+        is_active = i == clamped_active
+        is_done = i < clamped_active
+
+        if is_active:
+            draw.rounded_rectangle(
+                [(x0, y0), (x1, y1)],
+                radius=radius,
+                fill=(*accent_rgb, 244),
+                outline=(*accent_bright, 250),
+                width=2,
+            )
+            # Crisp bottom accent bar under active tab
+            draw.rectangle([(x0 + radius, nav_h - 4), (x1 - radius, nav_h - 1)], fill=(*accent_bright, 255))
+            txt_color = active_text
+            font = font_active
+        elif is_done:
+            draw.rounded_rectangle(
+                [(x0, y0), (x1, y1)],
+                radius=radius,
+                fill=(*done_bg, 226),
+            )
+            draw.rectangle([(x0 + radius, nav_h - 3), (x1 - radius, nav_h - 1)], fill=(*accent_rgb, 205))
+            txt_color = (232, 240, 250, 232)
+            font = font_idle
+        else:
+            draw.rounded_rectangle(
+                [(x0, y0), (x1, y1)],
+                radius=radius,
+                fill=(26, 33, 46, 222),
+            )
+            txt_color = (196, 208, 224, 215)
+            font = font_idle
+
+        prefix = f"{i + 1:02d} " if n <= 6 else f"{i + 1}."
+        full_text = f"{prefix}{raw_label}"
+        max_text_w = max(12.0, (x1 - x0) - 2 * inner_pad_x)
+        fitted = _truncate_text_to_width(text_draw, full_text, font, max_text_w)
+        if fitted:
+            bbox = text_draw.textbbox((0, 0), fitted, font=font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            tx = x0 + ((x1 - x0) - tw) / 2.0 - bbox[0]
+            ty = y0 + ((y1 - y0) - th) / 2.0 - bbox[1]
+            if is_active:
+                text_draw.text((tx, ty + 1), fitted, font=font, fill=active_shadow)
+            text_draw.text((tx, ty), fitted, font=font, fill=txt_color)
+
+    return Image.alpha_composite(img, text_layer)
+
+
+def compose_portrait_frame_overlay_image(
+    *,
+    width: int = 1080,
+    height: int = 1920,
+    title: str,
+    subtitle: str = "",
+    badge_text: str = "",
+    labels: list[str] | None = None,
+    active_index: int = 0,
+    show_nav: bool = True,
+    active_meta_title: str = "",
+    active_meta_badge: str = "",
+    active_meta_summary: str = "",
+    meta_channel: str = "",
+    meta_guest: str = "",
+    meta_date: str = "",
+    source_duration_text: str = "",
+    total_duration_text: str = "",
+    color_scheme: str = "tiffany",
+    custom_accent: str = "#0ABAB5",
+) -> tuple[Image.Image, int, int]:
+    """
+    Render a 9:16 portrait editorial overlay:
+    - Top black band: main title + horizontal left-to-right navigation bar flush above the video window.
+    - Middle band: transparent 16:9 video window.
+    - Bottom black band: structured clip/segment metadata (active segment, guest/channel/date, duration, summary).
+    Returns (overlay_rgba_image, video_y, video_h).
+    """
+    video_h = int(round(width * 9 / 16))
+    video_h -= video_h % 2
+    video_y = int(round((height - video_h) * 0.49))
+    video_y -= video_y % 2
+
+    pal = resolve_nav_palette(color_scheme, custom_accent)
+    accent_rgb = pal["accent_rgb"]
+    accent_light = pal["accent_light"]
+    accent_bright = pal["accent_bright"]
+    done_bg = pal["done_bg"]
+    active_text = pal["active_text"]
+    active_shadow = pal["active_shadow"]
+
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # Top and bottom dark letterbox bands (middle [video_y, video_y + video_h) stays transparent)
+    draw.rectangle([(0, 0), (width, video_y)], fill=(11, 15, 24, 255))
+    draw.rectangle([(0, video_y + video_h), (width, height)], fill=(11, 15, 24, 255))
+    # Subtle themed hairline borders framing the 16:9 video window
+    draw.rectangle([(0, video_y - 2), (width, video_y)], fill=(*accent_rgb, 220))
+    draw.rectangle([(0, video_y + video_h), (width, video_y + video_h + 2)], fill=(*accent_rgb, 220))
+
+    text_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    td = ImageDraw.Draw(text_layer)
+    pad_x = int(round(width * 0.048))
+    content_w = width - 2 * pad_x
+
+    # ── Horizontal Left-to-Right Navigation Bar flush above the video window ──
+    clean_labels = [str(x or "").strip() or f"分段 {i + 1}" for i, x in enumerate(labels or [])]
+    nav_block_h = 0
+    clamped_active = 0
+    if show_nav and clean_labels:
+        n = len(clean_labels)
+        clamped_active = max(0, min(active_index, n - 1))
+        n_rows = 1 if n <= 5 else 2
+        row_h = 72 if n_rows == 1 else 56
+        row_gap = 8
+        nav_pad_y = 10
+        nav_block_h = n_rows * row_h + (n_rows - 1) * row_gap + nav_pad_y * 2
+        nav_y0 = video_y - nav_block_h - 2
+
+        draw.rectangle([(0, nav_y0), (width, video_y - 2)], fill=(15, 20, 32, 255))
+        draw.line([(0, nav_y0), (width, nav_y0)], fill=(58, 72, 96, 220), width=1)
+
+        per_row = n if n_rows == 1 else (n + 1) // 2
+        nav_pad_x = max(14, int(round(width * 0.016)))
+        col_gap = 8
+        radius = max(8, int(round(row_h * 0.22)))
+        font_px = 26 if n_rows == 1 else 22
+        if n_rows == 1 and n >= 5:
+            font_px = 23
+        font_active = _load_cjk_font(font_px, weight="bold")
+        font_idle = _load_cjk_font(font_px, weight="medium")
+
+        for r_idx in range(n_rows):
+            row_start = r_idx * per_row
+            row_end = min(n, row_start + per_row)
+            row_items = clean_labels[row_start:row_end]
+            if not row_items:
+                continue
+            m = len(row_items)
+            usable_w = max(1, width - 2 * nav_pad_x - col_gap * (m - 1))
+            slot_w = usable_w / m
+            ry0 = nav_y0 + nav_pad_y + r_idx * (row_h + row_gap)
+            ry1 = ry0 + row_h
+
+            for c_idx, raw_label in enumerate(row_items):
+                global_i = row_start + c_idx
+                x0 = int(round(nav_pad_x + c_idx * (slot_w + col_gap)))
+                x1 = int(round(nav_pad_x + (c_idx + 1) * slot_w + c_idx * col_gap))
+                is_active = global_i == clamped_active
+                is_done = global_i < clamped_active
+
+                if is_active:
+                    draw.rounded_rectangle(
+                        [(x0, ry0), (x1, ry1)],
+                        radius=radius,
+                        fill=(*accent_rgb, 246),
+                        outline=(*accent_bright, 255),
+                        width=2,
+                    )
+                    draw.rectangle([(x0 + radius, ry1 - 4), (x1 - radius, ry1 - 1)], fill=(*accent_bright, 255))
+                    txt_color = active_text
+                    font = font_active
+                elif is_done:
+                    draw.rounded_rectangle(
+                        [(x0, ry0), (x1, ry1)],
+                        radius=radius,
+                        fill=(*done_bg, 232),
+                        outline=(*accent_rgb, 140),
+                        width=1,
+                    )
+                    txt_color = (232, 240, 250, 235)
+                    font = font_idle
+                else:
+                    draw.rounded_rectangle(
+                        [(x0, ry0), (x1, ry1)],
+                        radius=radius,
+                        fill=(26, 33, 46, 232),
+                        outline=(56, 68, 90, 160),
+                        width=1,
+                    )
+                    txt_color = (196, 208, 224, 220)
+                    font = font_idle
+
+                prefix = f"{global_i + 1:02d} " if m <= 4 else f"{global_i + 1}."
+                full_text = f"{prefix}{raw_label}"
+                inner_pad = 10
+                fitted = _truncate_text_to_width(td, full_text, font, max(16.0, (x1 - x0) - 2 * inner_pad))
+                if fitted:
+                    bbox = td.textbbox((0, 0), fitted, font=font)
+                    tw = bbox[2] - bbox[0]
+                    th = bbox[3] - bbox[1]
+                    tx = x0 + ((x1 - x0) - tw) / 2.0 - bbox[0]
+                    ty = ry0 + (row_h - th) / 2.0 - bbox[1]
+                    if is_active:
+                        td.text((tx, ty + 1), fitted, font=font, fill=active_shadow)
+                    td.text((tx, ty), fitted, font=font, fill=txt_color)
+
+    # ── Top Black Band (above nav bar): Badge + Big Bold Main Title ──
+    title_area_top = int(round(height * 0.075))
+    title_area_bottom = (video_y - nav_block_h - 18) if nav_block_h > 0 else (video_y - 24)
+    cur_y = title_area_top
+    if badge_text:
+        badge_font = _load_cjk_font(max(24, int(round(width * 0.025))), weight="bold")
+        bb = td.textbbox((0, 0), badge_text, font=badge_font)
+        bw, bh = bb[2] - bb[0], bb[3] - bb[1]
+        bpx, bpy = 18, 7
+        pill_w = bw + 2 * bpx
+        pill_h = bh + 2 * bpy
+        bx0 = (width - pill_w) // 2
+        draw.rounded_rectangle(
+            [(bx0, cur_y), (bx0 + pill_w, cur_y + pill_h)],
+            radius=pill_h // 2,
+            fill=(*accent_rgb, 242),
+            outline=(*accent_bright, 240),
+            width=2,
+        )
+        td.text((bx0 + bpx - bb[0], cur_y + bpy - bb[1]), badge_text, font=badge_font, fill=active_text)
+        cur_y += pill_h + 22
+
+    clean_title = str(title or "").strip() or "精选合辑"
+    title_avail_h = max(110, title_area_bottom - cur_y)
+    title_font_px = max(48, int(round(width * 0.056)))
+    title_lines: list[str] = []
+    title_font = _load_cjk_font(title_font_px, weight="heavy")
+    while title_font_px >= 28:
+        title_font = _load_cjk_font(title_font_px, weight="heavy")
+        title_lines = _wrap_title_smart(td, clean_title, title_font, content_w, max_lines=2)
+        line_step = int(round(title_font_px * 1.28))
+        if len(title_lines) <= 2 and len(title_lines) * line_step <= title_avail_h:
+            break
+        title_font_px -= 3
+    title_lines = title_lines[:2]
+    line_step = int(round(title_font_px * 1.28))
+    total_title_h = len(title_lines) * line_step
+    extra_top = max(0, (title_avail_h - total_title_h) // 2)
+    ty_cursor = cur_y + extra_top
+    for ln in title_lines:
+        lb = td.textbbox((0, 0), ln, font=title_font)
+        lw = lb[2] - lb[0]
+        tx = (width - lw) // 2 - lb[0]
+        ty = ty_cursor - lb[1]
+        td.text((tx + 2, ty + 3), ln, font=title_font, fill=(0, 0, 0, 175))
+        td.text((tx, ty), ln, font=title_font, fill=(255, 255, 255, 255))
+        ty_cursor += line_step
+
+    # ── Bottom Black Band: Horizontal Video Metadata Row + Divider + Current Segment Info ──
+    meta_top = video_y + video_h + 30
+    meta_bottom = height - int(round(height * 0.115))  # clear of platform bottom controls
+    mx = pad_x + 8
+    mw = width - 2 * mx
+    my = meta_top
+
+    # Tier 1: Horizontal metadata strip (频道 | 嘉宾 | 发布 | 原片 | 切片)
+    meta_items: list[tuple[str, str, bool]] = []
+    if meta_channel.strip():
+        meta_items.append(("频道", meta_channel.strip(), True))
+    if meta_guest.strip():
+        meta_items.append(("嘉宾", meta_guest.strip(), False))
+    if meta_date.strip():
+        meta_items.append(("发布", meta_date.strip(), False))
+    if not meta_items and subtitle.strip():
+        meta_items.append(("来源", subtitle.strip(), True))
+    if source_duration_text.strip():
+        meta_items.append(("原片", source_duration_text.strip(), False))
+    if total_duration_text.strip():
+        meta_items.append(("切片", total_duration_text.strip(), False))
+
+    if meta_items:
+        lbl_font = _load_cjk_font(18, weight="regular")
+        val_font = _load_cjk_font(23, weight="medium")
+        col_gap = 20
+        n_cols = len(meta_items)
+        # Measure natural widths for proportional horizontal layout
+        nat_widths: list[float] = []
+        for lbl, val, _ in meta_items:
+            lb = td.textbbox((0, 0), lbl, font=lbl_font)
+            vb = td.textbbox((0, 0), val, font=val_font)
+            nat_widths.append(max(float(lb[2] - lb[0]), float(vb[2] - vb[0]), 64.0))
+        usable_w = max(120.0, float(mw - col_gap * (n_cols - 1)))
+        total_nat = sum(nat_widths)
+        if total_nat > usable_w:
+            col_widths = [max(56.0, w_i * usable_w / total_nat) for w_i in nat_widths]
+        else:
+            # Spread proportionally with slight breathing room while keeping compact left-to-right flow
+            extra = (usable_w - total_nat) / n_cols
+            col_widths = [w_i + min(extra, 44.0) for w_i in nat_widths]
+
+        cx = float(mx)
+        for idx_m, ((lbl, val, is_accent), cw) in enumerate(zip(meta_items, col_widths)):
+            if idx_m > 0:
+                div_x = int(round(cx - col_gap / 2.0))
+                draw.line([(div_x, my + 4), (div_x, my + 52)], fill=(255, 255, 255, 38), width=1)
+            td.text((int(round(cx)), my), lbl, font=lbl_font, fill=(148, 163, 184, 210))
+            val_fit = _truncate_text_to_width(td, val, val_font, max(44.0, cw - 4.0))
+            val_color = (*accent_light, 245) if is_accent else (234, 240, 248, 240)
+            td.text((int(round(cx)), my + 24), val_fit, font=val_font, fill=val_color)
+            cx += cw + col_gap
+
+        my += 64
+        draw.line([(mx, my), (mx + mw, my)], fill=(255, 255, 255, 42), width=1)
+        my += 22
+
+    # Tier 2: Current segment info (progress + title + summary, no beat/category badge)
+    seg_title = (
+        str(active_meta_title or "").strip()
+        or (clean_labels[clamped_active] if clean_labels else "")
+        or clean_title
+    )
+    if seg_title:
+        prefix_idx = f"{clamped_active + 1:02d}/{len(clean_labels):02d}  " if clean_labels else ""
+        st_font = _load_cjk_font(32, weight="bold")
+        st_lines = _wrap_text(td, f"{prefix_idx}{seg_title}", st_font, mw)[:2]
+        for ln_i, ln in enumerate(st_lines):
+            if ln_i == 0 and prefix_idx and ln.startswith(prefix_idx):
+                p_bb = td.textbbox((0, 0), prefix_idx, font=st_font)
+                p_w = p_bb[2] - p_bb[0]
+                td.text((mx, my), prefix_idx, font=st_font, fill=(*accent_bright, 255))
+                td.text((mx + p_w, my), ln[len(prefix_idx) :], font=st_font, fill=(255, 255, 255, 255))
+            else:
+                td.text((mx, my), ln, font=st_font, fill=(255, 255, 255, 255))
+            my += 44
+        my += 6
+
+    if active_meta_summary and my + 30 < meta_bottom:
+        sum_font = _load_cjk_font(24, weight="regular")
+        max_sum_lines = max(1, min(4, (meta_bottom - my) // 34))
+        sum_lines = _wrap_text(td, active_meta_summary.strip(), sum_font, mw)[:max_sum_lines]
+        for ln in sum_lines:
+            td.text((mx, my), ln, font=sum_font, fill=(198, 210, 226, 225))
+            my += 34
+
+    return Image.alpha_composite(img, text_layer), video_y, video_h
+
+
+def _build_layout_vf(
+    width: int,
+    height: int,
+    fps: float,
+    *,
+    video_y: int | None = None,
+    video_h: int | None = None,
+) -> str:
+    if video_y is not None and video_h is not None:
+        return (
+            f"scale={width}:{video_h}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:{video_y}:color=#0B0F18,"
+            f"fps={fps:.3f}"
+        )
+    return (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+        f"fps={fps:.3f}"
+    )
+
+
+def _overlay_nav_bar_on_video(
+    src_mp4: Path,
+    nav_png: Path,
+    out_mp4: Path,
+    *,
+    width: int,
+    height: int,
+    fps: float,
+    use_vt: bool,
+    video_y: int | None = None,
+    video_h: int | None = None,
+) -> tuple[bool, str, str]:
+    """Composite persistent navigation/layout PNG onto a video segment with uniform stream params."""
+    vf_scale = _build_layout_vf(width, height, fps, video_y=video_y, video_h=video_h)
+    fc = f"[0:v]{vf_scale}[vbase];[vbase][1:v]overlay=0:0:eof_action=repeat,format=yuv420p[vout]"
+    base = [
+        "ffmpeg",
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        str(src_mp4),
+        "-i",
+        str(nav_png),
+        "-filter_complex",
+        fc,
+        "-map",
+        "[vout]",
+        "-map",
+        "0:a:0?",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-movflags",
+        "+faststart",
+    ]
+    cmd_vt = base + ["-c:v", "h264_videotoolbox", "-q:v", "60", str(out_mp4)]
+    cmd_x264 = base + ["-c:v", "libx264", "-preset", "fast", "-crf", "18", str(out_mp4)]
+    return _run_ffmpeg_encode(cmd_vt, cmd_x264, use_vt)
+
+
 def _create_title_card_video(
     *,
     width: int,
@@ -2254,6 +3327,8 @@ def _create_title_card_video(
     portrait_frame: SelectedFrame | None = None,
     enable_pip: bool = True,
     index_text: str = "",
+    color_scheme: str = "amber",
+    custom_accent: str = "#0ABAB5",
 ) -> bool:
     """Render an editorial PiP title card PNG and encode to an MP4 segment matching main stream."""
     img = compose_pip_card_image(
@@ -2266,6 +3341,8 @@ def _create_title_card_video(
         left_meta_lines=left_meta_lines or [],
         portrait_frame=portrait_frame,
         enable_pip=enable_pip,
+        color_scheme=color_scheme,
+        custom_accent=custom_accent,
     )
 
     png_path = out_mp4.with_suffix(".png")
@@ -2391,14 +3468,25 @@ def _render_remix(
             return out_mp4
 
     t0 = time.monotonic()
-    store.log(f"[render] 开始精装合成 Remix（{len(enabled_items)} 小段，卡片模式: {remix.card_mode}）")
+    nav_settings = resolve_navigation_settings(cfg)
+    nav_style = nav_settings["remix_style"]
+    screen_layout = nav_settings["screen_layout"]
+    nav_color_scheme = nav_settings["color_scheme"]
+    nav_custom_accent = nav_settings["custom_accent"]
+    is_portrait = screen_layout == "portrait"
+    has_top_nav = nav_style in ("top_nav", "both") and remix.card_mode != "none"
+    has_title_card = nav_style in ("title_card", "both") and remix.card_mode != "none"
+    store.log(
+        f"[render] 开始精装合成 Remix（{len(enabled_items)} 小段，布局: {screen_layout} / 导航: {nav_style} / 色系: {nav_color_scheme} / 分组: {remix.card_mode}）"
+    )
     tmp_dir = store.work_dir / "remix_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     src_video = Path(manifest.source.render_video)
     clean_video = Path(manifest.source.analysis_video)
     frame_src = clean_video if clean_video.exists() else src_video
-    w, h = manifest.source.width or 1920, manifest.source.height or 1080
+    src_w, src_h = manifest.source.width or 1920, manifest.source.height or 1080
+    w, h = (1080, 1920) if is_portrait else (src_w, src_h)
     fps = manifest.source.fps if 15.0 <= manifest.source.fps <= 60.0 else 30.0
     defaults = ensure_default_assets()
     sfx_path = Path(remix.sfx_path) if (remix.sfx_path and Path(remix.sfx_path).exists()) else defaults["sfx"]
@@ -2408,20 +3496,20 @@ def _render_remix(
     concat_files: list[Path] = []
     card_entry_times: list[float] = []
     cursor_s = 0.0
-    last_group: str | None = None
-    card_num = 0
     active_cuts = get_active_delete_spans(manifest, cfg) if manifest.clean_cut.apply_to_clips else []
-    clean_vid, masked_ass, audio_mask_spans, mask_spans = (
+    clean_vid, masked_ass, audio_mask_spans, mask_spans, visual_mask_regions = (
         _prepare_mask_render_context(
             manifest,
             store.work_dir / "masked_subs",
             hash_key=remix.render_hash or run_id,
             cfg=cfg,
+            store=store,
         )
         if manifest.clean_cut.apply_to_clips
-        else (None, None, [], [])
+        else (None, None, [], [], [])
     )
 
+    playable_entries: list[tuple[int, Any, list[tuple[float, float]]]] = []
     for idx, it in enumerate(enabled_items):
         sub_spans = (
             subtract_cut_intervals(it.start_s, it.end_s, active_cuts, min_keep_s=1.0)
@@ -2431,110 +3519,273 @@ def _render_remix(
         if not sub_spans:
             store.log(f"[render] Remix 片段 {it.remix_id} 完全位于已屏蔽广告/敏感区间，跳过")
             continue
+        playable_entries.append((idx, it, sub_spans))
 
-        group_key = remix_item_group_key(it)
-        need_card = should_insert_title_card(remix.card_mode, idx, group_key, last_group)
+    if not playable_entries:
+        return None
 
-        if need_card:
-            card_num += 1
-            card_mp4 = tmp_dir / f"card_{card_num:02d}.mp4"
-            # Gather contiguous items in same group to pick best portrait frame in group window
-            grp_start = it.start_s
-            grp_end = it.end_s
-            for nxt in enabled_items[idx + 1 :]:
-                if remix_item_group_key(nxt) == group_key:
-                    grp_end = max(grp_end, nxt.end_s)
-                else:
-                    break
-            portrait_sf = (
-                select_best_frame_for_interval(
-                    source_video=frame_src,
-                    start_s=grp_start,
-                    end_s=grp_end,
-                    work_dir=store.work_dir,
-                    cache_key=f"rmx_{remix.render_hash}_{card_num:02d}",
-                    hero_pool=hero_pool,
-                    fallback_index=card_num - 1,
-                    prefer_two_shot=prefer_two_shot,
-                )
-                if remix_card_pip
-                else None
+    # Build persistent navigation bar segments when has_top_nav
+    nav_labels: list[str] = []
+    entry_nav_indices: list[int | None] = []
+    if has_top_nav:
+        last_group_nav: str | None = None
+        for p_idx, (_, it, _) in enumerate(playable_entries):
+            group_key = remix_item_group_key(it)
+            if remix.card_mode == "every":
+                nav_labels.append((it.card_title or it.group_label or f"片段 {p_idx + 1}").strip())
+                entry_nav_indices.append(len(nav_labels) - 1)
+            else:
+                if p_idx == 0 or group_key != last_group_nav:
+                    nav_labels.append((it.group_label or it.card_title or f"板块 {len(nav_labels) + 1}").strip())
+                entry_nav_indices.append(len(nav_labels) - 1)
+            last_group_nav = group_key
+    else:
+        entry_nav_indices = [None] * len(playable_entries)
+
+    remix_disp_title = (remix.cover_title or remix.title or manifest.metadata.original_theme_zh or "高光混剪").strip()
+    src_ch = (manifest.metadata.channel_zh or manifest.metadata.channel or "").strip()
+    src_guest = (manifest.metadata.guest_zh or "").strip()
+    remix_sub = "  ·  ".join(p for p in (src_ch, src_guest, published_date.strip()) if p)
+    src_dur_txt = _fmt_dur(float(manifest.source.duration_s or 0.0)) if manifest.source.duration_s else ""
+    remix_dur_txt = _fmt_dur(_estimate_remix_duration_s(manifest))
+    nav_meta_by_idx: dict[int, tuple[str, str]] = {}
+    for (_, it, _), n_idx in zip(playable_entries, entry_nav_indices):
+        if n_idx is not None and n_idx not in nav_meta_by_idx:
+            nav_meta_by_idx[n_idx] = (
+                (it.card_title or it.group_label or "").strip(),
+                (it.reason or it.quote or "").strip(),
             )
-            ok = _create_title_card_video(
+    nav_pngs: list[Path] = []
+    portrait_static_png: Path | None = None
+    portrait_vid_y: int | None = None
+    portrait_vid_h: int | None = None
+    if is_portrait:
+        if has_top_nav and nav_labels:
+            for nav_i in range(len(nav_labels)):
+                png_p = tmp_dir / f"nav_portrait_{nav_i + 1:02d}.png"
+                m_title, m_sum = nav_meta_by_idx.get(nav_i, (nav_labels[nav_i], ""))
+                ov_img, portrait_vid_y, portrait_vid_h = compose_portrait_frame_overlay_image(
+                    width=w,
+                    height=h,
+                    title=remix_disp_title,
+                    subtitle=remix_sub,
+                    badge_text="速览混剪",
+                    labels=nav_labels,
+                    active_index=nav_i,
+                    show_nav=True,
+                    active_meta_title=m_title,
+                    active_meta_summary=m_sum,
+                    meta_channel=src_ch,
+                    meta_guest=src_guest,
+                    meta_date=published_date.strip(),
+                    source_duration_text=src_dur_txt,
+                    total_duration_text=remix_dur_txt,
+                    color_scheme=nav_color_scheme,
+                    custom_accent=nav_custom_accent,
+                )
+                ov_img.save(png_p, format="PNG")
+                nav_pngs.append(png_p)
+        else:
+            portrait_static_png = tmp_dir / "nav_portrait_static.png"
+            ov_img, portrait_vid_y, portrait_vid_h = compose_portrait_frame_overlay_image(
                 width=w,
                 height=h,
-                fps=fps,
-                duration_s=remix.card_duration_s,
-                fade_s=remix.card_fade_s,
-                group_label=it.group_label or "高光片段",
-                card_title=it.card_title or it.group_label,
-                card_index=card_num,
-                out_mp4=card_mp4,
-                use_vt=use_vt,
-                meta_parts=meta_parts,
-                left_meta_lines=[
-                    BEAT_LABELS_ZH.get(it.beat_type, "高光"),
-                    published_date or (manifest.metadata.channel_zh or manifest.metadata.channel or ""),
-                ],
-                portrait_frame=portrait_sf,
-                enable_pip=remix_card_pip,
-                index_text="",
+                title=remix_disp_title,
+                subtitle=remix_sub,
+                badge_text="速览混剪",
+                labels=[],
+                active_index=0,
+                show_nav=False,
+                active_meta_title=remix_disp_title,
+                active_meta_summary=remix.editorial_thesis or "",
+                meta_channel=src_ch,
+                meta_guest=src_guest,
+                meta_date=published_date.strip(),
+                source_duration_text=src_dur_txt,
+                total_duration_text=remix_dur_txt,
+                color_scheme=nav_color_scheme,
+                custom_accent=nav_custom_accent,
             )
-            if ok:
-                concat_files.append(card_mp4)
-                card_entry_times.append(cursor_s)
-                cursor_s += remix.card_duration_s
-        last_group = group_key
+            ov_img.save(portrait_static_png, format="PNG")
+    elif has_top_nav and nav_labels:
+        for nav_i in range(len(nav_labels)):
+            png_p = tmp_dir / f"nav_{nav_i + 1:02d}.png"
+            compose_nav_bar_overlay_image(
+                width=w,
+                height=h,
+                labels=nav_labels,
+                active_index=nav_i,
+                color_scheme=nav_color_scheme,
+                custom_accent=nav_custom_accent,
+            ).save(png_p, format="PNG")
+            nav_pngs.append(png_p)
 
-        # Extract loudness-normalized excerpt(s) matching exact stream geometry
+    prev_nav_idx: int | None = None
+    last_card_group: str | None = None
+    card_num = 0
+    for p_idx, ((idx, it, sub_spans), nav_idx) in enumerate(zip(playable_entries, entry_nav_indices)):
+        if has_title_card:
+            group_key = remix_item_group_key(it)
+            need_card = should_insert_title_card(remix.card_mode, p_idx, group_key, last_card_group)
+            if need_card:
+                card_num += 1
+                card_mp4 = tmp_dir / f"card_{card_num:02d}.mp4"
+                grp_start = it.start_s
+                grp_end = it.end_s
+                for _, nxt, _ in playable_entries[p_idx + 1 :]:
+                    if remix_item_group_key(nxt) == group_key:
+                        grp_end = max(grp_end, nxt.end_s)
+                    else:
+                        break
+                portrait_sf = (
+                    select_best_frame_for_interval(
+                        source_video=frame_src,
+                        start_s=grp_start,
+                        end_s=grp_end,
+                        work_dir=store.work_dir,
+                        cache_key=f"rmx_{remix.render_hash}_{card_num:02d}",
+                        hero_pool=hero_pool,
+                        fallback_index=card_num - 1,
+                        prefer_two_shot=prefer_two_shot,
+                    )
+                    if remix_card_pip
+                    else None
+                )
+                ok_card = _create_title_card_video(
+                    width=w,
+                    height=h,
+                    fps=fps,
+                    duration_s=remix.card_duration_s,
+                    fade_s=remix.card_fade_s,
+                    group_label=it.group_label or "高光片段",
+                    card_title=it.card_title or it.group_label,
+                    card_index=card_num,
+                    out_mp4=card_mp4,
+                    use_vt=use_vt,
+                    meta_parts=meta_parts,
+                    left_meta_lines=[
+                        BEAT_LABELS_ZH.get(it.beat_type, "高光"),
+                        published_date or (manifest.metadata.channel_zh or manifest.metadata.channel or ""),
+                    ],
+                    portrait_frame=portrait_sf,
+                    enable_pip=remix_card_pip,
+                    index_text="",
+                    color_scheme=nav_color_scheme,
+                    custom_accent=nav_custom_accent,
+                )
+                if ok_card:
+                    concat_files.append(card_mp4)
+                    card_entry_times.append(cursor_s)
+                    cursor_s += remix.card_duration_s
+            last_card_group = group_key
+        elif has_top_nav and nav_idx is not None and nav_idx != prev_nav_idx:
+            if cursor_s > 0.0:
+                card_entry_times.append(cursor_s)
+            prev_nav_idx = nav_idx
+
+        if has_top_nav and nav_idx is not None and nav_idx < len(nav_pngs):
+            nav_png = nav_pngs[nav_idx]
+        elif is_portrait and portrait_static_png is not None:
+            nav_png = portrait_static_png
+        else:
+            nav_png = None
+
+        # Extract loudness-normalized excerpt(s) with layout & persistent navigation overlay
         for part_i, (sub_s, sub_e) in enumerate(sub_spans):
             seg_mp4 = tmp_dir / f"seg_{idx + 1:02d}_{part_i + 1:02d}.mp4"
             dur = max(0.5, sub_e - sub_s)
-            vf_rmx = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps={fps:.3f}"
-            if clean_vid is not None and masked_ass is not None and _span_needs_mask(sub_s, sub_e, mask_spans):
+            vf_rmx = _build_layout_vf(
+                w,
+                h,
+                fps,
+                video_y=portrait_vid_y if is_portrait else None,
+                video_h=portrait_vid_h if is_portrait else None,
+            )
+            need_rmx_mask = bool(
+                (clean_vid is not None and masked_ass is not None and _span_needs_mask(sub_s, sub_e, mask_spans))
+                or _span_needs_visual_mask(sub_s, sub_e, visual_mask_regions)
+            )
+            if need_rmx_mask:
+                use_clean = clean_vid is not None and masked_ass is not None
                 ok, _, err = _render_masked_span(
-                    clean_vid,
+                    clean_vid if use_clean and clean_vid is not None else src_video,
                     sub_s,
                     sub_e,
-                    masked_ass,
-                    audio_mask_spans,
+                    masked_ass if use_clean else None,
+                    audio_mask_spans if use_clean else None,
                     seg_mp4,
                     fade_ms=30,
                     use_vt=use_vt,
                     vf_extra=vf_rmx,
                     af_prefix="loudnorm=I=-16:TP=-1.5:LRA=11",
                     apply_edge_fade=True,
+                    visual_mask_regions=visual_mask_regions,
+                    video_size=(w, h),
+                    overlay_png=nav_png,
                 )
             else:
                 fade_s = min(0.03, dur * 0.15)
                 fade_out_st = max(0.0, dur - fade_s)
-                vf = f"{vf_rmx},format=yuv420p"
                 af = f"loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:st=0:d={fade_s:.3f},afade=t=out:st={fade_out_st:.3f}:d={fade_s:.3f}"
 
-                base = [
-                    "ffmpeg",
-                    "-y",
-                    "-v",
-                    "error",
-                    "-ss",
-                    f"{sub_s:.3f}",
-                    "-i",
-                    str(src_video),
-                    "-t",
-                    f"{dur:.3f}",
-                    "-vf",
-                    vf,
-                    "-af",
-                    af,
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "192k",
-                    "-ar",
-                    "44100",
-                    "-ac",
-                    "2",
-                ]
+                if nav_png is not None and nav_png.is_file():
+                    fc_nav = f"[0:v]{vf_rmx}[vbase];[vbase][1:v]overlay=0:0:eof_action=repeat,format=yuv420p[vout]"
+                    base = [
+                        "ffmpeg",
+                        "-y",
+                        "-v",
+                        "error",
+                        "-ss",
+                        f"{sub_s:.3f}",
+                        "-i",
+                        str(src_video),
+                        "-i",
+                        str(nav_png),
+                        "-t",
+                        f"{dur:.3f}",
+                        "-filter_complex",
+                        fc_nav,
+                        "-map",
+                        "[vout]",
+                        "-map",
+                        "0:a:0",
+                        "-af",
+                        af,
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "192k",
+                        "-ar",
+                        "44100",
+                        "-ac",
+                        "2",
+                    ]
+                else:
+                    vf = f"{vf_rmx},format=yuv420p"
+                    base = [
+                        "ffmpeg",
+                        "-y",
+                        "-v",
+                        "error",
+                        "-ss",
+                        f"{sub_s:.3f}",
+                        "-i",
+                        str(src_video),
+                        "-t",
+                        f"{dur:.3f}",
+                        "-vf",
+                        vf,
+                        "-af",
+                        af,
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "192k",
+                        "-ar",
+                        "44100",
+                        "-ac",
+                        "2",
+                    ]
                 cmd_vt = base + ["-c:v", "h264_videotoolbox", "-q:v", "60", str(seg_mp4)]
                 cmd_x264 = base + ["-c:v", "libx264", "-preset", "fast", "-crf", "18", str(seg_mp4)]
                 ok, _, err = _run_ffmpeg_encode(cmd_vt, cmd_x264, use_vt)
@@ -2553,7 +3804,7 @@ def _render_remix(
         encoding="utf-8",
     )
     raw_concat = tmp_dir / "remix_raw.mp4"
-    res_cat = subprocess.run(
+    res_cat = run_cancellable_subprocess(
         [
             "ffmpeg",
             "-y",
@@ -2574,7 +3825,7 @@ def _render_remix(
     )
     if res_cat.returncode != 0:
         # Fallback re-encode concat if stream params differed slightly
-        res_fallback = subprocess.run(
+        res_fallback = run_cancellable_subprocess(
             [
                 "ffmpeg",
                 "-y",
@@ -2667,7 +3918,7 @@ def _render_remix(
         )
         fc = ";".join(filter_parts)
 
-        res_mix = subprocess.run(
+        res_mix = run_cancellable_subprocess(
             [
                 "ffmpeg",
                 "-y",
@@ -2762,14 +4013,25 @@ def _render_compilation(
 
     output_dir = Path(manifest.source.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    nav_settings = resolve_navigation_settings(cfg)
+    nav_style = nav_settings["compilation_style"]
+    screen_layout = nav_settings["screen_layout"]
+    nav_color_scheme = nav_settings["color_scheme"]
+    nav_custom_accent = nav_settings["custom_accent"]
+    is_portrait = screen_layout == "portrait"
+    has_top_nav = nav_style in ("top_nav", "both")
+    has_title_card = nav_style in ("title_card", "both")
     card_dur = float(comp.card_duration_s or 1.8)
     card_fade = float(comp.card_fade_s or 0.2)
-    est_dur_s = sum(max(0.0, c.end_s - c.start_s) for c in enabled_clips) + len(enabled_clips) * card_dur
+    est_dur_s = sum(max(0.0, c.end_s - c.start_s) for c in enabled_clips) + (
+        len(enabled_clips) * card_dur if has_title_card else 0.0
+    )
     out_mp4 = output_dir / build_compilation_filename(manifest, published_date, duration_s=est_dur_s)
     cover_jpg = out_mp4.with_suffix(".jpg")
 
     comp.render_hash = compute_compilation_render_hash(manifest)
-    effective_title = (comp.cover_title or comp.title or "切片精选集").strip()
+    _, effective_title = _resolve_compilation_effective_title(manifest, persist=True)
+    comp.render_hash = compute_compilation_render_hash(manifest)
     exp_cover_hash = compute_cover_hash(
         key="compilation",
         title=effective_title,
@@ -2810,62 +4072,110 @@ def _render_compilation(
     frame_src = Path(manifest.source.analysis_video)
     if not frame_src.exists():
         frame_src = src_video
-    w = manifest.source.width or 1920
-    h = manifest.source.height or 1080
+    src_w = manifest.source.width or 1920
+    src_h = manifest.source.height or 1080
+    w, h = (1080, 1920) if is_portrait else (src_w, src_h)
     fps = manifest.source.fps or 30.0
 
     concat_files: list[Path] = []
     active_cuts = get_active_delete_spans(manifest, cfg) if manifest.clean_cut.apply_to_clips else []
-    clean_vid, masked_ass, audio_mask_spans, mask_spans = (
+    clean_vid, masked_ass, audio_mask_spans, mask_spans, visual_mask_regions = (
         _prepare_mask_render_context(
             manifest,
             store.work_dir / "masked_subs",
             hash_key=comp.render_hash or run_id,
             cfg=cfg,
+            store=store,
         )
         if manifest.clean_cut.apply_to_clips
-        else (None, None, [], [])
+        else (None, None, [], [], [])
     )
-    store.log(f"[render] 开始合成切片精选集 ({len(enabled_clips)} 支已选切片，预估总长 {est_dur_s:.1f}s)")
+    store.log(
+        f"[render] 开始合成切片精选集 ({len(enabled_clips)} 支已选切片，布局: {screen_layout} / 导航: {nav_style} / 色系: {nav_color_scheme}，预估总长 {est_dur_s:.1f}s)"
+    )
 
+    nav_labels = [(c.cover_title or c.title).strip() or f"切片 {i}" for i, c in enumerate(enabled_clips, 1)]
+    src_ch = (manifest.metadata.channel_zh or manifest.metadata.channel or "").strip()
+    src_guest = (manifest.metadata.guest_zh or "").strip()
+    comp_sub = "  ·  ".join(p for p in (src_ch, src_guest, published_date.strip()) if p)
+    src_dur_txt = _fmt_dur(float(manifest.source.duration_s or 0.0)) if manifest.source.duration_s else ""
     for idx, clip in enumerate(enabled_clips, 1):
-        # 1. Chapter title card
-        card_mp4 = tmp_dir / f"card_{idx:02d}.mp4"
-        card_title = (clip.cover_title or clip.title).strip()
-        part_tag = (
-            CATEGORY_LABELS_ZH.get(clip.categories[0], clip.categories[0])
-            if clip.categories
-            else (clip.chapter_title or "切片精选")
-        )
-        portrait = select_best_frame_for_interval(
-            source_video=frame_src,
-            start_s=clip.start_s,
-            end_s=clip.end_s,
-            work_dir=store.work_dir,
-            cache_key=f"comp_{comp.render_hash}_{idx:02d}",
-            hero_pool=hero_pool,
-            fallback_index=idx - 1,
-            prefer_two_shot=prefer_two_shot,
-        )
-        _create_title_card_video(
-            width=w,
-            height=h,
-            fps=fps,
-            duration_s=card_dur,
-            fade_s=card_fade,
-            group_label=part_tag,
-            card_title=card_title,
-            card_index=idx,
-            out_mp4=card_mp4,
-            use_vt=use_vt,
-            meta_parts=meta_parts,
-            portrait_frame=portrait,
-            enable_pip=True,
-            index_text="",
-        )
-        concat_files.append(card_mp4)
+        # 1. Optional title card before clip (when nav_style in ("title_card", "both"))
+        if has_title_card:
+            card_mp4 = tmp_dir / f"card_{idx:02d}.mp4"
+            card_title = (clip.cover_title or clip.title).strip()
+            part_tag = (
+                CATEGORY_LABELS_ZH.get(clip.categories[0], clip.categories[0])
+                if clip.categories
+                else (clip.chapter_title or "切片精选")
+            )
+            portrait = select_best_frame_for_interval(
+                source_video=frame_src,
+                start_s=clip.start_s,
+                end_s=clip.end_s,
+                work_dir=store.work_dir,
+                cache_key=f"comp_{comp.render_hash}_{idx:02d}",
+                hero_pool=hero_pool,
+                fallback_index=idx - 1,
+                prefer_two_shot=prefer_two_shot,
+            )
+            _create_title_card_video(
+                width=w,
+                height=h,
+                fps=fps,
+                duration_s=card_dur,
+                fade_s=card_fade,
+                group_label=part_tag,
+                card_title=card_title,
+                card_index=idx,
+                out_mp4=card_mp4,
+                use_vt=use_vt,
+                meta_parts=meta_parts,
+                portrait_frame=portrait,
+                enable_pip=True,
+                index_text="",
+                color_scheme=nav_color_scheme,
+                custom_accent=nav_custom_accent,
+            )
+            concat_files.append(card_mp4)
 
-        # 2. Clip segment (re-cut cleanly if active ad/sensitive cuts overlap and clip cache is stale)
+        nav_png: Path | None = None
+        portrait_vid_y: int | None = None
+        portrait_vid_h: int | None = None
+        if is_portrait:
+            nav_png = tmp_dir / f"nav_portrait_{idx:02d}.png"
+            ov_img, portrait_vid_y, portrait_vid_h = compose_portrait_frame_overlay_image(
+                width=w,
+                height=h,
+                title=effective_title,
+                subtitle=comp_sub,
+                badge_text="中长集锦",
+                labels=nav_labels,
+                active_index=idx - 1,
+                show_nav=has_top_nav,
+                active_meta_title=(clip.cover_title or clip.title).strip(),
+                active_meta_summary=(clip.summary or clip.hook or clip.key_quote or "").strip(),
+                meta_channel=src_ch,
+                meta_guest=src_guest,
+                meta_date=published_date.strip(),
+                source_duration_text=src_dur_txt,
+                total_duration_text=_fmt_dur(est_dur_s),
+                color_scheme=nav_color_scheme,
+                custom_accent=nav_custom_accent,
+            )
+            ov_img.save(nav_png, format="PNG")
+        elif has_top_nav:
+            nav_png = tmp_dir / f"nav_{idx:02d}.png"
+            compose_nav_bar_overlay_image(
+                width=w,
+                height=h,
+                labels=nav_labels,
+                active_index=idx - 1,
+                color_scheme=nav_color_scheme,
+                custom_accent=nav_custom_accent,
+            ).save(nav_png, format="PNG")
+
+        # 2. Obtain clean base clip segment (reuse cached standalone clip if up-to-date)
         clip_masks = (
             get_overlapping_mask_payload(clip.start_s, clip.end_s, manifest, cfg)
             if manifest.clean_cut.apply_to_clips
@@ -2878,7 +4188,7 @@ def _render_compilation(
             manifest.source.subtitle_sha256,
             mask_payload=clip_masks,
         )
-        clip_mp4 = (
+        base_mp4: Path | None = (
             Path(clip.output_file)
             if (
                 clip.output_file
@@ -2888,15 +4198,13 @@ def _render_compilation(
             )
             else None
         )
-        if clip_mp4:
-            concat_files.append(clip_mp4)
-        else:
-            seg_mp4 = tmp_dir / f"seg_{idx:02d}.mp4"
+        if base_mp4 is None:
+            raw_seg_mp4 = tmp_dir / f"raw_seg_{idx:02d}.mp4"
             fade_ms = int(cfg.get("boundary", {}).get("audio_fade_ms", 25))
-            ok, enc, err = _render_single_clip(
+            ok, _, err = _render_single_clip(
                 src_video,
                 clip,
-                seg_mp4,
+                raw_seg_mp4,
                 fade_ms,
                 use_vt,
                 cut_spans=active_cuts,
@@ -2905,11 +4213,36 @@ def _render_compilation(
                 masked_ass_path=masked_ass,
                 audio_mask_spans=audio_mask_spans,
                 mask_spans=mask_spans,
+                visual_mask_regions=visual_mask_regions,
+                video_size=(src_w, src_h),
             )
-            if ok and seg_mp4.exists():
-                concat_files.append(seg_mp4)
+            if ok and raw_seg_mp4.exists():
+                base_mp4 = raw_seg_mp4
             else:
                 store.log(f"[render] 精选集分段 {clip.clip_id} 截取失败: {err}")
+                continue
+
+        # 3. Composite layout / navigation bar overlay when portrait or has_top_nav (standalone clip stays clean)
+        if nav_png is not None:
+            seg_mp4 = tmp_dir / f"seg_{idx:02d}.mp4"
+            ok_nav, _, err_nav = _overlay_nav_bar_on_video(
+                base_mp4,
+                nav_png,
+                seg_mp4,
+                width=w,
+                height=h,
+                fps=fps,
+                use_vt=use_vt,
+                video_y=portrait_vid_y if is_portrait else None,
+                video_h=portrait_vid_h if is_portrait else None,
+            )
+            if ok_nav and seg_mp4.exists():
+                concat_files.append(seg_mp4)
+            else:
+                store.log(f"[render] 精选集分段 {clip.clip_id} 叠加导航/布局失败，回退原分段: {err_nav}")
+                concat_files.append(base_mp4)
+        else:
+            concat_files.append(base_mp4)
 
     if not concat_files:
         store.log("[render] 精选集无有效拼接分段")
@@ -2921,7 +4254,7 @@ def _render_compilation(
         encoding="utf-8",
     )
     raw_mp4 = tmp_dir / "compilation_raw.mp4"
-    res_cat = subprocess.run(
+    res_cat = run_cancellable_subprocess(
         [
             "ffmpeg",
             "-y",
@@ -2943,7 +4276,7 @@ def _render_compilation(
         text=True,
     )
     if res_cat.returncode != 0:
-        res_fb = subprocess.run(
+        res_fb = run_cancellable_subprocess(
             [
                 "ffmpeg",
                 "-y",
@@ -2985,7 +4318,7 @@ def _render_compilation(
             if manifest.clean_cut.apply_to_clips
             else "原片直出(未关联)"
         )
-        _generate_compilation_cover(
+        if _generate_compilation_cover(
             manifest=manifest,
             store=store,
             cfg=cfg,
@@ -2993,9 +4326,9 @@ def _render_compilation(
             published_date=published_date,
             cover_path=cover_jpg,
             total_duration_s=est_dur_s,
-        )
-        comp.cover_file = str(cover_jpg)
-        comp.cover_hash = exp_cover_hash
+        ):
+            comp.cover_file = str(cover_jpg)
+            comp.cover_hash = exp_cover_hash
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         store.append_receipt(
             run_id=run_id,
@@ -3003,7 +4336,7 @@ def _render_compilation(
             actor="system",
             action="render_compilation",
             elapsed_ms=elapsed_ms,
-            summary=f"切片精选集完成: {out_mp4.name}（包含 {len(enabled_clips)} 支已选切片，插入片头卡片 {len(enabled_clips)} 张，总长 {est_dur_s:.1f}s）",
+            summary=f"切片精选集完成: {out_mp4.name}（包含 {len(enabled_clips)} 支已选切片，顶部常驻导航条 {len(enabled_clips)} 分段高亮，总长 {est_dur_s:.1f}s）",
             details={
                 "output_file": str(out_mp4),
                 "cover_file": comp.cover_file,
@@ -3074,6 +4407,7 @@ def _render_clean_cut(
         manifest=manifest,
         cfg=cfg,
         published_date=published_date,
+        theme="crimson",
     )
 
     if cc.render_hash == cc.last_rendered_hash:
@@ -3105,18 +4439,19 @@ def _render_clean_cut(
             )
             return out_mp4
 
-    clean_vid, masked_ass, audio_mask_spans, mask_spans = _prepare_mask_render_context(
+    clean_vid, masked_ass, audio_mask_spans, mask_spans, visual_mask_regions = _prepare_mask_render_context(
         manifest,
         store.work_dir / "clean_cut_masks",
         hash_key=cc.render_hash or run_id,
         cfg=cfg,
+        store=store,
     )
     ad_cnt = sum(1 for x in active_segs if x.kind == "ad")
-    pol_del_cnt = sum(1 for x in active_segs if x.kind == "political_sensitive") - len(mask_spans)
-    pol_mask_cnt = len(mask_spans)
-    precise_copy = should_use_precise_copy(manifest, cfg) and not mask_spans
+    pol_del_cnt = sum(1 for x in active_segs if x.kind == "political_sensitive" and not is_visual_ocr_segment(x)) - len(mask_spans)
+    pol_mask_cnt = len(mask_spans) + len(visual_mask_regions)
+    precise_copy = should_use_precise_copy(manifest, cfg) and not mask_spans and not visual_mask_regions
     store.log(
-        f"[render] 开始渲染全片净版: 生效 {len(active_segs)} 段（去广 {ad_cnt} / 删敏 {max(0, pol_del_cnt)} / 遮蔽 {pol_mask_cnt}，时长变化 -{saved_s:.1f}s），"
+        f"[render] 开始渲染全片净版: 生效 {len(active_segs)} 段（去广 {ad_cnt} / 删敏 {max(0, pol_del_cnt)} / 遮蔽 {pol_mask_cnt} [含画面模糊 {len(visual_mask_regions)}]，时长变化 -{saved_s:.1f}s），"
         f"模式={'极速无损' if precise_copy else '帧精准硬件重编'}"
     )
 
@@ -3136,6 +4471,8 @@ def _render_clean_cut(
         masked_ass_path=masked_ass,
         audio_mask_spans=audio_mask_spans,
         mask_spans=mask_spans,
+        visual_mask_regions=visual_mask_regions,
+        video_size=(manifest.source.width or 1920, manifest.source.height or 1080),
     )
     if not ok or not out_mp4.exists():
         store.log(f"[render] 全片净版渲染失败: {err}")
@@ -3311,14 +4648,14 @@ def _write_markdown_deliverables(manifest: ProjectManifest, output_dir: Path) ->
         if should_insert_title_card(manifest.remix.card_mode, idx, gk, last_gk):
             est_cards += 1
         last_gk = gk
-    est_total_s = speech_total_s + est_cards * (manifest.remix.card_duration_s if manifest.remix.card_mode != "none" else 0.0)
+    est_total_s = speech_total_s
     src_dur = max(1.0, float(manifest.source.duration_s or 1.0))
     ratio_pct = (est_total_s / src_dur) * 100.0 if manifest.source.duration_s else 0.0
 
     rmx_lines = [
         f"# {manifest.remix.title}",
         "",
-        f"> 卡片模式：`{manifest.remix.card_mode}`（{est_cards} 张卡） | 板块：{len({remix_item_group_key(x) for x in enabled_remix})} 组 | 段落：{len(enabled_remix)} 段 | 预估总长：{_fmt_dur(est_total_s)}（人声 {_fmt_dur(speech_total_s)}，占原片 {ratio_pct:.1f}%） | BGM：`{'开' if manifest.remix.enable_bgm else '关'}` | 音效：`{'开' if manifest.remix.enable_sfx else '关'}`",
+        f"> 导航模式：`{manifest.remix.card_mode}`（顶部常驻 {est_cards} 分段） | 板块：{len({remix_item_group_key(x) for x in enabled_remix})} 组 | 段落：{len(enabled_remix)} 段 | 预估总长：{_fmt_dur(est_total_s)}（人声 {_fmt_dur(speech_total_s)}，占原片 {ratio_pct:.1f}%） | BGM：`{'开' if manifest.remix.enable_bgm else '关'}` | 音效：`{'开' if manifest.remix.enable_sfx else '关'}`",
     ]
     if manifest.remix.editorial_thesis:
         rmx_lines += ["", f"> 总编策展思路：{manifest.remix.editorial_thesis}"]
@@ -3400,15 +4737,16 @@ def run_render_stage(
     failed_count = 0
     apply_links = bool(manifest.clean_cut.apply_to_clips)
     active_cuts = get_active_delete_spans(manifest, cfg) if apply_links else []
-    clean_vid, masked_ass, audio_mask_spans, mask_spans = (
+    clean_vid, masked_ass, audio_mask_spans, mask_spans, visual_mask_regions = (
         _prepare_mask_render_context(
             manifest,
             store.work_dir / "masked_subs",
             hash_key=manifest.clean_cut.render_hash or run_id,
             cfg=cfg,
+            store=store,
         )
         if apply_links
-        else (None, None, [], [])
+        else (None, None, [], [], [])
     )
 
     if "clips" in targets:
@@ -3480,6 +4818,8 @@ def run_render_stage(
                 masked_ass_path=masked_ass,
                 audio_mask_spans=audio_mask_spans,
                 mask_spans=mask_spans,
+                visual_mask_regions=visual_mask_regions,
+                video_size=(manifest.source.width or 1920, manifest.source.height or 1080),
             )
             celapsed = int((time.monotonic() - ct0) * 1000)
 
@@ -3659,15 +4999,16 @@ def render_single_clip_and_cover(
     hero_pool = _build_hero_pool_for_manifest(frame_src, manifest, store, cfg, prefer_two_shot)
     apply_links = bool(manifest.clean_cut.apply_to_clips)
     active_cuts = get_active_delete_spans(manifest, cfg) if apply_links else []
-    clean_vid, masked_ass, audio_mask_spans, mask_spans = (
+    clean_vid, masked_ass, audio_mask_spans, mask_spans, visual_mask_regions = (
         _prepare_mask_render_context(
             manifest,
             store.work_dir / "masked_subs",
             hash_key=manifest.clean_cut.render_hash or "single",
             cfg=cfg,
+            store=store,
         )
         if apply_links
-        else (None, None, [], [])
+        else (None, None, [], [], [])
     )
 
     clip_masks = get_overlapping_mask_payload(clip.start_s, clip.end_s, manifest, cfg) if apply_links else []
@@ -3727,6 +5068,8 @@ def render_single_clip_and_cover(
         masked_ass_path=masked_ass,
         audio_mask_spans=audio_mask_spans,
         mask_spans=mask_spans,
+        visual_mask_regions=visual_mask_regions,
+        video_size=(manifest.source.width or 1920, manifest.source.height or 1080),
     )
     if not ok:
         store.log(f"[render] 切片 {clip.clip_id} 渲染失败: {err}")

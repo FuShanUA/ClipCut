@@ -58,6 +58,7 @@ class VideoMetadata(BaseModel):
     guest_zh: str = ""
     channel_zh: str = ""
     original_theme_zh: str = ""
+    full_summary_zh: str = ""
     published_date: str = ""
     chapters: list[Chapter] = Field(default_factory=list)
     chapter_audits: list[ChapterAudit] = Field(default_factory=list)
@@ -166,6 +167,8 @@ class PublishRecord(BaseModel):
     progress_stage: str = ""
     message: str = ""
     error: str | None = None
+    error_code: str = ""
+    solution: str = ""
 
 
 class SubtitleRepairItem(BaseModel):
@@ -231,6 +234,7 @@ class RemixConfig(BaseModel):
     enabled: bool = True
     title: str = "高光混剪集锦"
     cover_title: str = ""
+    publish_desc: str = ""
     editorial_thesis: str = ""
     card_mode: Literal["group", "every", "none"] = "group"
     card_duration_s: float = 0.9
@@ -241,6 +245,8 @@ class RemixConfig(BaseModel):
     sfx_volume: float = 0.35
     bgm_path: str | None = None
     sfx_path: str | None = None
+    source_mode: Literal["compilation", "manual_clips", "prompt", "ai_auto"] = "compilation"
+    custom_prompt: str = ""
     source_clip_ids: list[str] | None = None
     manual_script_locked: bool = False
     items: list[RemixItem] = Field(default_factory=list)
@@ -258,6 +264,7 @@ class CompilationConfig(BaseModel):
     enabled: bool = True
     title: str = "切片精选集"
     cover_title: str = ""
+    publish_desc: str = ""
     clip_ids: list[str] | None = None
     card_duration_s: float = 1.8
     card_fade_s: float = 0.2
@@ -270,16 +277,28 @@ class CompilationConfig(BaseModel):
     publish_records: list[PublishRecord] = Field(default_factory=list)
 
 
+class VisualMaskBox(BaseModel):
+    x: float
+    y: float
+    w: float
+    h: float
+    text: str = ""
+
+
 class CutSegment(BaseModel):
     cut_id: str
     kind: Literal["ad", "political_sensitive"] = "ad"
     subtype: str = ""
     enabled: bool = True
-    detector: Literal["llm", "visual", "manual"] = "llm"
-    action: Literal["inherit", "delete", "mask"] = "inherit"
+    detector: Literal["llm", "visual", "visual_ocr", "manual"] = "llm"
+    action: Literal["inherit", "delete", "mask", "precise_mask"] = "inherit"
     recommended_action: Literal["delete", "mask"] = "delete"
     sensitive_terms_zh: list[str] = Field(default_factory=list)
     sensitive_terms_en: list[str] = Field(default_factory=list)
+    precise_terms_zh: list[str] = Field(default_factory=list)
+    precise_terms_en: list[str] = Field(default_factory=list)
+    precise_terms_extracted: bool = False
+    visual_boxes: list[VisualMaskBox] = Field(default_factory=list)
     start_utt: int | None = None
     end_utt: int | None = None
     start_s: float
@@ -294,10 +313,11 @@ class CleanCutConfig(BaseModel):
     enabled: bool = False
     title: str = ""
     cover_title: str = ""
+    publish_desc: str = ""
     cut_ads: bool = False
     cut_political_sensitive: bool = False
     sensitivity: Literal["strict", "balanced", "loose"] = "strict"
-    political_action: Literal["auto", "delete", "mask"] = "delete"
+    political_action: Literal["auto", "delete", "mask", "precise_mask"] = "delete"
     apply_to_clips: bool = True
     cut_mode: Literal["auto", "precise", "reencode"] = "auto"
     scanned_at: str | None = None

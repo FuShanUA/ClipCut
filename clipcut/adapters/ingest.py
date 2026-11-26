@@ -515,6 +515,18 @@ def ingest_source(
             metadata=metadata,
             utterances=utterances,
         )
+        try:
+            from ..config import load_editorial_config
+
+            cf_cfg = load_editorial_config().get("content_filter", {}) or {}
+            def_sens = str(cf_cfg.get("sensitivity") or "").strip().lower()
+            if def_sens in ("strict", "balanced", "loose"):
+                manifest.clean_cut.sensitivity = def_sens  # type: ignore[assignment]
+            def_action = str(cf_cfg.get("political_action") or "").strip().lower()
+            if def_action in ("auto", "delete", "mask", "precise_mask"):
+                manifest.clean_cut.political_action = def_action  # type: ignore[assignment]
+        except Exception:
+            pass
 
     store.save(manifest)
     store.append_receipt(

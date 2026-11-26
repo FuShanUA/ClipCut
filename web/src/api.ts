@@ -1,8 +1,10 @@
 import type {
   ContentFilterConfig,
+  NavigationConfig,
   PlatformStatus,
   ProjectManifest,
   ProjectSummary,
+  PublishJobInfo,
   Receipt,
   RenderedAssetsInfo,
   ScanResult,
@@ -60,19 +62,25 @@ export const api = {
     req<{
       manifest: ProjectManifest;
       job: { running: boolean; cancelling?: boolean; cancelled?: boolean; stages?: string[]; error?: string | null };
+      publish_jobs?: PublishJobInfo[];
       assets?: RenderedAssetsInfo;
       can_mask?: boolean;
     }>(`/api/projects/${projectId}`),
 
-  runStages: (projectId: string, stages: string[], forceRender = false) =>
+  runStages: (projectId: string, stages: string[], forceRender = false, renderTargets?: string[]) =>
     req<{ started: boolean; job_id: string }>(`/api/projects/${projectId}/run`, {
       method: "POST",
-      body: JSON.stringify({ stages, force_render: forceRender }),
+      body: JSON.stringify({
+        stages,
+        force_render: forceRender,
+        ...(renderTargets ? { render_targets: renderTargets } : {}),
+      }),
     }),
 
-  cancelJob: (projectId: string) =>
+  cancelJob: (projectId: string, payload?: { job_id?: string; target?: string }) =>
     req<{ cancelled: boolean; job_id?: string; message: string }>(`/api/projects/${projectId}/cancel`, {
       method: "POST",
+      ...(payload ? { body: JSON.stringify(payload) } : {}),
     }),
 
   getRenderedAssets: (projectId: string) =>
@@ -151,6 +159,15 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
+  patchMetadata: (
+    projectId: string,
+    patch: { channel_zh?: string; guest_zh?: string; published_date?: string }
+  ) =>
+    req<{ manifest: ProjectManifest }>(`/api/projects/${projectId}/metadata`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+
   renderRemix: (projectId: string, force = true) =>
     req<{ started: boolean; job_id: string }>(
       `/api/projects/${projectId}/remix/render?force=${force}`,
@@ -163,6 +180,11 @@ export const api = {
     req<{ manifest: ProjectManifest }>(`/api/projects/${projectId}/compilation`, {
       method: "PATCH",
       body: JSON.stringify(patch),
+    }),
+
+  suggestCompilationTitle: (projectId: string) =>
+    req<{ manifest: ProjectManifest; title: string }>(`/api/projects/${projectId}/compilation/suggest-title`, {
+      method: "POST",
     }),
 
   renderCompilation: (projectId: string, force = true) =>
@@ -196,6 +218,23 @@ export const api = {
       }
     ),
 
+  suggestCleanCutTitle: (projectId: string) =>
+    req<{ manifest: ProjectManifest; title: string }>(`/api/projects/${projectId}/clean-cut/suggest-title`, {
+      method: "POST",
+    }),
+
+  extractPreciseTerms: (
+    projectId: string,
+    payload: { force?: boolean; cut_ids?: string[] } = {}
+  ) =>
+    req<{ manifest: ProjectManifest; updated_count: number }>(
+      `/api/projects/${projectId}/clean-cut/extract-precise-terms`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    ),
+
   refreshCover: (projectId: string, target: string) =>
     req<{ refreshed: string; manifest: ProjectManifest }>(`/api/projects/${projectId}/covers/refresh`, {
       method: "POST",
@@ -226,6 +265,48 @@ export const api = {
   ) =>
     req<{ started: boolean; job_id: string; target: string; platforms: string[] }>(
       `/api/projects/${projectId}/publish`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    ),
+
+  publishBatch: (
+    projectId: string,
+    payload: {
+      targets?: string[];
+      platforms: string[];
+      is_public?: boolean;
+      collection?: string;
+      skip_already_published?: boolean;
+      extra_tags?: string[];
+    }
+  ) =>
+    req<{
+      started: boolean;
+      job_id: string;
+      targets: string[];
+      platforms: string[];
+      collection: string;
+      skipped_unrendered: string[];
+      skipped_already_published: string[];
+    }>(`/api/projects/${projectId}/publish/batch`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  suggestPublishDesc: (projectId: string, target: string) =>
+    req<{ manifest: ProjectManifest; desc: string }>(`/api/projects/${projectId}/publish/suggest-desc`, {
+      method: "POST",
+      body: JSON.stringify({ target }),
+    }),
+
+  resetPublishRecords: (
+    projectId: string,
+    payload: { target: string; platform?: string | null; only_errors?: boolean }
+  ) =>
+    req<{ manifest: ProjectManifest; removed: string[] }>(
+      `/api/projects/${projectId}/publish/reset`,
       {
         method: "POST",
         body: JSON.stringify(payload),
@@ -302,5 +383,20 @@ export const api = {
     req<{ reset: boolean } & ContentFilterConfig>("/api/config/content-filter/reset", {
       method: "POST",
       body: JSON.stringify({ profile: profile ?? null }),
+    }),
+
+  getNavigationConfig: () => req<NavigationConfig>("/api/config/navigation"),
+
+  saveNavigationConfig: (
+    payload: Partial<
+      Pick<
+        NavigationConfig,
+        "style" | "remix_style" | "compilation_style" | "screen_layout" | "color_scheme" | "custom_accent"
+      >
+    >
+  ) =>
+    req<{ saved: boolean } & NavigationConfig>("/api/config/navigation", {
+      method: "PUT",
+      body: JSON.stringify(payload),
     }),
 };

@@ -363,31 +363,45 @@ button.danger:hover:not(:disabled) {
 }
 
 .split-handle-h {
-  flex: 0 0 6px;
-  height: 6px;
+  flex: 0 0 10px;
+  height: 10px;
   width: 100%;
   cursor: row-resize;
+  background: var(--bg-2);
+  border-top: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-strong);
+  transition: background-color 120ms ease, border-color 120ms ease;
 }
 
 .split-handle-h::before {
   left: 0;
   right: 0;
   top: 50%;
-  height: 1px;
+  height: 0;
   transform: translateY(-50%);
+}
+
+.split-handle-h:hover,
+.split-handle-h:focus-visible,
+.split-handle-h.dragging {
+  background: var(--accent-dim);
+  border-top-color: var(--accent);
+  border-bottom-color: var(--accent);
 }
 
 .split-handle-h:hover::before,
 .split-handle-h:focus-visible::before,
 .split-handle-h.dragging::before {
-  height: 2px;
+  height: 0;
 }
 
 .split-handle-h::after {
   top: 50%;
   left: 50%;
-  width: 38px;
+  width: 52px;
   height: 4px;
+  background: var(--text-2);
+  opacity: 0.85;
   transform: translate(-50%, -50%);
 }
 
@@ -469,6 +483,11 @@ button.danger:hover:not(:disabled) {
 .tag.dirty {
   background: var(--red-dim);
   color: #fca5a5;
+}
+
+.tag.running {
+  background: var(--accent-dim);
+  color: #fcd34d;
 }
 
 /* Center pane */
@@ -867,4 +886,62 @@ details.fold > summary:hover {
   background: var(--red-dim);
   color: #fca5a5;
   border-color: rgba(248, 113, 113, 0.45);
+}
+
+.pub-error-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.pub-error-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  background: var(--red-dim);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.pub-error-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pub-error-title {
+  font-weight: 600;
+  color: #fecaca;
+}
+
+.pub-error-msg {
+  color: var(--text-1);
+  word-break: break-word;
+}
+
+.pub-error-solution {
+  color: #fde68a;
+  word-break: break-word;
+}
+
+.pub-error-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pub-login-notice {
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text-1);
+  font-size: 12px;
+  line-height: 1.45;
 }

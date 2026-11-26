@@ -83,6 +83,24 @@ export interface PublishRecord {
   progress_stage?: string;
   message: string;
   error: string | null;
+  error_code?: string;
+  solution?: string;
+}
+
+export interface PublishJobInfo {
+  job_id: string;
+  kind: "single" | "batch";
+  running: boolean;
+  cancelling?: boolean;
+  cancelled?: boolean;
+  targets: string[];
+  current_target: string | null;
+  completed_targets: string[];
+  failed_targets: string[];
+  skipped_targets?: string[];
+  platforms: string[];
+  collection: string;
+  error?: string | null;
 }
 
 export interface SubtitleRepairItem {
@@ -110,6 +128,10 @@ export interface PlatformStatus {
   python_ready: boolean;
   script: string;
   hint: string;
+  login_running?: boolean;
+  login_returncode?: number | null;
+  login_updated_at?: string;
+  login_message?: string;
 }
 
 export interface ClipItem {
@@ -165,10 +187,13 @@ export interface RemixItem {
   reason: string;
 }
 
+export type RemixSourceMode = "compilation" | "manual_clips" | "prompt" | "ai_auto";
+
 export interface RemixConfig {
   enabled: boolean;
   title: string;
   cover_title?: string;
+  publish_desc?: string;
   editorial_thesis?: string;
   card_mode: "group" | "every" | "none";
   card_duration_s: number;
@@ -177,6 +202,8 @@ export interface RemixConfig {
   enable_bgm: boolean;
   bgm_volume: number;
   sfx_volume: number;
+  source_mode?: RemixSourceMode;
+  custom_prompt?: string;
   source_clip_ids?: string[] | null;
   manual_script_locked?: boolean;
   items: RemixItem[];
@@ -193,6 +220,7 @@ export interface CompilationConfig {
   enabled: boolean;
   title: string;
   cover_title?: string;
+  publish_desc?: string;
   clip_ids?: string[] | null;
   card_duration_s: number;
   card_fade_s: number;
@@ -205,16 +233,30 @@ export interface CompilationConfig {
   publish_records?: PublishRecord[];
 }
 
+export type PoliticalAction = "auto" | "delete" | "mask" | "precise_mask";
+
+export interface VisualMaskBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  text?: string;
+}
+
 export interface CutSegment {
   cut_id: string;
   kind: "ad" | "political_sensitive";
   subtype?: string;
   enabled: boolean;
-  detector: "llm" | "visual" | "manual";
-  action?: "inherit" | "delete" | "mask";
+  detector: "llm" | "visual" | "visual_ocr" | "manual";
+  action?: "inherit" | "delete" | "mask" | "precise_mask";
   recommended_action?: "delete" | "mask";
   sensitive_terms_zh?: string[];
   sensitive_terms_en?: string[];
+  precise_terms_zh?: string[];
+  precise_terms_en?: string[];
+  precise_terms_extracted?: boolean;
+  visual_boxes?: VisualMaskBox[];
   start_utt?: number | null;
   end_utt?: number | null;
   start_s: number;
@@ -229,10 +271,11 @@ export interface CleanCutConfig {
   enabled: boolean;
   title: string;
   cover_title?: string;
+  publish_desc?: string;
   cut_ads: boolean;
   cut_political_sensitive: boolean;
   sensitivity: "strict" | "balanced" | "loose";
-  political_action?: "auto" | "delete" | "mask";
+  political_action?: PoliticalAction;
   apply_to_clips: boolean;
   cut_mode: "auto" | "precise" | "reencode";
   scanned_at?: string | null;
@@ -266,6 +309,7 @@ export interface ProjectManifest {
     guest_zh: string;
     channel_zh: string;
     original_theme_zh: string;
+    full_summary_zh?: string;
     published_date?: string;
     metadata_source: string;
     chapters: { index: number; title: string; start_s: number; end_s: number }[];
@@ -341,6 +385,25 @@ export interface PoliticalProfile {
 
 export interface ContentFilterConfig {
   default_sensitivity: "strict" | "balanced" | "loose";
-  default_political_action?: "auto" | "delete" | "mask";
+  default_political_action?: PoliticalAction;
   political_profiles: Record<"strict" | "balanced" | "loose", PoliticalProfile>;
+}
+
+export interface NavColorPreset {
+  id: string;
+  label: string;
+  hex: string;
+}
+
+export type NavStyleMode = "top_nav" | "both" | "title_card";
+export type ScreenLayoutMode = "portrait" | "landscape";
+
+export interface NavigationConfig {
+  style: NavStyleMode;
+  remix_style: NavStyleMode;
+  compilation_style: NavStyleMode;
+  screen_layout: ScreenLayoutMode;
+  color_scheme: string;
+  custom_accent: string;
+  presets?: NavColorPreset[];
 }

@@ -228,11 +228,23 @@ def run_existing_project_stages(
             )
             _mark_stage(manifest, store, "ingest", "completed", "重新载入完成")
 
+        def _run_replan_remix(m: ProjectManifest) -> ProjectManifest:
+            m = plan_remix_from_clips(m, store, cfg, run_id)
+            if m.remix.items:
+                try:
+                    from ..render.renderer import refresh_single_cover
+
+                    refresh_single_cover(m, store, cfg, "remix")
+                    m = store.load()
+                except Exception:
+                    pass
+            return m
+
         stage_runners: dict[str, Any] = {
             "signals": lambda m: run_signals_stage(m, store, run_id),
             "analyze": lambda m: run_analyze_stage(m, store, cfg, run_id),
             "verify_and_plan": lambda m: run_verify_and_plan_stage(m, store, cfg, run_id),
-            "replan_remix": lambda m: plan_remix_from_clips(m, store, cfg, run_id),
+            "replan_remix": _run_replan_remix,
             "scan_cuts": lambda m: scan_cut_segments(m, store, cfg, run_id, scan_ads=True, scan_political=True),
             "render": lambda m: run_render_stage(
                 m, store, cfg, run_id, force=force_render, render_targets=render_targets
@@ -341,9 +353,9 @@ def inspect_rendered_assets(manifest: ProjectManifest) -> dict[str, Any]:
     compilation_rendered = bool(manifest.compilation.output_file)
     clean_cut_rendered = bool(manifest.clean_cut.output_file)
     has_prior_stage = any(
-        st.status != "idle" or bool(st.finished_at) or bool(st.message)
+        st.status == "completed"
         for name, st in manifest.stages.items()
-        if name != "ingest"
+        if name in ("scan_cuts", "analyze", "verify_and_plan", "render")
     )
     has_prior_analysis = bool(
         manifest.clips
@@ -427,6 +439,8 @@ def reset_project_strategy(
     manifest.remix_only_pool = []
 
     manifest.remix.items = []
+    manifest.remix.source_mode = "compilation"
+    manifest.remix.custom_prompt = ""
     manifest.remix.source_clip_ids = None
     manifest.remix.manual_script_locked = False
     manifest.remix.title = "高光混剪集锦"
@@ -441,6 +455,8 @@ def reset_project_strategy(
     manifest.remix.rendered_filter_tag = ""
     manifest.remix.publish_records = []
 
+    manifest.compilation.title = "切片精选集"
+    manifest.compilation.cover_title = ""
     manifest.compilation.clip_ids = None
     manifest.compilation.render_hash = ""
     manifest.compilation.last_rendered_hash = ""
@@ -456,6 +472,16 @@ def reset_project_strategy(
     manifest.clean_cut.cover_title = ""
     manifest.clean_cut.cut_ads = False
     manifest.clean_cut.cut_political_sensitive = False
+    try:
+        cf_cfg = load_editorial_config().get("content_filter", {}) or {}
+        def_sens = str(cf_cfg.get("sensitivity") or "").strip().lower()
+        if def_sens in ("strict", "balanced", "loose"):
+            manifest.clean_cut.sensitivity = def_sens  # type: ignore[assignment]
+        def_action = str(cf_cfg.get("political_action") or "").strip().lower()
+        if def_action in ("auto", "delete", "mask", "precise_mask"):
+            manifest.clean_cut.political_action = def_action  # type: ignore[assignment]
+    except Exception:
+        pass
     manifest.clean_cut.scanned_at = None
     manifest.clean_cut.render_hash = ""
     if delete_rendered_files:

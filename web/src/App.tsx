@@ -14,10 +14,13 @@ import type {
   ClipItem,
   ContentFilterConfig,
   CutSegment,
+  NavigationConfig,
   PlatformStatus,
+  PoliticalAction,
   PoliticalProfile,
   ProjectManifest,
   ProjectSummary,
+  PublishJobInfo,
   PublishRecord,
   Receipt,
   RemixItem,
@@ -40,7 +43,7 @@ const SENS_SHORT_LABELS: Record<"strict" | "balanced" | "loose", string> = {
 
 interface ComplianceSegmentHit {
   seg: CutSegment;
-  effAction: "delete" | "mask" | "passed" | "off";
+  effAction: "delete" | "mask" | "precise_mask" | "passed" | "off";
   reasonLabel: string;
 }
 
@@ -59,17 +62,48 @@ interface ComplianceSummary {
   overlappingSegs: ComplianceSegmentHit[];
 }
 
+function isVisualOcrSeg(seg: CutSegment): boolean {
+  return seg.detector === "visual_ocr" || Boolean(seg.visual_boxes && seg.visual_boxes.length > 0);
+}
+
 function resolveSegActionFrontend(
   seg: CutSegment,
   cc: CleanCutConfig | undefined,
   canMask: boolean
-): "delete" | "mask" {
-  if (seg.kind !== "political_sensitive" || !canMask) return "delete";
-  if (seg.action === "mask" || seg.action === "delete") return seg.action;
+): "delete" | "mask" | "precise_mask" {
+  if (seg.kind !== "political_sensitive") return "delete";
+  if (isVisualOcrSeg(seg)) {
+    if (seg.action === "delete") return "delete";
+    if (seg.action === "mask" || seg.action === "precise_mask") return seg.action;
+    return cc?.political_action === "precise_mask" ? "precise_mask" : "mask";
+  }
+  if (!canMask) return "delete";
+  if (seg.action === "precise_mask" || seg.action === "mask" || seg.action === "delete") return seg.action;
   const g = cc?.political_action || "delete";
+  if (g === "precise_mask") return "precise_mask";
   if (g === "mask") return "mask";
   if (g === "auto") return seg.recommended_action === "mask" ? "mask" : "delete";
   return "delete";
+}
+
+function getEffectiveMaskTerms(
+  seg: CutSegment,
+  effAct: "delete" | "mask" | "precise_mask"
+): { zh: string[]; en: string[] } {
+  const pZh = seg.precise_terms_zh || [];
+  const pEn = seg.precise_terms_en || [];
+  const sZh = seg.sensitive_terms_zh || [];
+  const sEn = seg.sensitive_terms_en || [];
+  if (effAct === "precise_mask") {
+    if (pZh.length > 0 || pEn.length > 0 || Boolean(seg.precise_terms_extracted)) {
+      return { zh: pZh, en: pEn };
+    }
+    return { zh: sZh, en: sEn };
+  }
+  if (effAct === "mask") {
+    return { zh: sZh, en: sEn };
+  }
+  return { zh: [], en: [] };
 }
 
 function mergeSpanPairs(spans: [number, number][], gap = 0.05): [number, number][] {
@@ -151,11 +185,22 @@ function summarizeIntervalsCompliance(
     }
 
     const act = resolveSegActionFrontend(seg, cc, canMask);
-    if (act === "mask") {
+    if (act === "mask" || act === "precise_mask") {
       maskCount += 1;
-      for (const tz of seg.sensitive_terms_zh || []) if (tz.trim()) maskTerms.add(tz.trim());
-      for (const te of seg.sensitive_terms_en || []) if (te.trim()) maskTerms.add(te.trim());
-      overlappingSegs.push({ seg, effAction: "mask", reasonLabel: "脱敏·遮蔽消音" });
+      if (!isVisualOcrSeg(seg)) {
+        const effTerms = getEffectiveMaskTerms(seg, act);
+        for (const tz of effTerms.zh) if (tz.trim()) maskTerms.add(tz.trim());
+        for (const te of effTerms.en) if (te.trim()) maskTerms.add(te.trim());
+      }
+      overlappingSegs.push({
+        seg,
+        effAction: act,
+        reasonLabel: isVisualOcrSeg(seg)
+          ? "脱敏·画面模糊"
+          : act === "precise_mask"
+            ? "脱敏·精准遮蔽"
+            : "脱敏·常规遮蔽",
+      });
     } else {
       polDelSpans.push([seg.start_s, seg.end_s]);
       overlappingSegs.push({ seg, effAction: "delete", reasonLabel: "脱敏·将删段" });
@@ -334,7 +379,7 @@ function getRenderBadge(
 const STAGE_SHORT_LABELS: Record<string, string> = {
   ingest: "载入",
   signals: "信号",
-  scan_cuts: "广敏分析",
+  scan_cuts: "广敏扫描",
   analyze: "分析",
   verify_and_plan: "复核",
   render: "渲染",
@@ -371,6 +416,150 @@ function fmtSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function hasCjkText(text: string): boolean {
+  return /[\u4e00-\u9fff]/.test(text || "");
+}
+
+function formatProgramContext(manifest: ProjectManifest): string {
+  const guest = (manifest.metadata.guest_zh || "").trim();
+  const channel = (manifest.metadata.channel_zh || manifest.metadata.channel || "").trim();
+  const theme = (manifest.metadata.original_theme_zh || "").trim();
+  if (guest && channel) return `${guest}做客${channel}的访谈`;
+  if (channel) return `${channel}本期节目`;
+  if (guest) return `${guest}本期访谈`;
+  if (theme) return `《${theme}》`;
+  return "本期节目";
+}
+
+function pickSpreadItems<T>(items: T[], maxCount: number): T[] {
+  if (maxCount <= 0 || items.length === 0) return [];
+  if (items.length <= maxCount) return [...items];
+  if (maxCount === 1) return [items[0]];
+  const indices: number[] = [];
+  for (let i = 0; i < maxCount; i += 1) {
+    const idx = Math.round((i * (items.length - 1)) / (maxCount - 1));
+    if (!indices.includes(idx)) indices.push(idx);
+  }
+  return indices.map((idx) => items[idx]);
+}
+
+function dedupeLabels(labels: string[], maxCount: number): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of labels) {
+    const s = (raw || "").trim();
+    if (!s) continue;
+    const key = s.replace(/\s+/g, "").toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+    if (out.length >= maxCount) break;
+  }
+  return out;
+}
+
+function buildDefaultCleanCutDesc(manifest: ProjectManifest): string {
+  const cached = (manifest.clean_cut?.publish_desc || "").trim();
+  if (cached) return cached;
+  const fullSummary = (manifest.metadata.full_summary_zh || "").trim();
+  if (fullSummary) return fullSummary;
+
+  const lead = formatProgramContext(manifest);
+  const theme = (manifest.metadata.original_theme_zh || "").trim();
+  let opening = `本期为${lead}完整内容。`;
+  if (theme && !lead.includes(theme)) {
+    opening =
+      lead.endsWith("访谈") || lead.endsWith("节目")
+        ? `本期为${lead}完整版，核心围绕“${theme}”展开深入对话。`
+        : `本期带来${lead}完整内容，核心围绕“${theme}”展开深入对话。`;
+  }
+
+  const topics = (manifest.topic_map || []).filter(
+    (t) => !t.is_filler && ((t.title || "").trim() || (t.summary || "").trim())
+  );
+  let detailLine = "";
+  if (topics.length > 0) {
+    if (topics.length <= 3) {
+      const parts: string[] = [];
+      let totalLen = 0;
+      for (const t of topics) {
+        const frag = (t.summary || t.title || "").trim().replace(/[。；;]+$/, "");
+        if (!frag) continue;
+        if (totalLen + frag.length > 260 && parts.length > 0) break;
+        parts.push(frag);
+        totalLen += frag.length + 1;
+      }
+      if (parts.length > 0) detailLine = `全片重点探讨：${parts.join("；")}。`;
+    } else {
+      const picked = pickSpreadItems(topics, 6);
+      const titles = dedupeLabels(
+        picked.map((t) => (t.title || (t.summary || "").slice(0, 24) || "").trim().replace(/[。；;]+$/, "")),
+        6
+      );
+      if (titles.length > 0) detailLine = `全片涵盖：${titles.join("；")}等核心议题。`;
+    }
+  } else if (manifest.clips.length > 0) {
+    const pickedClips = pickSpreadItems(manifest.clips, 6);
+    const titles = dedupeLabels(
+      pickedClips.map((c) => (c.title || "").trim().replace(/[。；;]+$/, "")),
+      6
+    );
+    if (titles.length > 0) detailLine = `全片涵盖：${titles.join("；")}等核心议题。`;
+  } else {
+    const rawDesc = (manifest.metadata.description || "").trim();
+    if (rawDesc && hasCjkText(rawDesc)) {
+      detailLine = rawDesc.slice(0, 220);
+    }
+  }
+  return detailLine ? `${opening}\n${detailLine}`.trim() : opening;
+}
+
+function buildDefaultRemixDesc(manifest: ProjectManifest): string {
+  const cached = (manifest.remix.publish_desc || "").trim();
+  if (cached) return cached;
+
+  const sortedItems = [...(manifest.remix.items || [])].sort((a, b) => a.order - b.order);
+  const activeItems = sortedItems.filter((x) => x.enabled);
+  const usedItems = activeItems.length > 0 ? activeItems : sortedItems;
+  const clipById = new Map(manifest.clips.map((c) => [c.clip_id, c]));
+
+  const rawLabels: string[] = [];
+  for (const it of usedItems) {
+    const srcTitle = it.source_clip_id ? (clipById.get(it.source_clip_id)?.title || "").trim() : "";
+    const cand =
+      (it.card_title || "").trim() ||
+      (it.group_label || "").trim() ||
+      srcTitle ||
+      (it.quote || "").trim().slice(0, 36);
+    if (cand) rawLabels.push(cand);
+  }
+  const uniqueLabels = dedupeLabels(rawLabels, 8);
+  const lead = formatProgramContext(manifest);
+  if (uniqueLabels.length > 0) {
+    const opening = `本视频为${lead}的高光混剪，浓缩串联全片核心观点与高能片段：`;
+    const bullets = uniqueLabels.map((lbl, idx) => `${idx + 1}. ${lbl}`).join("\n");
+    return `${opening}\n${bullets}`;
+  }
+  return `本视频为${lead}的高光混剪，提炼全片最具看点的核心观点与精彩对话。`;
+}
+
+function buildDefaultCompilationDesc(manifest: ProjectManifest, compilationClips: ClipItem[]): string {
+  const cached = (manifest.compilation?.publish_desc || "").trim();
+  if (cached) return cached;
+
+  const titles = dedupeLabels(
+    compilationClips.map((c) => (c.title || c.cover_title || "").trim()),
+    12
+  );
+  const lead = formatProgramContext(manifest);
+  if (titles.length > 0) {
+    const opening = `本视频为${lead}的精选片段合辑，完整收录以下核心内容：`;
+    const bullets = titles.map((t, idx) => `${idx + 1}. ${t}`).join("\n");
+    return `${opening}\n${bullets}`;
+  }
+  return `本视频为${lead}的精选片段合辑，收录全片核心精彩对话。`;
+}
+
 function bindOutsideClickDismiss(dialog: HTMLDialogElement | null, onClose: () => void) {
   if (!dialog || "closedBy" in HTMLDialogElement.prototype) return () => {};
   let pressedOutside = false;
@@ -395,6 +584,42 @@ function bindOutsideClickDismiss(dialog: HTMLDialogElement | null, onClose: () =
   };
 }
 
+function formatPublishErrorView(rec: PublishRecord): { errorText: string; solutionText: string } {
+  const platLabel = PLAT_LABELS[rec.platform] || rec.platform;
+  const rawErr = (rec.error || "").trim();
+  const isLegacyRawCmdTimeout = rawErr.startsWith("Command '[") && rawErr.includes("timed out");
+  let errorText = rawErr || rec.message || `${platLabel}上传失败`;
+  if (isLegacyRawCmdTimeout) {
+    const secMatch = rawErr.match(/timed out after\s+([\d.]+)\s+seconds/i);
+    const mins = secMatch ? Math.max(1, Math.round(Number(secMatch[1]) / 60)) : 30;
+    errorText = `${platLabel}上传超过 ${mins} 分钟无响应已超时终止（上传进程在传输阶段卡死）。`;
+  }
+  let solutionText = (rec.solution || "").trim();
+  if (!solutionText) {
+    if (rec.platform === "bilibili") {
+      solutionText =
+        "1) 检查网络或临时关闭/分流 VPN 代理（B站 UPOS 走国内直连，代理易导致分块卡死）；2) 点击「复位状态」后单独重试 B站上传；3) 若多次失败，点击「重扫码」刷新 Cookie 或到 B站创作中心网页端手动投稿。";
+    } else if (rec.platform === "wechat") {
+      solutionText =
+        "1) 先到视频号助手草稿箱确认是否已上传；2) 确认未开启代理拦截 channels.weixin.qq.com 并关闭其他微信登录窗口；3) 点击「重扫码」完成登录后再点「复位状态」并重试。";
+    } else {
+      solutionText = "1) 检查登录态与网络后点击「复位状态」；2) 重新发起上传。";
+    }
+  }
+  return { errorText, solutionText };
+}
+
+function formatShortClock(iso?: string): string {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "";
+    return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+  } catch {
+    return "";
+  }
+}
+
 function renderPubBadges(records?: PublishRecord[]) {
   if (!records || records.length === 0) return null;
   return records.map((rec) => {
@@ -414,6 +639,15 @@ function renderPubBadges(records?: PublishRecord[]) {
               ? `${runningStage} ${pct}%`
               : runningStage
             : "失败";
+    const tooltip =
+      rec.status === "error"
+        ? (() => {
+            const view = formatPublishErrorView(rec);
+            return [rec.message, view.errorText, `解决方案：${view.solutionText}`]
+              .filter(Boolean)
+              .join("\n");
+          })()
+        : rec.message || rec.error || "";
     if (rec.url_or_id) {
       return (
         <a
@@ -423,7 +657,7 @@ function renderPubBadges(records?: PublishRecord[]) {
           rel="noreferrer"
           className={`pub-badge ${rec.status}`}
           onClick={(e) => e.stopPropagation()}
-          title={rec.message || rec.error || ""}
+          title={tooltip}
         >
           {label}:{statusText}
         </a>
@@ -438,12 +672,47 @@ function renderPubBadges(records?: PublishRecord[]) {
         key={rec.platform}
         className={`pub-badge ${rec.status}`}
         style={badgeStyle}
-        title={rec.message || rec.error || ""}
+        title={tooltip}
       >
         {label}:{statusText}
       </span>
     );
   });
+}
+
+function hasRemixCardFor(m: ProjectManifest | null): boolean {
+  return Boolean(
+    m &&
+      (m.remix.items.length > 0 ||
+        m.clips.length > 0 ||
+        (m.remix_only_pool?.length || 0) > 0 ||
+        Boolean(m.remix.output_file))
+  );
+}
+
+function hasCompilationCardFor(m: ProjectManifest | null): boolean {
+  return Boolean(m && (m.clips.length > 0 || Boolean(m.compilation?.output_file)));
+}
+
+function hasCleanCutCardFor(m: ProjectManifest | null): boolean {
+  return Boolean(m && ((m.cut_segments || []).length > 0 || Boolean(m.clean_cut?.output_file)));
+}
+
+function pickDefaultSelectedId(m: ProjectManifest): string | null {
+  if (m.remix.items.length > 0) return "REMIX";
+  if (m.clips.length > 0) return m.clips[0].clip_id;
+  if (hasRemixCardFor(m)) return "REMIX";
+  if (hasCompilationCardFor(m)) return "COMPILATION";
+  if (hasCleanCutCardFor(m)) return "CLEAN_CUT";
+  return null;
+}
+
+function reconcileSelectedId(prev: string | null, m: ProjectManifest): string | null {
+  if (prev === "REMIX" && hasRemixCardFor(m)) return prev;
+  if (prev === "COMPILATION" && hasCompilationCardFor(m)) return prev;
+  if (prev === "CLEAN_CUT" && hasCleanCutCardFor(m)) return prev;
+  if (prev && m.clips.some((c) => c.clip_id === prev)) return prev;
+  return pickDefaultSelectedId(m);
 }
 
 export default function App() {
@@ -454,6 +723,7 @@ export default function App() {
   const [jobRunning, setJobRunning] = useState(false);
   const [jobCancelling, setJobCancelling] = useState(false);
   const [jobStages, setJobStages] = useState<string[]>([]);
+  const [publishJobs, setPublishJobs] = useState<PublishJobInfo[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [singleRendering, setSingleRendering] = useState(false);
 
@@ -500,8 +770,14 @@ export default function App() {
   const settingsDialogRef = useRef<HTMLDialogElement | null>(null);
   const configDialogRef = useRef<HTMLDialogElement | null>(null);
   const publishDialogRef = useRef<HTMLDialogElement | null>(null);
+  const batchPublishDialogRef = useRef<HTMLDialogElement | null>(null);
   const replanDialogRef = useRef<HTMLDialogElement | null>(null);
   const policyDialogRef = useRef<HTMLDialogElement | null>(null);
+  const metadataDialogRef = useRef<HTMLDialogElement | null>(null);
+  const [metaChannelDraft, setMetaChannelDraft] = useState("");
+  const [metaGuestDraft, setMetaGuestDraft] = useState("");
+  const [metaDateDraft, setMetaDateDraft] = useState("");
+  const [metaSaving, setMetaSaving] = useState(false);
   const [replanAssets, setReplanAssets] = useState<RenderedAssetsInfo | null>(null);
   const [projectAssets, setProjectAssets] = useState<RenderedAssetsInfo | null>(null);
   const [canMask, setCanMask] = useState(true);
@@ -510,9 +786,18 @@ export default function App() {
 
   // Political sensitivity policy profiles & editing draft
   const [contentFilterCfg, setContentFilterCfg] = useState<ContentFilterConfig | null>(null);
+  const [navCfg, setNavCfg] = useState<NavigationConfig>({
+    style: "top_nav",
+    remix_style: "top_nav",
+    compilation_style: "top_nav",
+    screen_layout: "portrait",
+    color_scheme: "tiffany",
+    custom_accent: "#0ABAB5",
+  });
   const [policyDraft, setPolicyDraft] = useState<ContentFilterConfig | null>(null);
   const [policyTab, setPolicyTab] = useState<"strict" | "balanced" | "loose">("strict");
   const [policySaving, setPolicySaving] = useState(false);
+  const [extractingPreciseTerms, setExtractingPreciseTerms] = useState(false);
 
   // Settings & YAML state
   const [yamlText, setYamlText] = useState("");
@@ -527,7 +812,11 @@ export default function App() {
   // Inline drafts for selected item title + cover title
   const [titleDraft, setTitleDraft] = useState("");
   const [coverTitleDraft, setCoverTitleDraft] = useState("");
+  const [remixPromptDraft, setRemixPromptDraft] = useState("");
   const [coverRefreshing, setCoverRefreshing] = useState(false);
+  const [coverNonce, setCoverNonce] = useState(0);
+  const [compTitleSuggesting, setCompTitleSuggesting] = useState(false);
+  const [cleanCutTitleSuggesting, setCleanCutTitleSuggesting] = useState(false);
   const [subtitleDrafts, setSubtitleDrafts] = useState<Record<number, { zh: string; en: string }>>({});
   const [subtitleRepairSaving, setSubtitleRepairSaving] = useState(false);
   const [subtitleRepairFullBurn, setSubtitleRepairFullBurn] = useState(false);
@@ -542,9 +831,25 @@ export default function App() {
   const [pubTitle, setPubTitle] = useState("");
   const [pubCoverTitle, setPubCoverTitle] = useState("");
   const [pubDesc, setPubDesc] = useState("");
+  const [pubDescSuggesting, setPubDescSuggesting] = useState(false);
   const [pubTags, setPubTags] = useState("");
   const [pubPublic, setPubPublic] = useState(false);
   const [pubCollection, setPubCollection] = useState("");
+  const [pubLoginNotice, setPubLoginNotice] = useState<string | null>(null);
+  const [pubResettingKey, setPubResettingKey] = useState<string | null>(null);
+  const [pubLoginWatchPlat, setPubLoginWatchPlat] = useState<string | null>(null);
+
+  // Batch publish standalone clips dialog state
+  const [batchPlatforms, setBatchPlatforms] = useState<Record<string, boolean>>({
+    wechat: true,
+    bilibili: false,
+    xiaohongshu: false,
+  });
+  const [batchCollection, setBatchCollection] = useState("");
+  const [batchPublic, setBatchPublic] = useState(false);
+  const [batchSkipPublished, setBatchSkipPublished] = useState(true);
+  const [batchClipPick, setBatchClipPick] = useState<Record<string, boolean>>({});
+  const [batchSubmitting, setBatchSubmitting] = useState(false);
 
   useEffect(() => {
     api
@@ -572,6 +877,10 @@ export default function App() {
       .getContentFilterConfig()
       .then((res) => setContentFilterCfg(res))
       .catch(() => {});
+    api
+      .getNavigationConfig()
+      .then((res) => setNavCfg(res))
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -581,6 +890,7 @@ export default function App() {
     const c4 = bindOutsideClickDismiss(publishDialogRef.current, () => {});
     const c5 = bindOutsideClickDismiss(replanDialogRef.current, () => setReplanAssets(null));
     const c6 = bindOutsideClickDismiss(policyDialogRef.current, () => {});
+    const c7 = bindOutsideClickDismiss(batchPublishDialogRef.current, () => {});
     return () => {
       c1();
       c2();
@@ -588,6 +898,7 @@ export default function App() {
       c4();
       c5();
       c6();
+      c7();
     };
   }, []);
 
@@ -601,12 +912,10 @@ export default function App() {
       setJobRunning(running);
       setJobCancelling(running && Boolean(data.job?.cancelling));
       setJobStages(running ? data.job?.stages || [] : []);
+      setPublishJobs((data.publish_jobs || []).filter((j) => j.running));
+      setBatchCollection("");
       if (data.job?.error) setErrorMsg(data.job.error);
-      if (data.manifest.remix.items.length > 0) {
-        setSelectedId((prev) => prev || "REMIX");
-      } else if (data.manifest.clips.length > 0) {
-        setSelectedId((prev) => prev || data.manifest.clips[0].clip_id);
-      }
+      setSelectedId((prev) => reconcileSelectedId(prev, data.manifest));
       if (showLogs) {
         refreshReceipts(projectId, stageFilter);
       }
@@ -625,9 +934,9 @@ export default function App() {
     }
   }
 
-  // Poll while background job is running
+  // Poll while pipeline or publish background job is running
   useEffect(() => {
-    if (!manifest || !jobRunning) return;
+    if (!manifest || (!jobRunning && publishJobs.length === 0)) return;
     const pid = manifest.project_id;
     const timer = window.setInterval(async () => {
       try {
@@ -638,21 +947,15 @@ export default function App() {
         if (showLogs) refreshReceipts(pid, stageFilter);
         setJobCancelling(Boolean(data.job?.cancelling));
         if (data.job?.stages) setJobStages(data.job.stages);
-        if (!data.job?.running) {
+        const nextPubJobs = (data.publish_jobs || []).filter((j) => j.running);
+        setPublishJobs(nextPubJobs);
+        if (!data.job?.running && jobRunning) {
           setJobRunning(false);
           setJobCancelling(false);
           setJobStages([]);
           if (data.job?.error) setErrorMsg(data.job.error);
-          setSelectedId((prev) => {
-            if (prev === "REMIX" || prev === "COMPILATION" || prev === "CLEAN_CUT") {
-              return prev;
-            }
-            if (prev && data.manifest.clips.some((c) => c.clip_id === prev)) {
-              return prev;
-            }
-            if (data.manifest.remix.items.length > 0) return "REMIX";
-            return data.manifest.clips[0]?.clip_id || null;
-          });
+          setCoverNonce((n) => n + 1);
+          setSelectedId((prev) => reconcileSelectedId(prev, data.manifest));
           api.listProjects().then((r) => setProjects(r.projects)).catch(() => {});
         }
       } catch {
@@ -660,13 +963,26 @@ export default function App() {
       }
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [manifest?.project_id, jobRunning, stageFilter, showLogs]);
+  }, [manifest?.project_id, jobRunning, publishJobs.length, stageFilter, showLogs]);
 
   useEffect(() => {
-    if (manifest && selectedId === "CLEAN_CUT" && (manifest.cut_segments || []).length === 0) {
-      setSelectedId(manifest.remix.items.length > 0 ? "REMIX" : manifest.clips[0]?.clip_id || null);
-    }
-  }, [manifest?.project_id, selectedId, manifest?.cut_segments?.length]);
+    setRemixPromptDraft(manifest?.remix?.custom_prompt || "");
+  }, [manifest?.project_id, manifest?.remix?.custom_prompt]);
+
+  useEffect(() => {
+    if (!manifest) return;
+    setSelectedId((prev) => reconcileSelectedId(prev, manifest));
+  }, [
+    manifest?.project_id,
+    manifest?.clips.length,
+    manifest?.remix.items.length,
+    manifest?.remix_only_pool?.length,
+    manifest?.remix.output_file,
+    manifest?.compilation?.output_file,
+    manifest?.cut_segments?.length,
+    manifest?.clean_cut?.output_file,
+    selectedId,
+  ]);
 
   useEffect(() => {
     if (manifest && showLogs) {
@@ -940,7 +1256,16 @@ export default function App() {
       });
       setManifest(res.manifest);
       setProjectAssets(null);
-      setSelectedId(res.manifest.clips[0]?.clip_id || "REMIX");
+      setSelectedId(
+        res.manifest.remix.items.length > 0
+          ? "REMIX"
+          : res.manifest.clips[0]?.clip_id ||
+              (res.manifest.remix.output_file
+                ? "REMIX"
+                : res.manifest.compilation?.output_file
+                  ? "COMPILATION"
+                  : null)
+      );
       setPlayMode("source");
       api.listProjects().then((r) => setProjects(r.projects)).catch(() => {});
     } catch (err) {
@@ -948,11 +1273,11 @@ export default function App() {
     }
   }
 
-  async function handleRun(stages: string[], forceRender = false) {
+  async function handleRun(stages: string[], forceRender = false, renderTargets?: string[]) {
     if (!manifest) return;
     setErrorMsg(null);
     try {
-      await api.runStages(manifest.project_id, stages, forceRender);
+      await api.runStages(manifest.project_id, stages, forceRender, renderTargets);
       setJobCancelling(false);
       setJobStages(stages);
       setJobRunning(true);
@@ -1095,6 +1420,33 @@ export default function App() {
     }
   }
 
+  function openMetadataDialog() {
+    if (!manifest) return;
+    setMetaChannelDraft(manifest.metadata.channel_zh || manifest.metadata.channel || "");
+    setMetaGuestDraft(manifest.metadata.guest_zh || "");
+    setMetaDateDraft(manifest.metadata.published_date || "");
+    metadataDialogRef.current?.showModal();
+  }
+
+  async function handleSaveMetadata() {
+    if (!manifest) return;
+    setMetaSaving(true);
+    setErrorMsg(null);
+    try {
+      const res = await api.patchMetadata(manifest.project_id, {
+        channel_zh: metaChannelDraft.trim(),
+        guest_zh: metaGuestDraft.trim(),
+        published_date: metaDateDraft.trim(),
+      });
+      setManifest(res.manifest);
+      metadataDialogRef.current?.close();
+    } catch (e) {
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMetaSaving(false);
+    }
+  }
+
   async function handlePatchRemix(patch: Record<string, unknown>) {
     if (!manifest) return;
     setErrorMsg(null);
@@ -1166,6 +1518,9 @@ export default function App() {
     try {
       const res = await api.patchCleanCut(manifest.project_id, patch);
       setManifest(res.manifest);
+      if ("title" in patch || "cover_title" in patch) {
+        setCoverNonce((n) => n + 1);
+      }
     } catch (err) {
       setErrorMsg((err as Error).message);
     }
@@ -1184,6 +1539,38 @@ export default function App() {
     }
   }
 
+  async function handleSuggestCompilationTitle() {
+    if (!manifest) return;
+    setErrorMsg(null);
+    setCompTitleSuggesting(true);
+    try {
+      const res = await api.suggestCompilationTitle(manifest.project_id);
+      setManifest(res.manifest);
+      setTitleDraft(res.title || res.manifest.compilation?.title || "切片精选集");
+      setCoverNonce((n) => n + 1);
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    } finally {
+      setCompTitleSuggesting(false);
+    }
+  }
+
+  async function handleSuggestCleanCutTitle() {
+    if (!manifest) return;
+    setErrorMsg(null);
+    setCleanCutTitleSuggesting(true);
+    try {
+      const res = await api.suggestCleanCutTitle(manifest.project_id);
+      setManifest(res.manifest);
+      setTitleDraft(res.title || res.manifest.clean_cut?.title || "全片（净版）");
+      setCoverNonce((n) => n + 1);
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    } finally {
+      setCleanCutTitleSuggesting(false);
+    }
+  }
+
   async function handleSaveCoverTitleAndRefresh() {
     if (!manifest || !selectedId) return;
     setErrorMsg(null);
@@ -1191,38 +1578,43 @@ export default function App() {
     try {
       const nextText = coverTitleDraft.trim();
       if (selectedId === "REMIX") {
+        const prevCt = (manifest.remix.cover_title || "").trim();
         const res = await api.patchRemix(manifest.project_id, { cover_title: nextText });
-        if (!res.manifest.remix.cover_file) {
+        if (!res.manifest.remix.cover_file || nextText === prevCt) {
           const r2 = await api.refreshCover(manifest.project_id, "remix");
           setManifest(r2.manifest);
         } else {
           setManifest(res.manifest);
         }
       } else if (selectedId === "COMPILATION") {
+        const prevCt = (manifest.compilation?.cover_title || "").trim();
         const res = await api.patchCompilation(manifest.project_id, { cover_title: nextText });
-        if (!res.manifest.compilation?.cover_file) {
+        if (!res.manifest.compilation?.cover_file || nextText === prevCt) {
           const r2 = await api.refreshCover(manifest.project_id, "compilation");
           setManifest(r2.manifest);
         } else {
           setManifest(res.manifest);
         }
       } else if (selectedId === "CLEAN_CUT") {
+        const prevCt = (manifest.clean_cut?.cover_title || "").trim();
         const res = await api.patchCleanCut(manifest.project_id, { cover_title: nextText });
-        if (!res.manifest.clean_cut?.cover_file) {
+        if (!res.manifest.clean_cut?.cover_file || nextText === prevCt) {
           const r2 = await api.refreshCover(manifest.project_id, "clean_cut");
           setManifest(r2.manifest);
         } else {
           setManifest(res.manifest);
         }
       } else if (activeClip) {
+        const prevCt = (activeClip.cover_title || "").trim();
         const res = await api.patchClip(manifest.project_id, activeClip.clip_id, { cover_title: nextText });
-        if (!res.manifest.clips.find((c) => c.clip_id === activeClip.clip_id)?.cover_file) {
+        if (!res.manifest.clips.find((c) => c.clip_id === activeClip.clip_id)?.cover_file || nextText === prevCt) {
           const r2 = await api.refreshCover(manifest.project_id, activeClip.clip_id);
           setManifest(r2.manifest);
         } else {
           setManifest(res.manifest);
         }
       }
+      setCoverNonce((n) => n + 1);
     } catch (err) {
       setErrorMsg((err as Error).message);
     } finally {
@@ -1240,17 +1632,6 @@ export default function App() {
     sorted[targetIdx] = tmp;
     const reordered = sorted.map((it, i) => ({ remix_id: it.remix_id, order: i + 1 }));
     handlePatchRemix({ items: reordered });
-  }
-
-  async function handleUndo() {
-    if (!manifest) return;
-    setErrorMsg(null);
-    try {
-      const res = await api.undo(manifest.project_id);
-      setManifest(res.manifest);
-    } catch (err) {
-      setErrorMsg((err as Error).message);
-    }
   }
 
   async function openEditorialConfig() {
@@ -1349,7 +1730,42 @@ export default function App() {
     }
   }
 
-  async function handleChangeGlobalPoliticalAction(nextAction: "auto" | "delete" | "mask") {
+  async function handleExtractPreciseTerms(force = false) {
+    if (!manifest) return;
+    setExtractingPreciseTerms(true);
+    setErrorMsg(null);
+    try {
+      const res = await api.extractPreciseTerms(manifest.project_id, { force });
+      setManifest(res.manifest);
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    } finally {
+      setExtractingPreciseTerms(false);
+    }
+  }
+
+  async function handleChangeProjectPoliticalAction(nextAction: PoliticalAction) {
+    if (!manifest) return;
+    setErrorMsg(null);
+    try {
+      const res = await api.patchCleanCut(manifest.project_id, { political_action: nextAction });
+      setManifest(res.manifest);
+      const missingCount = (res.manifest.cut_segments || []).filter(
+        (s) =>
+          s.kind === "political_sensitive" &&
+          !s.precise_terms_extracted &&
+          !(s.precise_terms_zh && s.precise_terms_zh.length > 0) &&
+          !(s.precise_terms_en && s.precise_terms_en.length > 0)
+      ).length;
+      if (nextAction === "precise_mask" && missingCount > 0) {
+        await handleExtractPreciseTerms(false);
+      }
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    }
+  }
+
+  async function handleChangeDefaultPoliticalAction(nextAction: PoliticalAction) {
     setErrorMsg(null);
     try {
       const saved = await api.saveContentFilterConfig({ default_political_action: nextAction });
@@ -1358,9 +1774,6 @@ export default function App() {
         default_political_action: saved.default_political_action,
         political_profiles: saved.political_profiles,
       });
-      if (manifest) {
-        await handlePatchCleanCut({ political_action: nextAction });
-      }
     } catch (err) {
       setErrorMsg((err as Error).message);
     }
@@ -1411,13 +1824,147 @@ export default function App() {
     }
   }
 
-  async function openPublishModal() {
+  function getPublishJobForTarget(target: string | null): PublishJobInfo | null {
+    if (!target) return null;
+    return publishJobs.find((j) => j.running && j.targets.includes(target)) || null;
+  }
+
+  const activeBatchPublishJob = useMemo(
+    () => publishJobs.find((j) => j.running && j.kind === "batch") || null,
+    [publishJobs]
+  );
+
+  async function handleCancelPublishJob(jobId: string) {
+    if (!manifest || !jobId) return;
+    setErrorMsg(null);
+    setPublishJobs((prev) =>
+      prev.map((j) => (j.job_id === jobId ? { ...j, cancelling: true } : j))
+    );
+    try {
+      await api.cancelJob(manifest.project_id, { job_id: jobId });
+      const data = await api.getProject(manifest.project_id);
+      setManifest(data.manifest);
+      setPublishJobs((data.publish_jobs || []).filter((j) => j.running));
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    }
+  }
+
+  function defaultCollectionName(m: ProjectManifest): string {
+    const raw = (m.metadata.original_theme_zh || m.metadata.original_title || "").trim();
+    if (!raw) return "";
+    const firstClause = raw.split(/[：:。；;，,]+/)[0].trim() || raw;
+    return (firstClause.length > 10 ? firstClause.slice(0, 10) : firstClause).trim();
+  }
+
+  const activePublishTarget = useMemo(() => {
+    if (!selectedId) return null;
+    if (selectedId === "REMIX") return "remix";
+    if (selectedId === "COMPILATION") return "compilation";
+    if (selectedId === "CLEAN_CUT") return "clean_cut";
+    return activeClip?.clip_id || null;
+  }, [selectedId, activeClip?.clip_id]);
+
+  const activePublishJob = useMemo(
+    () => getPublishJobForTarget(activePublishTarget),
+    [publishJobs, activePublishTarget]
+  );
+
+  const activePublishRecords = useMemo(() => {
+    if (!manifest || !activePublishTarget) return [] as PublishRecord[];
+    if (activePublishTarget === "remix") return manifest.remix.publish_records || [];
+    if (activePublishTarget === "compilation") return manifest.compilation?.publish_records || [];
+    if (activePublishTarget === "clean_cut") return manifest.clean_cut?.publish_records || [];
+    return activeClip?.publish_records || [];
+  }, [manifest, activePublishTarget, activeClip]);
+
+  async function handleRefreshPublishStatus() {
+    try {
+      const res = await api.getPublishStatus();
+      setPlatStatus(res.platforms);
+      return res.platforms;
+    } catch {
+      return null;
+    }
+  }
+
+  async function handleResetPublish(target: string, platform?: string, silent = false) {
+    if (!manifest) return;
+    const key = platform ? `${target}:${platform}` : `${target}:all`;
+    setPubResettingKey(key);
+    if (!silent) setErrorMsg(null);
+    try {
+      const res = await api.resetPublishRecords(manifest.project_id, {
+        target,
+        platform: platform ?? null,
+        only_errors: !platform,
+      });
+      setManifest(res.manifest);
+      if (res.removed.length > 0) {
+        const names = res.removed.map((p) => PLAT_LABELS[p] || p).join("、");
+        setPubLoginNotice(`已复位 ${names} 发布状态`);
+      } else if (!silent) {
+        setPubLoginNotice("当前无可复位的失败记录");
+      }
+    } catch (err) {
+      if (!silent) {
+        setErrorMsg((err as Error).message);
+      }
+    } finally {
+      setPubResettingKey(null);
+    }
+  }
+
+  useEffect(() => {
+    if (!pubLoginWatchPlat) return;
+    const watchPlat = pubLoginWatchPlat;
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await api.getPublishStatus();
+        if (cancelled) return;
+        setPlatStatus(res.platforms);
+        const st = res.platforms[watchPlat];
+        if (!st || st.login_running) return;
+        setPubLoginWatchPlat(null);
+        const platLabel = PLAT_LABELS[watchPlat] || watchPlat;
+        if (st.login_returncode === 0) {
+          setPubLoginNotice(`${platLabel} 扫码登录已完成`);
+          if (
+            manifest &&
+            activePublishTarget &&
+            !jobRunning &&
+            !activePublishJob &&
+            activePublishRecords.some((r) => r.platform === watchPlat && r.status === "error")
+          ) {
+            await handleResetPublish(activePublishTarget, watchPlat, true);
+            setPubLoginNotice(`${platLabel} 扫码登录已完成，失败状态已自动复位`);
+          }
+        } else if (st.login_message) {
+          setPubLoginNotice(st.login_message);
+        }
+      } catch {
+        // ignore transient polling error
+      }
+    }, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [pubLoginWatchPlat, manifest?.project_id, activePublishTarget, jobRunning, activePublishJob, activePublishRecords]);
+
+  function openPublishModal(preselectPlatform?: string) {
     if (!manifest || !selectedId) return;
     setErrorMsg(null);
-    api
-      .getPublishStatus()
-      .then((res) => setPlatStatus(res.platforms))
-      .catch(() => {});
+    if (!pubLoginWatchPlat) setPubLoginNotice(null);
+    handleRefreshPublishStatus();
+    if (preselectPlatform) {
+      setPubPlatforms({
+        wechat: preselectPlatform === "wechat",
+        bilibili: preselectPlatform === "bilibili",
+        xiaohongshu: preselectPlatform === "xiaohongshu",
+      });
+    }
 
     if (selectedId === "REMIX") {
       const rmx = manifest.remix;
@@ -1431,14 +1978,7 @@ export default function App() {
       const baseCover = (coverTitleDraft.trim() || rmx.cover_title || baseTitle).trim();
       setPubTitle(baseTitle);
       setPubCoverTitle(baseCover);
-      const bullets = rmx.items
-        .filter((x) => x.enabled && x.card_title)
-        .slice(0, 4)
-        .map((x) => x.card_title)
-        .join(" | ");
-      setPubDesc(
-        [manifest.metadata.guest_zh, manifest.metadata.channel_zh, bullets].filter(Boolean).join(" · ")
-      );
+      setPubDesc(buildDefaultRemixDesc(manifest));
       setPubTags([...(manifest.primary_topics || []), "AI", "深度访谈"].slice(0, 6).join(", "));
     } else if (selectedId === "COMPILATION") {
       const cmp = manifest.compilation;
@@ -1446,13 +1986,7 @@ export default function App() {
       const baseCover = (coverTitleDraft.trim() || cmp?.cover_title || baseTitle).trim();
       setPubTitle(baseTitle);
       setPubCoverTitle(baseCover);
-      const summary = compilationClips
-        .slice(0, 4)
-        .map((c) => c.title)
-        .join(" | ");
-      setPubDesc(
-        `精选 ${compilationClips.length} 支独立切片：\n` + summary
-      );
+      setPubDesc(buildDefaultCompilationDesc(manifest, compilationClips));
       setPubTags([...(manifest.primary_topics || []), "AI", "深度访谈", "合集"].slice(0, 6).join(", "));
     } else if (selectedId === "CLEAN_CUT") {
       const cc = manifest.clean_cut;
@@ -1461,9 +1995,7 @@ export default function App() {
       const baseCover = (coverTitleDraft.trim() || cc?.cover_title || baseTitle).trim();
       setPubTitle(baseTitle);
       setPubCoverTitle(baseCover);
-      setPubDesc(
-        [manifest.metadata.guest_zh, manifest.metadata.channel_zh, cleanCutStats.summaryLabel].filter(Boolean).join(" · ")
-      );
+      setPubDesc(buildDefaultCleanCutDesc(manifest));
       setPubTags([...(manifest.primary_topics || []), "AI", "深度访谈", "全片"].slice(0, 6).join(", "));
     } else if (activeClip) {
       const baseTitle = (titleDraft.trim() || activeClip.title || activeClip.cover_title || "").trim();
@@ -1477,23 +2009,165 @@ export default function App() {
           .join(", ")
       );
     }
-    const defaultCol = (manifest.metadata.original_theme_zh || manifest.metadata.original_title || "")
-      .trim()
-      .slice(0, 10);
-    setPubCollection(defaultCol);
+    setPubCollection(defaultCollectionName(manifest));
     setPubPublic(false);
     publishDialogRef.current?.showModal();
+  }
+
+  async function handleSuggestPublishDesc() {
+    if (!manifest || !activePublishTarget) return;
+    setErrorMsg(null);
+    setPubDescSuggesting(true);
+    try {
+      const res = await api.suggestPublishDesc(manifest.project_id, activePublishTarget);
+      setManifest(res.manifest);
+      setPubDesc(res.desc || "");
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    } finally {
+      setPubDescSuggesting(false);
+    }
+  }
+
+  function openBatchPublishModal() {
+    if (!manifest) return;
+    setErrorMsg(null);
+    if (!pubLoginWatchPlat) setPubLoginNotice(null);
+    handleRefreshPublishStatus();
+    const initPick: Record<string, boolean> = {};
+    manifest.clips
+      .filter((c) => c.enabled)
+      .forEach((c) => {
+        initPick[c.clip_id] = Boolean(c.output_file);
+      });
+    setBatchClipPick(initPick);
+    setBatchCollection((prev) => prev || defaultCollectionName(manifest));
+    setBatchPublic(false);
+    setBatchSkipPublished(true);
+    batchPublishDialogRef.current?.showModal();
+  }
+
+  async function handleConfirmBatchPublish() {
+    if (!manifest) return;
+    const chosenPlatforms = Object.entries(batchPlatforms)
+      .filter(([, on]) => on)
+      .map(([k]) => k);
+    if (chosenPlatforms.length === 0) {
+      setErrorMsg("请至少选择一个发布平台");
+      return;
+    }
+    const chosenTargets = manifest.clips
+      .filter((c) => c.enabled && Boolean(c.output_file) && batchClipPick[c.clip_id])
+      .map((c) => c.clip_id);
+    if (chosenTargets.length === 0) {
+      setErrorMsg("请至少选择 1 个已渲染的独立切片");
+      return;
+    }
+    setErrorMsg(null);
+    setBatchSubmitting(true);
+    try {
+      const colName = batchCollection.trim();
+      const res = await api.publishBatch(manifest.project_id, {
+        targets: chosenTargets,
+        platforms: chosenPlatforms,
+        is_public: batchPublic,
+        collection: colName,
+        skip_already_published: batchSkipPublished,
+      });
+      batchPublishDialogRef.current?.close();
+      setPublishJobs((prev) => [
+        ...prev.filter((j) => j.job_id !== res.job_id),
+        {
+          job_id: res.job_id,
+          kind: "batch",
+          running: true,
+          cancelling: false,
+          targets: res.targets,
+          current_target: res.targets[0] || null,
+          completed_targets: [],
+          failed_targets: [],
+          skipped_targets: [],
+          platforms: res.platforms,
+          collection: res.collection,
+        },
+      ]);
+      api
+        .getProject(manifest.project_id)
+        .then((d) => {
+          setManifest(d.manifest);
+          setPublishJobs((d.publish_jobs || []).filter((j) => j.running));
+        })
+        .catch(() => {});
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    } finally {
+      setBatchSubmitting(false);
+    }
   }
 
   async function handleLaunchLogin(plat: string) {
     setErrorMsg(null);
     try {
       const res = await api.launchPublishLogin(plat);
-      window.alert(res.message);
-      api.getPublishStatus().then((r) => setPlatStatus(r.platforms)).catch(() => {});
+      setPubLoginNotice(res.message);
+      setPubLoginWatchPlat(plat);
+      await handleRefreshPublishStatus();
     } catch (err) {
       setErrorMsg((err as Error).message);
     }
+  }
+
+  function renderPublishDiagnostics(target: string, records?: PublishRecord[]) {
+    const failed = (records || []).filter((r) => r.status === "error");
+    if (failed.length === 0) return null;
+    const targetBusy = Boolean(getPublishJobForTarget(target));
+    return (
+      <div className="pub-error-box">
+        {failed.map((rec) => {
+          const platLabel = PLAT_LABELS[rec.platform] || rec.platform;
+          const { errorText, solutionText } = formatPublishErrorView(rec);
+          const resetKey = `${target}:${rec.platform}`;
+          const loginSt = platStatus[rec.platform];
+          return (
+            <div key={rec.platform} className="pub-error-item">
+              <div className="pub-error-head">
+                <span className="pub-error-title">
+                  {rec.message || `${platLabel} 发布失败`}
+                </span>
+                <div className="pub-error-actions">
+                  <button
+                    type="button"
+                    className="sm"
+                    disabled={jobRunning || targetBusy || pubResettingKey !== null}
+                    onClick={() => handleLaunchLogin(rec.platform)}
+                  >
+                    {loginSt?.login_running ? "扫码中..." : "重扫码"}
+                  </button>
+                  <button
+                    type="button"
+                    className="sm"
+                    disabled={jobRunning || targetBusy || pubResettingKey !== null}
+                    onClick={() => handleResetPublish(target, rec.platform)}
+                  >
+                    {pubResettingKey === resetKey ? "复位中..." : "复位状态"}
+                  </button>
+                  <button
+                    type="button"
+                    className="sm primary"
+                    disabled={jobRunning || targetBusy || pubResettingKey !== null}
+                    onClick={() => openPublishModal(rec.platform)}
+                  >
+                    重试{platLabel}
+                  </button>
+                </div>
+              </div>
+              <div className="pub-error-msg">原因：{errorText}</div>
+              <div className="pub-error-solution">解决方案：{solutionText}</div>
+            </div>
+          );
+        })}
+      </div>
+    );
   }
 
   async function handleConfirmPublish() {
@@ -1506,20 +2180,21 @@ export default function App() {
       return;
     }
     setErrorMsg(null);
+    const targetKey =
+      selectedId === "REMIX"
+        ? "remix"
+        : selectedId === "COMPILATION"
+        ? "compilation"
+        : selectedId === "CLEAN_CUT"
+        ? "clean_cut"
+        : selectedId;
     try {
       const tagsList = pubTags
         .split(/[,，、]/)
         .map((x) => x.trim())
         .filter(Boolean);
-      await api.publishTarget(manifest.project_id, {
-        target:
-          selectedId === "REMIX"
-            ? "remix"
-            : selectedId === "COMPILATION"
-            ? "compilation"
-            : selectedId === "CLEAN_CUT"
-            ? "clean_cut"
-            : selectedId,
+      const res = await api.publishTarget(manifest.project_id, {
+        target: targetKey,
         platforms: chosen,
         title: pubTitle.trim(),
         cover_title: pubCoverTitle.trim(),
@@ -1530,12 +2205,27 @@ export default function App() {
         ui_schema: 2,
       });
       publishDialogRef.current?.close();
-      setJobCancelling(false);
-      setJobStages(["publish"]);
-      setJobRunning(true);
+      setPublishJobs((prev) => [
+        ...prev.filter((j) => j.job_id !== res.job_id),
+        {
+          job_id: res.job_id,
+          kind: "single",
+          running: true,
+          cancelling: false,
+          targets: [targetKey],
+          current_target: targetKey,
+          completed_targets: [],
+          failed_targets: [],
+          platforms: chosen,
+          collection: pubCollection.trim(),
+        },
+      ]);
       api
         .getProject(manifest.project_id)
-        .then((d) => setManifest(d.manifest))
+        .then((d) => {
+          setManifest(d.manifest);
+          setPublishJobs((d.publish_jobs || []).filter((j) => j.running));
+        })
         .catch(() => {});
     } catch (err) {
       setErrorMsg((err as Error).message);
@@ -1646,7 +2336,7 @@ export default function App() {
   const cleanCutStats = useMemo(() => {
     const segs = manifest?.cut_segments || [];
     const cc = manifest?.clean_cut;
-    const sens = (cc?.sensitivity || contentFilterCfg?.default_sensitivity || "strict") as
+    const sens = (cc?.sensitivity || contentFilterCfg?.default_sensitivity || "balanced") as
       | "strict"
       | "balanced"
       | "loose";
@@ -1679,7 +2369,16 @@ export default function App() {
     const polActive = active.filter((s) => s.kind === "political_sensitive");
     const polCount = polActive.length;
     const delActive = active.filter((s) => resolveSegActionFrontend(s, cc, canMask) === "delete");
-    const maskActive = active.filter((s) => resolveSegActionFrontend(s, cc, canMask) === "mask");
+    const normalMaskActive = active.filter((s) => resolveSegActionFrontend(s, cc, canMask) === "mask");
+    const preciseMaskActive = active.filter((s) => resolveSegActionFrontend(s, cc, canMask) === "precise_mask");
+    const maskActive = [...normalMaskActive, ...preciseMaskActive];
+    const missingPreciseCount = allPolSegs.filter(
+      (s) =>
+        !isVisualOcrSeg(s) &&
+        !s.precise_terms_extracted &&
+        !(s.precise_terms_zh && s.precise_terms_zh.length > 0) &&
+        !(s.precise_terms_en && s.precise_terms_en.length > 0)
+    ).length;
     const delPolCount = Math.max(0, polCount - maskActive.length);
     const spans = delActive
       .map((s) => [Math.max(0, s.start_s), Math.max(0, s.end_s)] as [number, number])
@@ -1688,15 +2387,12 @@ export default function App() {
     const cutS = merged.reduce((acc, [s, e]) => acc + (e - s), 0);
     const totalS = manifest?.source.duration_s || 0;
     const keptS = Math.max(0, totalS - cutS);
-    const politicalAction = (cc?.political_action || contentFilterCfg?.default_political_action || "auto") as
-      | "auto"
-      | "delete"
-      | "mask";
+    const politicalAction = (cc?.political_action || contentFilterCfg?.default_political_action || "auto") as PoliticalAction;
     const summaryLabel =
       !isScanned && segs.length === 0
         ? "待分析"
         : active.length > 0
-          ? `广告${adCount}/${adTotal} · 删敏${delPolCount} · 遮蔽${maskActive.length}`
+          ? `广告${adCount}/${adTotal} · 删敏${delPolCount} · ${preciseMaskActive.length > 0 && normalMaskActive.length === 0 ? "精准" : "遮蔽"}${maskActive.length}`
           : polAllTotal > 0
             ? `广告${adCount}/${adTotal} · 当前标准放行${polAllTotal}段`
             : "无广告/敏感";
@@ -1713,6 +2409,9 @@ export default function App() {
       polCount,
       delPolCount,
       maskCount: maskActive.length,
+      normalMaskCount: normalMaskActive.length,
+      preciseCount: preciseMaskActive.length,
+      missingPreciseCount,
       cutS,
       keptS,
       merged,
@@ -1777,20 +2476,34 @@ export default function App() {
     return manifest ? manifest.clips.filter((c) => c.enabled).length : 0;
   }, [manifest]);
 
+  const selectedStandaloneClips = useMemo(() => {
+    return manifest ? manifest.clips.filter((c) => c.enabled) : [];
+  }, [manifest]);
+
+  const readySelectedClips = useMemo(() => {
+    return selectedStandaloneClips.filter((c) => Boolean(c.output_file));
+  }, [selectedStandaloneClips]);
+
   const compilationTotalS = useMemo(() => {
     if (!manifest) return 0;
-    const cardDur = manifest.compilation?.card_duration_s ?? 1.8;
     const baseSpeechS =
       cleanCutStats.isScanned
         ? compilationCompliance.netDurS
         : compilationClips.reduce((acc, c) => acc + (c.end_s - c.start_s), 0);
-    return baseSpeechS + compilationClips.length * cardDur;
-  }, [manifest, compilationClips, cleanCutStats.isScanned, compilationCompliance.netDurS]);
+    const compStyle = navCfg.compilation_style || navCfg.style;
+    if (compStyle === "title_card" || compStyle === "both") {
+      const cardDur = manifest.compilation?.card_duration_s ?? 1.8;
+      return baseSpeechS + compilationClips.length * cardDur;
+    }
+    return baseSpeechS;
+  }, [manifest, compilationClips, cleanCutStats.isScanned, compilationCompliance.netDurS, navCfg.compilation_style, navCfg.style]);
 
   const enabledRemixItemCount = useMemo(() => {
     return manifest ? manifest.remix.items.filter((x) => x.enabled).length : 0;
   }, [manifest]);
 
+  const showRemixCard = hasRemixCardFor(manifest);
+  const showCompilationCard = hasCompilationCardFor(manifest);
   const hasActiveRemixTarget = Boolean(
     manifest?.remix.enabled &&
       (enabledRemixItemCount > 0 || (manifest.remix.items.length === 0 && (manifest.clips.length > 0 || (manifest.remix_only_pool?.length || 0) > 0)))
@@ -1809,8 +2522,14 @@ export default function App() {
   }, [manifest, enabledClipCount, hasActiveRemixTarget, hasActiveCompilationTarget, hasActiveCleanCutTarget]);
 
   const isRendering = Boolean(jobRunning && (jobStages.includes("render") || manifest?.stages?.render?.status === "running"));
-  const isPublishing = Boolean(jobRunning && jobStages.includes("publish"));
-  const isPlanningRunning = Boolean(manifest && jobRunning && !isRendering && !isPublishing);
+  const isPlanningRunning = Boolean(manifest && jobRunning && !isRendering);
+  const cleanCutPubJob = useMemo(() => getPublishJobForTarget("clean_cut"), [publishJobs]);
+  const remixPubJob = useMemo(() => getPublishJobForTarget("remix"), [publishJobs]);
+  const compPubJob = useMemo(() => getPublishJobForTarget("compilation"), [publishJobs]);
+  const clipPubJob = useMemo(
+    () => getPublishJobForTarget(activeClip?.clip_id || null),
+    [publishJobs, activeClip?.clip_id]
+  );
   const hasStrategy = useMemo(() => {
     if (!manifest) return false;
     if (
@@ -1826,9 +2545,9 @@ export default function App() {
     ) {
       return true;
     }
-    return ["signals", "scan_cuts", "analyze", "verify_and_plan", "render"].some((k) => {
+    return ["scan_cuts", "analyze", "verify_and_plan", "render"].some((k) => {
       const st = manifest.stages?.[k];
-      return Boolean(st && (st.status !== "idle" || st.finished_at || st.message));
+      return Boolean(st && st.status === "completed");
     });
   }, [manifest, projectAssets]);
 
@@ -1852,37 +2571,41 @@ export default function App() {
       }
       lastGroup = gk;
     });
-    const cardDur = manifest.remix.card_mode === "none" ? 0 : manifest.remix.card_duration_s || 1.4;
+    const remixStyle = navCfg.remix_style || navCfg.style;
+    const cardDur =
+      (remixStyle === "title_card" || remixStyle === "both") && manifest.remix.card_mode !== "none"
+        ? manifest.remix.card_duration_s || 1.4
+        : 0;
     const estTotalS = speechS + cardCount * cardDur;
     const srcDur = manifest.source.duration_s || 0;
     const ratioPct = srcDur > 0 ? ((estTotalS / srcDur) * 100).toFixed(1) : "0.0";
     return { themeCount: groups.size, segmentCount: enabled.length, estTotalS, ratioPct };
-  }, [manifest]);
+  }, [manifest, navCfg.remix_style, navCfg.style]);
 
   const currentCoverUrl = useMemo(() => {
     if (!manifest) return null;
     if (selectedId === "REMIX" && manifest.remix.cover_file) {
       return `/api/projects/${manifest.project_id}/media/remix_cover?v=${encodeURIComponent(
         manifest.remix.cover_hash || manifest.remix.last_rendered_hash || "1"
-      )}`;
+      )}&n=${coverNonce}`;
     }
     if (selectedId === "COMPILATION" && manifest.compilation?.cover_file) {
       return `/api/projects/${manifest.project_id}/media/compilation_cover?v=${encodeURIComponent(
         manifest.compilation.cover_hash || manifest.compilation.last_rendered_hash || "1"
-      )}`;
+      )}&n=${coverNonce}`;
     }
     if (selectedId === "CLEAN_CUT" && manifest.clean_cut?.cover_file) {
       return `/api/projects/${manifest.project_id}/media/clean_cut_cover?v=${encodeURIComponent(
         manifest.clean_cut.cover_hash || manifest.clean_cut.last_rendered_hash || "1"
-      )}`;
+      )}&n=${coverNonce}`;
     }
     if (activeClip?.cover_file) {
       return `/api/projects/${manifest.project_id}/media/cover?clip_id=${encodeURIComponent(
         activeClip.clip_id
-      )}&v=${encodeURIComponent(activeClip.cover_hash || activeClip.last_rendered_hash || "1")}`;
+      )}&v=${encodeURIComponent(activeClip.cover_hash || activeClip.last_rendered_hash || "1")}&n=${coverNonce}`;
     }
     return null;
-  }, [manifest, selectedId, activeClip]);
+  }, [manifest, selectedId, activeClip, coverNonce]);
 
   return (
     <div className="app-shell">
@@ -1959,9 +2682,6 @@ export default function App() {
             title="全自动无人值守：全流程跑完包含全量渲染"
           >
             全自动跑完
-          </button>
-          <button type="button" onClick={handleUndo} disabled={!manifest}>
-            撤销
           </button>
           <button type="button" onClick={() => settingsDialogRef.current?.showModal()}>
             设置
@@ -2091,7 +2811,14 @@ export default function App() {
                 onClick={() => settingsDialogRef.current?.showModal()}
                 title="当前脱敏策略（点击前往右上角「设置」调整脱敏策略与政审规则）"
               >
-                策略:{cleanCutStats.politicalAction === "mask" ? "遮蔽" : cleanCutStats.politicalAction === "delete" ? "删段" : "智能"}
+                策略:
+                {cleanCutStats.politicalAction === "precise_mask"
+                  ? "精准遮蔽"
+                  : cleanCutStats.politicalAction === "mask"
+                    ? "常规遮蔽"
+                    : cleanCutStats.politicalAction === "delete"
+                      ? "删段"
+                      : "智能"}
               </button>
               {manifest && cleanCutStats.total > 0 && (
                 <button
@@ -2108,9 +2835,27 @@ export default function App() {
             </div>
           </div>
           {manifest && (
-            <div style={{ display: "flex", gap: 10, alignItems: "center", color: "var(--text-2)" }}>
-              <span>{manifest.metadata.channel_zh || manifest.metadata.channel}</span>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", color: "var(--text-2)", flexWrap: "wrap" }}>
+              <span
+                style={{ cursor: "pointer", display: "inline-flex", gap: 8, alignItems: "center" }}
+                onClick={openMetadataDialog}
+                title="点击编辑原视频元数据（频道 / 嘉宾 / 发布时间）"
+              >
+                <span style={{ color: "var(--text-1)" }}>
+                  {manifest.metadata.channel_zh || manifest.metadata.channel || "未设频道"}
+                </span>
+                {manifest.metadata.guest_zh && <span>· {manifest.metadata.guest_zh}</span>}
+                {manifest.metadata.published_date && <span className="mono">· {manifest.metadata.published_date}</span>}
+              </span>
               <span className="mono">{fmtTime(manifest.source.duration_s)}</span>
+              <button
+                type="button"
+                className="sm"
+                onClick={openMetadataDialog}
+                title="调整发布频道、被访谈人及发布时间（将同步至竖版画面元数据）"
+              >
+                编辑元数据
+              </button>
             </div>
           )}
         </div>
@@ -2147,30 +2892,104 @@ export default function App() {
                 <button
                   type="button"
                   className="sm"
+                  disabled={manifest.clips.length === 0 || jobRunning}
                   onClick={() => handleBatchClips("top_n", 5)}
                   title="按【核心主题、行业争议、精彩交锋、硬核实操、综合王牌】5大策展维度精准精选"
                 >
                   策划Top5
                 </button>
-                <button type="button" className="sm" onClick={() => handleBatchClips("enable_all")} title="全部启用">
+                <button
+                  type="button"
+                  className="sm"
+                  disabled={manifest.clips.length === 0 || jobRunning}
+                  onClick={() => handleBatchClips("enable_all")}
+                  title="全部启用"
+                >
                   全选
                 </button>
-                <button type="button" className="sm" onClick={() => handleBatchClips("disable_all")} title="全部停用">
+                <button
+                  type="button"
+                  className="sm"
+                  disabled={manifest.clips.length === 0 || jobRunning}
+                  onClick={() => handleBatchClips("disable_all")}
+                  title="全部停用"
+                >
                   全不选
                 </button>
                 <button
                   type="button"
                   className="sm"
+                  disabled={manifest.clips.length === 0 || jobRunning}
                   onClick={handleResetClipOrder}
                   title="按原片时间轴顺序一键复原切片排序"
                 >
                   复原时间轴
                 </button>
+                {activeBatchPublishJob ? (
+                  <button
+                    type="button"
+                    className="sm danger"
+                    disabled={Boolean(activeBatchPublishJob.cancelling)}
+                    onClick={() => handleCancelPublishJob(activeBatchPublishJob.job_id)}
+                    title="点击中止当前选中切片批量发布"
+                  >
+                    {activeBatchPublishJob.cancelling
+                      ? "正在中止..."
+                      : `批量发布中 (${
+                          activeBatchPublishJob.completed_targets.length +
+                          activeBatchPublishJob.failed_targets.length +
+                          (activeBatchPublishJob.skipped_targets?.length || 0)
+                        }/${activeBatchPublishJob.targets.length}) · 中止`}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className={readySelectedClips.length > 0 ? "sm primary" : "sm"}
+                    disabled={readySelectedClips.length === 0 || jobRunning}
+                    onClick={openBatchPublishModal}
+                    title={
+                      readySelectedClips.length > 0
+                        ? `将当前选中的 ${readySelectedClips.length} 支已渲染独立切片批量发布到同一合集`
+                        : selectedStandaloneClips.length > 0
+                          ? "请先点击「渲染选中」生成所选切片的成片后再批量发布"
+                          : "请先勾选至少 1 支独立切片并完成渲染"
+                    }
+                  >
+                    批量发布选中 ({readySelectedClips.length})
+                  </button>
+                )}
               </div>
+              {activeBatchPublishJob && (
+                <div
+                  style={{
+                    fontSize: 11,
+                    color: "var(--text-1)",
+                    background: "var(--bg-2)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    padding: "4px 8px",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: 6,
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span>
+                    队列：{activeBatchPublishJob.current_target || "收尾中"}
+                    {activeBatchPublishJob.collection ? ` · 合集「${activeBatchPublishJob.collection}」` : ""}
+                  </span>
+                  <span className="mono">
+                    完 {activeBatchPublishJob.completed_targets.length}
+                    {activeBatchPublishJob.failed_targets.length > 0
+                      ? ` · 败 ${activeBatchPublishJob.failed_targets.length}`
+                      : ""}
+                  </span>
+                </div>
+              )}
             </div>
             <div className="pane-body scroller">
-              {/* 1. Remix Card */}
-              {(() => {
+              {/* 1. Remix Card (Hidden when project has no planned clips/remix yet) */}
+              {showRemixCard && (() => {
                 const rb = getRenderBadge(manifest.remix, remixCompliance, cleanCutStats.isScanned, "待渲染");
                 const rmxNetS = Math.max(
                   0,
@@ -2215,8 +3034,8 @@ export default function App() {
                 );
               })()}
 
-              {/* 2. Compilation Card (Selected Clips Sequential with Title Cards) */}
-              {(() => {
+              {/* 2. Compilation Card (Selected Clips Sequential with Title Cards; Hidden when empty) */}
+              {showCompilationCard && (() => {
                 const compStub = manifest.compilation || {
                   render_hash: "",
                   last_rendered_hash: "",
@@ -2277,14 +3096,14 @@ export default function App() {
                   <span
                     className="tag highlight"
                     style={{
-                      background: "rgba(16, 185, 129, 0.16)",
-                      color: "#34d399",
-                      borderColor: "rgba(16, 185, 129, 0.45)",
+                      background: "rgba(220, 38, 38, 0.22)",
+                      color: "#f87171",
+                      borderColor: "rgba(239, 68, 68, 0.55)",
                     }}
                   >
                     全片净版
                   </span>
-                  <div className="clip-title">
+                  <div className="clip-title" style={{ color: "#fecaca" }}>
                     {manifest.clean_cut?.title ||
                       `${manifest.metadata.original_theme_zh || manifest.metadata.original_title || "全片"}（净版）`}
                   </div>
@@ -2468,7 +3287,7 @@ export default function App() {
                     className={`sm ${playMode === "source" ? "primary" : ""}`}
                     onClick={() => setPlayMode("source")}
                   >
-                    原片试看
+                    原片
                   </button>
                   <button
                     type="button"
@@ -2519,10 +3338,10 @@ export default function App() {
                 <div className="clip-inspector-bar" style={{ flexDirection: "row", gap: 14, alignItems: "center" }}>
                   <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 7 }}>
                     <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                      <span style={{ color: "var(--text-2)", fontSize: 12, width: 56 }}>净版标题</span>
+                      <span style={{ color: "#fca5a5", fontSize: 12, width: 56, fontWeight: 600 }}>净版标题</span>
                       <input
                         type="text"
-                        style={{ flex: 1, fontWeight: 600 }}
+                        style={{ flex: 1, fontWeight: 600, color: "#fee2e2" }}
                         value={titleDraft}
                         onChange={(e) => setTitleDraft(e.target.value)}
                         onBlur={() =>
@@ -2531,6 +3350,15 @@ export default function App() {
                           handlePatchCleanCut({ title: titleDraft.trim() })
                         }
                       />
+                      <button
+                        type="button"
+                        className="sm"
+                        disabled={cleanCutTitleSuggesting || jobRunning}
+                        onClick={handleSuggestCleanCutTitle}
+                        title="由 AI 根据全片中文主题与节目内容重新生成全片净版中文标题"
+                      >
+                        {cleanCutTitleSuggesting ? "生成中..." : "AI重新生成标题"}
+                      </button>
                     </div>
                     <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                       <span style={{ color: "var(--text-2)", fontSize: 12, width: 56 }}>封面标题</span>
@@ -2576,14 +3404,25 @@ export default function App() {
                       </button>
                       <button
                         type="button"
-                        className="sm primary"
-                        disabled={!manifest.clean_cut?.output_file || jobRunning}
-                        onClick={openPublishModal}
+                        className={cleanCutPubJob ? "sm danger" : "sm primary"}
+                        disabled={
+                          cleanCutPubJob
+                            ? Boolean(cleanCutPubJob.cancelling)
+                            : (!manifest.clean_cut?.output_file || jobRunning)
+                        }
+                        onClick={() =>
+                          cleanCutPubJob ? handleCancelPublishJob(cleanCutPubJob.job_id) : openPublishModal()
+                        }
                       >
-                        发布到 视频号 / B站 / 小红书…
+                        {cleanCutPubJob
+                          ? cleanCutPubJob.cancelling
+                            ? "正在中止发布..."
+                            : "发布中 · 中止"
+                          : "发布到 视频号 / B站 / 小红书…"}
                       </button>
                       {renderPubBadges(manifest.clean_cut?.publish_records)}
                     </div>
+                    {renderPublishDiagnostics("clean_cut", manifest.clean_cut?.publish_records)}
                   </div>
                   {currentCoverUrl && (
                     <a
@@ -2612,31 +3451,48 @@ export default function App() {
                 {/* Compact Clean Cut Segment Summary & Manual Marker */}
                 <div className="clean-cut-toolbar">
                   <span>
-                    共 {cleanCutStats.total} 段 · 生效 {cleanCutStats.activeCount} 段（去广 {cleanCutStats.adCount} / 删敏 {cleanCutStats.delPolCount} / 遮蔽 {cleanCutStats.maskCount}
+                    共 {cleanCutStats.total} 段 · 生效 {cleanCutStats.activeCount} 段（去广 {cleanCutStats.adCount} / 删敏 {cleanCutStats.delPolCount} / 常规遮蔽 {cleanCutStats.normalMaskCount} / 精准遮蔽 {cleanCutStats.preciseCount}
                     {cleanCutStats.polAllTotal > cleanCutStats.polTotal
                       ? ` · 已按当前标准放行 ${cleanCutStats.polAllTotal - cleanCutStats.polTotal} 段`
                       : ""}
                     {" · "}净删 {fmtTime(cleanCutStats.cutS)} · 净版约 {fmtTime(cleanCutStats.keptS)}）
                   </span>
-                  <button
-                    type="button"
-                    className="sm"
-                    onClick={() => {
-                      const s = Math.max(0, Math.round(currentTime * 10) / 10);
-                      const e = Math.min(manifest.source.duration_s || s + 15, s + 15);
-                      handlePatchCleanCut({
-                        add_segment: {
-                          kind: (manifest.clean_cut?.cut_political_sensitive ?? true) ? "political_sensitive" : "ad",
-                          start_s: s,
-                          end_s: e,
-                          reason: "人工从播放指针添加屏蔽段",
-                        },
-                      });
-                    }}
-                    title="以当前播放器时间为起点添加 15 秒人工屏蔽段（添加后可微调）"
-                  >
-                    + 在当前指针({fmtTime(currentTime)})添加屏蔽段
-                  </button>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                    {cleanCutStats.polAllTotal > 0 && canMask && (
+                      <button
+                        type="button"
+                        className="sm"
+                        disabled={extractingPreciseTerms || jobRunning}
+                        onClick={() => handleExtractPreciseTerms(cleanCutStats.missingPreciseCount === 0)}
+                        title="用 AI 仅提取不妥当政治人物/政体/中港台不规范称谓与定性判断词，用于「精准遮蔽+消音」模式"
+                      >
+                        {extractingPreciseTerms
+                          ? "提取精准词中..."
+                          : cleanCutStats.missingPreciseCount > 0
+                            ? `AI提取精准词 (${cleanCutStats.missingPreciseCount})`
+                            : "重提精准词"}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="sm"
+                      onClick={() => {
+                        const s = Math.max(0, Math.round(currentTime * 10) / 10);
+                        const e = Math.min(manifest.source.duration_s || s + 15, s + 15);
+                        handlePatchCleanCut({
+                          add_segment: {
+                            kind: (manifest.clean_cut?.cut_political_sensitive ?? true) ? "political_sensitive" : "ad",
+                            start_s: s,
+                            end_s: e,
+                            reason: "人工从播放指针添加屏蔽段",
+                          },
+                        });
+                      }}
+                      title="以当前播放器时间为起点添加 15 秒人工屏蔽段（添加后可微调）"
+                    >
+                      + 在当前指针({fmtTime(currentTime)})添加屏蔽段
+                    </button>
+                  </div>
                 </div>
 
                 {/* Cut Segments Review List */}
@@ -2653,6 +3509,14 @@ export default function App() {
                           : (manifest.clean_cut?.cut_political_sensitive ?? true);
                       const matchesProfile = cleanCutStats.matchesSeg(seg);
                       const isEffective = seg.enabled && categoryActive && matchesProfile;
+                      const segEffAction = resolveSegActionFrontend(seg, manifest.clean_cut, canMask);
+                      const isPreciseSeg = segEffAction === "precise_mask";
+                      const segActionLabel =
+                        segEffAction === "precise_mask"
+                          ? "精准遮蔽"
+                          : segEffAction === "mask"
+                            ? "常规遮蔽"
+                            : "删段";
                       return (
                         <div
                           key={seg.cut_id}
@@ -2726,24 +3590,51 @@ export default function App() {
                                   >
                                     未启用
                                   </span>
-                                ) : (
+                                ) : isVisualOcrSeg(seg) ? (
                                   <select
-                                    aria-label="单段脱敏方式"
-                                    value={seg.action || "inherit"}
+                                    aria-label="画面文字处理方式"
+                                    value={segEffAction === "delete" ? "delete" : "mask"}
                                     onChange={(e) =>
                                       handlePatchCleanCut({
                                         segments: [{ cut_id: seg.cut_id, action: e.target.value }],
                                       })
                                     }
                                     style={{ padding: "2px 5px", fontSize: 11 }}
+                                    title="画面文字默认仅对识别坐标框做局部马赛克模糊，不影响原声与翻译字幕"
+                                  >
+                                    <option value="mask">画面模糊</option>
+                                    <option value="delete">删段</option>
+                                  </select>
+                                ) : (
+                                  <select
+                                    aria-label="单段脱敏方式"
+                                    value={seg.action || "inherit"}
+                                    onChange={async (e) => {
+                                      const v = e.target.value;
+                                      await handlePatchCleanCut({
+                                        segments: [{ cut_id: seg.cut_id, action: v }],
+                                      });
+                                      if (
+                                        v === "precise_mask" &&
+                                        !seg.precise_terms_extracted &&
+                                        !(seg.precise_terms_zh && seg.precise_terms_zh.length > 0) &&
+                                        !(seg.precise_terms_en && seg.precise_terms_en.length > 0)
+                                      ) {
+                                        await handleExtractPreciseTerms(false);
+                                      }
+                                    }}
+                                    style={{ padding: "2px 5px", fontSize: 11 }}
                                     title={`覆盖本段处理方式（AI建议：${seg.recommended_action === "mask" ? "遮蔽" : "删段"}）`}
                                   >
                                     <option value="inherit">
-                                      跟随全局（{resolveSegActionFrontend(seg, manifest.clean_cut, canMask) === "mask" ? "遮蔽" : "删段"}）
+                                      跟随全局（{segActionLabel}）
                                     </option>
                                     <option value="delete">删段</option>
                                     <option value="mask" disabled={!canMask}>
-                                      遮蔽{!canMask ? "（无干净原片）" : ""}
+                                      常规遮蔽{!canMask ? "（无干净原片）" : ""}
+                                    </option>
+                                    <option value="precise_mask" disabled={!canMask}>
+                                      精准遮蔽{!canMask ? "（无干净原片）" : ""}
                                     </option>
                                   </select>
                                 )
@@ -2764,7 +3655,9 @@ export default function App() {
                                 </span>
                               )}
                               {seg.detector !== "llm" && (
-                                <span className="tag">{seg.detector === "visual" ? "画面" : "手动"}</span>
+                                <span className="tag">
+                                  {seg.detector === "visual_ocr" ? "画面文字" : seg.detector === "visual" ? "画面" : "手动"}
+                                </span>
                               )}
                               <span
                                 className="utt-time"
@@ -2792,48 +3685,101 @@ export default function App() {
                             )}
                             {seg.kind === "political_sensitive" && (
                               <div style={{ marginTop: 5, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", fontSize: 11 }}>
-                                <label style={{ display: "inline-flex", alignItems: "center", gap: 4, color: "var(--text-2)" }}>
-                                  中文屏蔽词:
-                                  <input
-                                    key={`tzh-${seg.cut_id}-${(seg.sensitive_terms_zh || []).join(",")}`}
-                                    type="text"
-                                    defaultValue={(seg.sensitive_terms_zh || []).join(", ")}
-                                    placeholder="留空则整句替换[已脱敏]"
-                                    style={{ width: 170, padding: "2px 6px", fontSize: 11 }}
-                                    onBlur={(e) => {
-                                      const parsed = e.target.value
-                                        .split(/[,，、]/)
-                                        .map((x) => x.trim())
-                                        .filter(Boolean);
-                                      if (parsed.join(",") !== (seg.sensitive_terms_zh || []).join(",")) {
-                                        handlePatchCleanCut({
-                                          segments: [{ cut_id: seg.cut_id, sensitive_terms_zh: parsed }],
-                                        });
-                                      }
-                                    }}
-                                  />
-                                </label>
-                                <label style={{ display: "inline-flex", alignItems: "center", gap: 4, color: "var(--text-2)" }}>
-                                  英文屏蔽/消音词:
-                                  <input
-                                    key={`ten-${seg.cut_id}-${(seg.sensitive_terms_en || []).join(",")}`}
-                                    type="text"
-                                    defaultValue={(seg.sensitive_terms_en || []).join(", ")}
-                                    placeholder="例: Xi Jinping, China"
-                                    style={{ width: 190, padding: "2px 6px", fontSize: 11 }}
-                                    onBlur={(e) => {
-                                      const parsed = e.target.value
-                                        .split(/[,，、]/)
-                                        .map((x) => x.trim())
-                                        .filter(Boolean);
-                                      if (parsed.join(",") !== (seg.sensitive_terms_en || []).join(",")) {
-                                        handlePatchCleanCut({
-                                          segments: [{ cut_id: seg.cut_id, sensitive_terms_en: parsed }],
-                                        });
-                                      }
-                                    }}
-                                  />
-                                </label>
+                                {isVisualOcrSeg(seg) ? (
+                                  <span style={{ color: "#7dd3fc" }}>
+                                    局部模糊画面文字 ({seg.visual_boxes?.length || 0} 处区域 · 保留原声与字幕)
+                                  </span>
+                                ) : isPreciseSeg ? (
+                                  <>
+                                    <label style={{ display: "inline-flex", alignItems: "center", gap: 4, color: "var(--text-2)" }}>
+                                      精准中文词:
+                                      <input
+                                        key={`pzh-${seg.cut_id}-${(seg.precise_terms_zh || []).join(",")}`}
+                                        type="text"
+                                        defaultValue={(seg.precise_terms_zh || []).join(", ")}
+                                        placeholder="仅屏蔽政治体/不规范称谓/定性词（留空不整段消音）"
+                                        style={{ width: 200, padding: "2px 6px", fontSize: 11 }}
+                                        onBlur={(e) => {
+                                          const parsed = e.target.value
+                                            .split(/[,，、]/)
+                                            .map((x) => x.trim())
+                                            .filter(Boolean);
+                                          if (parsed.join(",") !== (seg.precise_terms_zh || []).join(",")) {
+                                            handlePatchCleanCut({
+                                              segments: [{ cut_id: seg.cut_id, precise_terms_zh: parsed }],
+                                            });
+                                          }
+                                        }}
+                                      />
+                                    </label>
+                                    <label style={{ display: "inline-flex", alignItems: "center", gap: 4, color: "var(--text-2)" }}>
+                                      精准英文消音词:
+                                      <input
+                                        key={`pen-${seg.cut_id}-${(seg.precise_terms_en || []).join(",")}`}
+                                        type="text"
+                                        defaultValue={(seg.precise_terms_en || []).join(", ")}
+                                        placeholder="例: Xi Jinping, aggressor, purges"
+                                        style={{ width: 200, padding: "2px 6px", fontSize: 11 }}
+                                        onBlur={(e) => {
+                                          const parsed = e.target.value
+                                            .split(/[,，、]/)
+                                            .map((x) => x.trim())
+                                            .filter(Boolean);
+                                          if (parsed.join(",") !== (seg.precise_terms_en || []).join(",")) {
+                                            handlePatchCleanCut({
+                                              segments: [{ cut_id: seg.cut_id, precise_terms_en: parsed }],
+                                            });
+                                          }
+                                        }}
+                                      />
+                                    </label>
+                                  </>
+                                ) : (
+                                  <>
+                                    <label style={{ display: "inline-flex", alignItems: "center", gap: 4, color: "var(--text-2)" }}>
+                                      中文屏蔽词:
+                                      <input
+                                        key={`tzh-${seg.cut_id}-${(seg.sensitive_terms_zh || []).join(",")}`}
+                                        type="text"
+                                        defaultValue={(seg.sensitive_terms_zh || []).join(", ")}
+                                        placeholder="留空则整句替换[已脱敏]"
+                                        style={{ width: 170, padding: "2px 6px", fontSize: 11 }}
+                                        onBlur={(e) => {
+                                          const parsed = e.target.value
+                                            .split(/[,，、]/)
+                                            .map((x) => x.trim())
+                                            .filter(Boolean);
+                                          if (parsed.join(",") !== (seg.sensitive_terms_zh || []).join(",")) {
+                                            handlePatchCleanCut({
+                                              segments: [{ cut_id: seg.cut_id, sensitive_terms_zh: parsed }],
+                                            });
+                                          }
+                                        }}
+                                      />
+                                    </label>
+                                    <label style={{ display: "inline-flex", alignItems: "center", gap: 4, color: "var(--text-2)" }}>
+                                      英文屏蔽/消音词:
+                                      <input
+                                        key={`ten-${seg.cut_id}-${(seg.sensitive_terms_en || []).join(",")}`}
+                                        type="text"
+                                        defaultValue={(seg.sensitive_terms_en || []).join(", ")}
+                                        placeholder="例: Xi Jinping, China"
+                                        style={{ width: 190, padding: "2px 6px", fontSize: 11 }}
+                                        onBlur={(e) => {
+                                          const parsed = e.target.value
+                                            .split(/[,，、]/)
+                                            .map((x) => x.trim())
+                                            .filter(Boolean);
+                                          if (parsed.join(",") !== (seg.sensitive_terms_en || []).join(",")) {
+                                            handlePatchCleanCut({
+                                              segments: [{ cut_id: seg.cut_id, sensitive_terms_en: parsed }],
+                                            });
+                                          }
+                                        }}
+                                      />
+                                    </label>
+                                  </>
+                                )}
                               </div>
                             )}
                           </div>
@@ -2972,6 +3918,228 @@ export default function App() {
               </>
             ) : selectedId === "REMIX" ? (
               <>
+                {/* Compact Remix Mode & One-Click Generate/Render Bar */}
+                {(() => {
+                  const explicitSrc = Array.isArray(manifest.remix.source_clip_ids)
+                    ? manifest.remix.source_clip_ids
+                    : null;
+                  const srcMode: "compilation" | "manual_clips" | "prompt" | "ai_auto" =
+                    manifest.remix.source_mode &&
+                    ["compilation", "manual_clips", "prompt", "ai_auto"].includes(manifest.remix.source_mode)
+                      ? manifest.remix.source_mode
+                      : explicitSrc !== null
+                        ? explicitSrc.length > 0
+                          ? "manual_clips"
+                          : "ai_auto"
+                        : "compilation";
+                  const activeSrcSet = new Set(
+                    explicitSrc !== null
+                      ? explicitSrc
+                      : manifest.clips.filter((c) => c.enabled).map((c) => c.clip_id)
+                  );
+                  const remainingToAdd = manifest.clips.filter(
+                    (c) => !manifest.remix.items.some((it) => it.source_clip_id === c.clip_id)
+                  );
+                  const canGenerate =
+                    !jobRunning &&
+                    (srcMode === "compilation"
+                      ? compilationClips.length > 0
+                      : srcMode === "manual_clips"
+                        ? activeSrcSet.size > 0 || (Boolean(manifest.remix.manual_script_locked) && enabledRemixItemCount > 0)
+                        : srcMode === "prompt"
+                          ? Boolean(remixPromptDraft.trim()) && manifest.clips.length > 0
+                          : manifest.clips.length > 0 || (manifest.remix_only_pool?.length || 0) > 0);
+
+                  const handleGenerateRemix = async () => {
+                    if (srcMode === "prompt") {
+                      await handlePatchRemix({
+                        source_mode: "prompt",
+                        custom_prompt: remixPromptDraft.trim(),
+                      });
+                      handleRun(["replan_remix", "render"], true, ["remix"]);
+                    } else if (srcMode === "manual_clips" && manifest.remix.manual_script_locked && enabledRemixItemCount > 0) {
+                      handleRenderRemix(true);
+                    } else {
+                      handleRun(["replan_remix", "render"], true, ["remix"]);
+                    }
+                  };
+
+                  return (
+                    <div
+                      className="clean-cut-toolbar"
+                      style={{ flexDirection: "column", alignItems: "stretch", gap: 6 }}
+                    >
+                      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                        <span style={{ fontWeight: 600, color: "var(--text-1)", whiteSpace: "nowrap" }}>混剪模式：</span>
+                        <select
+                          aria-label="混剪模式"
+                          disabled={jobRunning}
+                          value={srcMode}
+                          onChange={(e) => {
+                            const nextMode = e.target.value as
+                              | "compilation"
+                              | "manual_clips"
+                              | "prompt"
+                              | "ai_auto";
+                            if (nextMode === "manual_clips") {
+                              const fallback = manifest.clips
+                                .filter((c) => c.enabled)
+                                .map((c) => c.clip_id);
+                              const nextIds =
+                                fallback.length > 0
+                                  ? fallback
+                                  : manifest.clips.slice(0, 1).map((c) => c.clip_id);
+                              handlePatchRemix({ source_mode: nextMode, source_clip_ids: nextIds });
+                            } else {
+                              handlePatchRemix({ source_mode: nextMode, clear_source_clip_ids: true });
+                            }
+                          }}
+                          style={{ padding: "3px 6px", fontSize: 12 }}
+                        >
+                          <option value="compilation">基于集锦片段（默认）</option>
+                          <option value="manual_clips">手动勾选片段</option>
+                          <option value="prompt">按 Prompt 定向提取</option>
+                          <option value="ai_auto">完全由 AI 自主精选</option>
+                        </select>
+
+                        {srcMode === "prompt" ? (
+                          <input
+                            type="text"
+                            aria-label="混剪定向提取 Prompt"
+                            disabled={jobRunning}
+                            value={remixPromptDraft}
+                            onChange={(e) => setRemixPromptDraft(e.target.value)}
+                            onBlur={() => {
+                              if (remixPromptDraft.trim() !== (manifest.remix.custom_prompt || "").trim()) {
+                                handlePatchRemix({
+                                  source_mode: "prompt",
+                                  custom_prompt: remixPromptDraft.trim(),
+                                });
+                              }
+                            }}
+                            onKeyDown={(e) => e.key === "Enter" && canGenerate && handleGenerateRemix()}
+                            placeholder="输入提取要求，如：只提取个人成长经历与商业思维"
+                            style={{ flex: 1, minWidth: 200, padding: "3px 8px", fontSize: 12 }}
+                          />
+                        ) : (
+                          <span style={{ fontSize: 11, color: "var(--text-2)", flex: 1, minWidth: 120 }}>
+                            {srcMode === "compilation"
+                              ? `同步集锦 ${compilationClips.length} 支切片 · 当前 ${enabledRemixItemCount} 段`
+                              : srcMode === "manual_clips"
+                                ? manifest.remix.manual_script_locked
+                                  ? `已锁定人工段落 (${enabledRemixItemCount}/${manifest.remix.items.length})`
+                                  : `已选 ${activeSrcSet.size} 支切片 · 当前 ${enabledRemixItemCount} 段`
+                                : `全片 ${manifest.clips.length} 支候选 · 当前 ${enabledRemixItemCount} 段`}
+                          </span>
+                        )}
+
+                        <button
+                          type="button"
+                          className="sm primary"
+                          style={{ marginLeft: "auto", whiteSpace: "nowrap" }}
+                          disabled={!canGenerate}
+                          onClick={handleGenerateRemix}
+                          title="按当前混剪模式重排脚本并自动渲染混剪成片与封面"
+                        >
+                          {jobRunning ? "生成中..." : "生成混剪"}
+                        </button>
+                      </div>
+
+                      {srcMode === "manual_clips" && manifest.clips.length > 0 && (
+                        <div style={{ display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap", fontSize: 11 }}>
+                          <span style={{ color: "var(--text-2)" }}>切片：</span>
+                          {manifest.clips.map((c) => {
+                            const on = activeSrcSet.has(c.clip_id);
+                            return (
+                              <button
+                                key={c.clip_id}
+                                type="button"
+                                className={`sm ${on ? "primary" : ""}`}
+                                style={{ padding: "1px 6px", fontSize: 11 }}
+                                title={c.title}
+                                disabled={jobRunning}
+                                onClick={() => {
+                                  const nextSet = new Set(activeSrcSet);
+                                  if (on) nextSet.delete(c.clip_id);
+                                  else nextSet.add(c.clip_id);
+                                  handlePatchRemix({
+                                    source_mode: "manual_clips",
+                                    source_clip_ids: manifest.clips
+                                      .filter((x) => nextSet.has(x.clip_id))
+                                      .map((x) => x.clip_id),
+                                  });
+                                }}
+                              >
+                                #{String(c.index).padStart(2, "0")}
+                              </button>
+                            );
+                          })}
+                          <button
+                            type="button"
+                            className="sm"
+                            style={{ padding: "1px 6px", fontSize: 11 }}
+                            disabled={jobRunning}
+                            onClick={() =>
+                              handlePatchRemix({
+                                source_mode: "manual_clips",
+                                source_clip_ids: manifest.clips.filter((c) => c.enabled).map((c) => c.clip_id),
+                              })
+                            }
+                          >
+                            同步左侧
+                          </button>
+                          <div style={{ display: "flex", gap: 4, marginLeft: "auto", flexWrap: "wrap" }}>
+                            <button
+                              type="button"
+                              className="sm"
+                              style={{ padding: "1px 6px", fontSize: 11 }}
+                              disabled={jobRunning || manifest.remix.items.length === 0}
+                              onClick={() =>
+                                handlePatchRemix({
+                                  items: manifest.remix.items.map((it) => ({ remix_id: it.remix_id, enabled: true })),
+                                })
+                              }
+                            >
+                              全选段落
+                            </button>
+                            <button
+                              type="button"
+                              className="sm"
+                              style={{ padding: "1px 6px", fontSize: 11 }}
+                              disabled={jobRunning || manifest.remix.items.length === 0}
+                              onClick={() =>
+                                handlePatchRemix({
+                                  items: manifest.remix.items.map((it) => ({ remix_id: it.remix_id, enabled: false })),
+                                })
+                              }
+                            >
+                              全不选
+                            </button>
+                            <select
+                              aria-label="手动加入切片到混剪"
+                              disabled={jobRunning || manifest.clips.length === 0}
+                              value=""
+                              onChange={(e) => {
+                                if (e.target.value) {
+                                  handlePatchRemix({ add_clip_id: e.target.value });
+                                }
+                              }}
+                              style={{ padding: "1px 5px", fontSize: 11, maxWidth: 145 }}
+                            >
+                              <option value="">+ 加入切片…</option>
+                              {(remainingToAdd.length > 0 ? remainingToAdd : manifest.clips).map((c) => (
+                                <option key={c.clip_id} value={c.clip_id}>
+                                  #{String(c.index).padStart(2, "0")} {c.title}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+
                 {/* Unified Remix Cover Title & Publish Card */}
                 <div className="clip-inspector-bar" style={{ flexDirection: "row", gap: 14, alignItems: "center" }}>
                   <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 7 }}>
@@ -3011,32 +4179,23 @@ export default function App() {
                     <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                       <button
                         type="button"
-                        className="sm"
-                        disabled={jobRunning || (manifest.remix.items.length > 0 && enabledRemixItemCount === 0) || (manifest.remix.items.length === 0 && manifest.clips.length === 0 && (manifest.remix_only_pool?.length || 0) === 0)}
-                        onClick={() => handleRenderRemix(true)}
-                        title="仅单独渲染当前 AI 混剪及封面（严格按已勾选段落出片）"
+                        className={remixPubJob ? "sm danger" : "sm primary"}
+                        disabled={
+                          remixPubJob
+                            ? Boolean(remixPubJob.cancelling)
+                            : (!manifest.remix.output_file || jobRunning)
+                        }
+                        onClick={() => (remixPubJob ? handleCancelPublishJob(remixPubJob.job_id) : openPublishModal())}
                       >
-                        {isRendering ? "渲染中..." : manifest.remix.output_file ? "重渲混剪" : "渲染混剪"}
-                      </button>
-                      <button
-                        type="button"
-                        className="sm"
-                        disabled={jobRunning || (manifest.clips.length === 0 && (manifest.remix_only_pool?.length || 0) === 0)}
-                        onClick={() => handleRun(["replan_remix"])}
-                        title="按上方设定的素材范围由 AI 重新规划混剪脚本（只重排脚本不渲染）"
-                      >
-                        AI 重新规划
-                      </button>
-                      <button
-                        type="button"
-                        className="sm primary"
-                        disabled={!manifest.remix.output_file || jobRunning}
-                        onClick={openPublishModal}
-                      >
-                        发布到 视频号 / B站 / 小红书…
+                        {remixPubJob
+                          ? remixPubJob.cancelling
+                            ? "正在中止发布..."
+                            : "发布中 · 中止"
+                          : "发布到 视频号 / B站 / 小红书…"}
                       </button>
                       {renderPubBadges(manifest.remix.publish_records)}
                     </div>
+                    {renderPublishDiagnostics("remix", manifest.remix.publish_records)}
                   </div>
                   {currentCoverUrl && (
                     <a
@@ -3062,177 +4221,24 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Visible Remix Source & Manual Control Bar */}
-                {(() => {
-                  const explicitSrc = Array.isArray(manifest.remix.source_clip_ids)
-                    ? manifest.remix.source_clip_ids
-                    : null;
-                  const srcMode =
-                    explicitSrc !== null
-                      ? explicitSrc.length > 0
-                        ? "custom"
-                        : "auto"
-                      : enabledClipCount > 0
-                        ? "custom"
-                        : "auto";
-                  const activeSrcSet = new Set(
-                    explicitSrc !== null
-                      ? explicitSrc
-                      : manifest.clips.filter((c) => c.enabled).map((c) => c.clip_id)
-                  );
-                  const remainingToAdd = manifest.clips.filter(
-                    (c) => !manifest.remix.items.some((it) => it.source_clip_id === c.clip_id)
-                  );
-                  return (
-                    <div
-                      className="clean-cut-toolbar"
-                      style={{ flexDirection: "column", alignItems: "stretch", gap: 6 }}
-                    >
-                      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                        <span style={{ fontWeight: 600, color: "var(--text-1)" }}>脚本来源：</span>
-                        <select
-                          aria-label="混剪素材范围"
-                          disabled={jobRunning}
-                          value={srcMode}
-                          onChange={(e) => {
-                            if (e.target.value === "auto") {
-                              handlePatchRemix({ source_clip_ids: [] });
-                            } else {
-                              const fallback = manifest.clips
-                                .filter((c) => c.enabled)
-                                .map((c) => c.clip_id);
-                              const next =
-                                fallback.length > 0
-                                  ? fallback
-                                  : manifest.clips.slice(0, 1).map((c) => c.clip_id);
-                              handlePatchRemix({ source_clip_ids: next });
-                            }
-                          }}
-                          style={{ padding: "2px 6px", fontSize: 11 }}
-                        >
-                          <option value="auto">全片 AI 自主精选</option>
-                          <option value="custom">限定参与重排的切片范围</option>
-                        </select>
-                        {manifest.remix.manual_script_locked ? (
-                          <span
-                            className="tag cached"
-                            title="已手动增删/勾选/排序段落，渲染时严格按下方已勾选段落出片，不会被左侧独立切片改动覆盖"
-                          >
-                            人工已锁定·按勾选段落出片 ({enabledRemixItemCount}/{manifest.remix.items.length})
-                          </span>
-                        ) : (
-                          <span className="tag">
-                            AI 策展脚本 ({enabledRemixItemCount}/{manifest.remix.items.length})
-                          </span>
-                        )}
-                        <div style={{ display: "flex", gap: 4, marginLeft: "auto", flexWrap: "wrap" }}>
-                          <button
-                            type="button"
-                            className="sm"
-                            disabled={jobRunning || manifest.remix.items.length === 0}
-                            onClick={() =>
-                              handlePatchRemix({
-                                items: manifest.remix.items.map((it) => ({ remix_id: it.remix_id, enabled: true })),
-                              })
-                            }
-                          >
-                            全选段落
-                          </button>
-                          <button
-                            type="button"
-                            className="sm"
-                            disabled={jobRunning || manifest.remix.items.length === 0}
-                            onClick={() =>
-                              handlePatchRemix({
-                                items: manifest.remix.items.map((it) => ({ remix_id: it.remix_id, enabled: false })),
-                              })
-                            }
-                          >
-                            全不选
-                          </button>
-                          <select
-                            aria-label="手动加入切片到混剪"
-                            disabled={jobRunning || manifest.clips.length === 0}
-                            value=""
-                            onChange={(e) => {
-                              if (e.target.value) {
-                                handlePatchRemix({ add_clip_id: e.target.value });
-                              }
-                            }}
-                            style={{ padding: "2px 6px", fontSize: 11, maxWidth: 165 }}
-                          >
-                            <option value="">+ 手动加入切片…</option>
-                            {(remainingToAdd.length > 0 ? remainingToAdd : manifest.clips).map((c) => (
-                              <option key={c.clip_id} value={c.clip_id}>
-                                #{String(c.index).padStart(2, "0")} {c.title}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      </div>
-                      {srcMode === "custom" && manifest.clips.length > 0 && (
-                        <div style={{ display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap", fontSize: 11 }}>
-                          <span style={{ color: "var(--text-2)" }}>参与重排切片：</span>
-                          {manifest.clips.map((c) => {
-                            const on = activeSrcSet.has(c.clip_id);
-                            return (
-                              <button
-                                key={c.clip_id}
-                                type="button"
-                                className={`sm ${on ? "primary" : ""}`}
-                                style={{ padding: "1px 6px", fontSize: 11 }}
-                                title={c.title}
-                                disabled={jobRunning}
-                                onClick={() => {
-                                  const nextSet = new Set(activeSrcSet);
-                                  if (on) nextSet.delete(c.clip_id);
-                                  else nextSet.add(c.clip_id);
-                                  handlePatchRemix({
-                                    source_clip_ids: manifest.clips
-                                      .filter((x) => nextSet.has(x.clip_id))
-                                      .map((x) => x.clip_id),
-                                  });
-                                }}
-                              >
-                                #{String(c.index).padStart(2, "0")}
-                              </button>
-                            );
-                          })}
-                          <button
-                            type="button"
-                            className="sm"
-                            style={{ padding: "1px 6px", fontSize: 11 }}
-                            disabled={jobRunning}
-                            onClick={() =>
-                              handlePatchRemix({
-                                source_clip_ids: manifest.clips.filter((c) => c.enabled).map((c) => c.clip_id),
-                              })
-                            }
-                          >
-                            同步左侧勾选
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })()}
-
                 {/* Collapsed Remix Advanced Options */}
                 <details className="fold">
                   <summary>
-                    ▸ 画面卡片与音频选项（{remixStats.themeCount} 板块 / {remixStats.segmentCount} 段 · 预估 {fmtTime(remixStats.estTotalS)}）
+                    ▸ 顶部导航条与音频选项（{remixStats.themeCount} 板块 / {remixStats.segmentCount} 段 · 预估 {fmtTime(remixStats.estTotalS)}）
                   </summary>
                   <div className="fold-body" style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
                     <label>
-                      标题卡：
+                      {(navCfg.remix_style || navCfg.style) === "title_card" ? "段前卡片：" : "顶部导航条："}
                       <select
                         value={manifest.remix.card_mode}
                         onChange={(e) => handlePatchRemix({ card_mode: e.target.value })}
                         style={{ marginLeft: 4 }}
                       >
                         <option value="group">按主题组</option>
-                        <option value="every">每段前</option>
-                        <option value="none">不插卡</option>
+                        <option value="every">每段</option>
+                        <option value="none">
+                          {(navCfg.remix_style || navCfg.style) === "title_card" ? "不插卡" : "隐藏导航条"}
+                        </option>
                       </select>
                     </label>
                     <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
@@ -3397,6 +4403,15 @@ export default function App() {
                           handlePatchCompilation({ title: titleDraft.trim() })
                         }
                       />
+                      <button
+                        type="button"
+                        className="sm"
+                        disabled={compTitleSuggesting || jobRunning || manifest.clips.length === 0}
+                        onClick={handleSuggestCompilationTitle}
+                        title="由 AI 根据入选切片内容重新提炼精选集主题标题"
+                      >
+                        {compTitleSuggesting ? "提炼中..." : "AI提炼标题"}
+                      </button>
                     </div>
                     <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                       <span style={{ color: "var(--text-2)", fontSize: 12, width: 56 }}>封面标题</span>
@@ -3429,14 +4444,23 @@ export default function App() {
                       </button>
                       <button
                         type="button"
-                        className="sm primary"
-                        disabled={!manifest.compilation?.output_file || jobRunning}
-                        onClick={openPublishModal}
+                        className={compPubJob ? "sm danger" : "sm primary"}
+                        disabled={
+                          compPubJob
+                            ? Boolean(compPubJob.cancelling)
+                            : (!manifest.compilation?.output_file || jobRunning)
+                        }
+                        onClick={() => (compPubJob ? handleCancelPublishJob(compPubJob.job_id) : openPublishModal())}
                       >
-                        发布到 视频号 / B站 / 小红书…
+                        {compPubJob
+                          ? compPubJob.cancelling
+                            ? "正在中止发布..."
+                            : "发布中 · 中止"
+                          : "发布到 视频号 / B站 / 小红书…"}
                       </button>
                       {renderPubBadges(manifest.compilation?.publish_records)}
                     </div>
+                    {renderPublishDiagnostics("compilation", manifest.compilation?.publish_records)}
                   </div>
                   {currentCoverUrl && (
                     <a
@@ -3468,18 +4492,30 @@ export default function App() {
                     <span style={{ color: "var(--text-1)", fontWeight: 600 }}>
                       已选 {compilationClips.length}/{manifest.clips.length} 支 · 约 {fmtTime(compilationTotalS)}
                     </span>
-                    <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-                      章节片头卡：
-                      <select
-                        value={String(manifest.compilation?.card_duration_s ?? 1.8)}
-                        onChange={(e) => handlePatchCompilation({ card_duration_s: Number(e.target.value) })}
-                        style={{ padding: "2px 5px", fontSize: 11 }}
+                    {(navCfg.compilation_style || navCfg.style) === "title_card" ||
+                    (navCfg.compilation_style || navCfg.style) === "both" ? (
+                      <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                        段前片头卡：
+                        <select
+                          value={String(manifest.compilation?.card_duration_s ?? 1.8)}
+                          onChange={(e) => handlePatchCompilation({ card_duration_s: Number(e.target.value) })}
+                          style={{ padding: "2px 5px", fontSize: 11 }}
+                        >
+                          <option value="1.2">1.2s</option>
+                          <option value="1.8">1.8s</option>
+                          <option value="2.5">2.5s</option>
+                        </select>
+                      </label>
+                    ) : (
+                      <button
+                        type="button"
+                        className="sm"
+                        onClick={() => settingsDialogRef.current?.showModal()}
+                        title="点击在设置中切换常驻导航式 / 段前卡片式及色系"
                       >
-                        <option value="1.2">1.2s</option>
-                        <option value="1.8">1.8s</option>
-                        <option value="2.5">2.5s</option>
-                      </select>
-                    </label>
+                        顶部导航条：常驻高亮
+                      </button>
+                    )}
                   </div>
                   <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                     <button
@@ -3576,7 +4612,6 @@ export default function App() {
                         const isSelected = selectedSet.has(c.clip_id);
                         const selPos = isSelected ? listIdx : -1;
                         const partNum = isSelected ? String(selPos + 1).padStart(2, "0") : "";
-                        const cardSec = (manifest.compilation?.card_duration_s ?? 1.8).toFixed(1);
                         const cComp = summarizeIntervalsCompliance(
                           [[c.start_s, c.end_s]],
                           manifest.cut_segments || [],
@@ -3619,7 +4654,7 @@ export default function App() {
                                       borderColor: "rgba(59, 130, 246, 0.45)",
                                     }}
                                   >
-                                    片头卡 Part {partNum} ({cardSec}s)
+                                    导航分段 {partNum}
                                   </span>
                                 )}
                                 <span style={{ fontWeight: 600 }}>
@@ -3731,14 +4766,25 @@ export default function App() {
                       </button>
                       <button
                         type="button"
-                        className="sm primary"
-                        disabled={!activeClip.output_file || jobRunning}
-                        onClick={openPublishModal}
+                        className={clipPubJob ? "sm danger" : "sm primary"}
+                        disabled={
+                          clipPubJob
+                            ? Boolean(clipPubJob.cancelling)
+                            : (!activeClip.output_file || jobRunning)
+                        }
+                        onClick={() => (clipPubJob ? handleCancelPublishJob(clipPubJob.job_id) : openPublishModal())}
                       >
-                        发布到 视频号 / B站 / 小红书…
+                        {clipPubJob
+                          ? clipPubJob.cancelling
+                            ? "正在中止..."
+                            : clipPubJob.kind === "batch" && clipPubJob.current_target !== activeClip.clip_id
+                              ? "批量队列等待中 · 中止批次"
+                              : "发布中 · 中止"
+                          : "发布到 视频号 / B站 / 小红书…"}
                       </button>
                       {renderPubBadges(activeClip.publish_records)}
                     </div>
+                    {renderPublishDiagnostics(activeClip.clip_id, activeClip.publish_records)}
                   </div>
                   {currentCoverUrl && (
                     <a
@@ -3804,11 +4850,18 @@ export default function App() {
                     </div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 2, color: "var(--text-2)", fontSize: 11 }}>
                       {activeClipCompliance.overlappingSegs.map(({ seg, effAction, reasonLabel }) => {
-                        const termTxt = [...(seg.sensitive_terms_zh || []), ...(seg.sensitive_terms_en || [])].join(" / ");
+                        const effTerms =
+                          effAction === "mask" || effAction === "precise_mask"
+                            ? getEffectiveMaskTerms(seg, effAction)
+                            : { zh: [], en: [] };
+                        const termTxt = [...effTerms.zh, ...effTerms.en].join(" / ");
                         return (
                           <div key={seg.cut_id}>
                             • [{fmtTime(seg.start_s)}–{fmtTime(seg.end_s)}] {reasonLabel}
-                            {effAction === "mask" && termTxt ? `（词表：${termTxt}）` : ""} — {seg.reason}
+                            {(effAction === "mask" || effAction === "precise_mask") && termTxt
+                              ? `（词表：${termTxt}）`
+                              : ""}{" "}
+                            — {seg.reason}
                           </div>
                         );
                       })}
@@ -3915,9 +4968,13 @@ export default function App() {
                       const hasDel = activeHits.some(
                         (seg) => resolveSegActionFrontend(seg, manifest.clean_cut, canMask) === "delete"
                       );
-                      const maskHits = activeHits.filter(
-                        (seg) => resolveSegActionFrontend(seg, manifest.clean_cut, canMask) === "mask"
-                      );
+                      const maskHits = activeHits.filter((seg) => {
+                        const a = resolveSegActionFrontend(seg, manifest.clean_cut, canMask);
+                        return a === "mask" || a === "precise_mask";
+                      });
+                      const allPrecise =
+                        maskHits.length > 0 &&
+                        maskHits.every((seg) => resolveSegActionFrontend(seg, manifest.clean_cut, canMask) === "precise_mask");
                       const rowStyle: CSSProperties | undefined = hasDel
                         ? { background: "rgba(239, 68, 68, 0.10)", borderLeft: "3px solid #ef4444" }
                         : maskHits.length > 0
@@ -3948,15 +5005,16 @@ export default function App() {
                                   className="tag"
                                   style={{ marginLeft: 6, background: "rgba(56, 189, 248, 0.2)", color: "#7dd3fc" }}
                                 >
-                                  将遮蔽:{" "}
+                                  {allPrecise ? "精准遮蔽:" : "将遮蔽:"}{" "}
                                   {Array.from(
                                     new Set(
-                                      maskHits.flatMap((s) => [
-                                        ...(s.sensitive_terms_zh || []),
-                                        ...(s.sensitive_terms_en || []),
-                                      ])
+                                      maskHits.flatMap((s) => {
+                                        const act = resolveSegActionFrontend(s, manifest.clean_cut, canMask);
+                                        const t = getEffectiveMaskTerms(s, act);
+                                        return [...t.zh, ...t.en];
+                                      })
                                     )
-                                  ).join(" / ") || "整句"}
+                                  ).join(" / ") || (allPrecise ? "无精准词(放行)" : "整句")}
                                 </span>
                               )}
                               {activeHits.length === 0 && uHits.length > 0 && (
@@ -3996,7 +5054,11 @@ export default function App() {
                 </div>
               </>
             ) : (
-              <div className="empty-state">在左侧选择一个切片或 Remix 进行预览与发布。</div>
+              <div className="empty-state">
+                {hasStrategy
+                  ? "在左侧选择一个切片、精选集或 AI 混剪进行预览与发布。"
+                  : "尚未生成切片策略。点击上方「生成切片策略」完成广告/敏感分析、独立切片与高光混剪规划。"}
+              </div>
             )}
             </div>
           </section>
@@ -4184,25 +5246,43 @@ export default function App() {
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
               <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                 <span style={{ fontSize: 12, color: "var(--text-2)" }}>
-                  脱敏策略（{manifest ? "作用于当前项目并存为默认" : "新建项目默认"}）
+                  当前项目脱敏方式
                 </span>
                 <select
-                  aria-label="设置中的脱敏策略"
-                  disabled={jobRunning}
+                  aria-label="当前项目脱敏方式"
+                  disabled={!manifest || jobRunning}
                   value={manifest ? cleanCutStats.politicalAction : contentFilterCfg?.default_political_action || "auto"}
-                  onChange={(e) =>
-                    handleChangeGlobalPoliticalAction(e.target.value as "auto" | "delete" | "mask")
-                  }
+                  onChange={(e) => handleChangeProjectPoliticalAction(e.target.value as PoliticalAction)}
                 >
                   <option value="auto">
                     智能（顺带打码+哔音，整段删剪）{manifest && !canMask ? " [无干净原片]" : ""}
                   </option>
                   <option value="delete">全删片段</option>
                   <option value="mask" disabled={Boolean(manifest && !canMask)}>
-                    敏感词遮蔽+哔音{manifest && !canMask ? "（无干净原片）" : ""}
+                    常规遮蔽+消音（现有方式）{manifest && !canMask ? "（无干净原片）" : ""}
+                  </option>
+                  <option value="precise_mask" disabled={Boolean(manifest && !canMask)}>
+                    精准遮蔽+消音（仅关键词）{manifest && !canMask ? "（无干净原片）" : ""}
                   </option>
                 </select>
               </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <span style={{ fontSize: 12, color: "var(--text-2)" }}>
+                  新建项目默认脱敏方式（写入配置）
+                </span>
+                <select
+                  aria-label="配置中的默认脱敏方式"
+                  value={contentFilterCfg?.default_political_action || "auto"}
+                  onChange={(e) => handleChangeDefaultPoliticalAction(e.target.value as PoliticalAction)}
+                >
+                  <option value="auto">智能（顺带打码+哔音，整段删剪）</option>
+                  <option value="delete">全删片段</option>
+                  <option value="mask">常规遮蔽+消音（现有方式）</option>
+                  <option value="precise_mask">精准遮蔽+消音（仅关键词）</option>
+                </select>
+              </label>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, alignItems: "end" }}>
               <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                 <span style={{ fontSize: 12, color: "var(--text-2)" }}>净版剪切模式</span>
                 <select
@@ -4216,8 +5296,6 @@ export default function App() {
                   <option value="reencode">全片硬件帧精准</option>
                 </select>
               </label>
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, alignItems: "end" }}>
               <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                 <span style={{ fontSize: 12, color: "var(--text-2)" }}>新建项目默认政审标准</span>
                 <select
@@ -4232,14 +5310,264 @@ export default function App() {
                   <option value="loose">仅硬红线</option>
                 </select>
               </label>
-              <div style={{ fontSize: 11, color: "var(--text-2)", lineHeight: 1.5 }}>
-                {manifest
-                  ? canMask
-                    ? "当前项目存在无字幕干净原片，可使用词级遮蔽+880Hz哔音并重烧双语字幕。"
-                    : "当前项目缺少无字幕干净原片，遮蔽选项已禁用并自动回退删段。"
-                  : "载入项目后可在上方状态栏切换本片去广/脱敏开关与政审标准，在此统一配置脱敏方式。"}
-              </div>
             </div>
+            <div style={{ fontSize: 11, color: "var(--text-2)", lineHeight: 1.5 }}>
+              {manifest && !canMask
+                ? "当前项目缺少无字幕干净原片，遮蔽选项已禁用并自动回退删段。"
+                : "「精准遮蔽」仅屏蔽领导人/政体/中港台不规范称谓及定性判断词，不消音整段；任一模式均可设为新建项目默认。"}
+            </div>
+          </div>
+
+          <div
+            style={{
+              padding: "10px 12px",
+              borderRadius: 8,
+              border: "1px solid var(--border)",
+              background: "var(--bg-2)",
+              display: "flex",
+              flexDirection: "column",
+              gap: 10,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+              <span style={{ fontWeight: 600 }}>导航样式与封面主题色系</span>
+              <span style={{ fontSize: 11, color: "var(--text-2)" }}>
+                切换后重渲或刷新封面生效
+              </span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <span style={{ fontSize: 12, color: "var(--text-2)" }}>高光混剪导航模式</span>
+                <select
+                  aria-label="高光混剪导航模式"
+                  value={navCfg.remix_style || navCfg.style}
+                  onChange={async (e) => {
+                    const nextStyle = e.target.value as "top_nav" | "both" | "title_card";
+                    setNavCfg((prev) => ({ ...prev, remix_style: nextStyle }));
+                    try {
+                      const saved = await api.saveNavigationConfig({ remix_style: nextStyle });
+                      setNavCfg(saved);
+                      if (manifest) {
+                        const refreshed = await api.getProject(manifest.project_id);
+                        setManifest(refreshed.manifest);
+                      }
+                    } catch (err) {
+                      setErrorMsg(String(err));
+                    }
+                  }}
+                >
+                  <option value="top_nav">常驻导航式（默认 · 全程高亮）</option>
+                  <option value="both">导航 + 段前卡片（双显）</option>
+                  <option value="title_card">段前卡片式（每段前插入片头卡）</option>
+                </select>
+              </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <span style={{ fontSize: 12, color: "var(--text-2)" }}>切片精选集导航模式</span>
+                <select
+                  aria-label="切片精选集导航模式"
+                  value={navCfg.compilation_style || navCfg.style}
+                  onChange={async (e) => {
+                    const nextStyle = e.target.value as "top_nav" | "both" | "title_card";
+                    setNavCfg((prev) => ({ ...prev, compilation_style: nextStyle }));
+                    try {
+                      const saved = await api.saveNavigationConfig({ compilation_style: nextStyle });
+                      setNavCfg(saved);
+                      if (manifest) {
+                        const refreshed = await api.getProject(manifest.project_id);
+                        setManifest(refreshed.manifest);
+                      }
+                    } catch (err) {
+                      setErrorMsg(String(err));
+                    }
+                  }}
+                >
+                  <option value="top_nav">常驻导航式（默认 · 全程高亮）</option>
+                  <option value="both">导航 + 段前卡片（双显）</option>
+                  <option value="title_card">段前卡片式（每段前插入片头卡）</option>
+                </select>
+              </label>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <span style={{ fontSize: 12, color: "var(--text-2)" }}>屏幕布局（混剪 / 精选集）</span>
+                <select
+                  aria-label="屏幕布局"
+                  value={navCfg.screen_layout || "portrait"}
+                  onChange={async (e) => {
+                    const nextLayout = e.target.value as "portrait" | "landscape";
+                    setNavCfg((prev) => ({ ...prev, screen_layout: nextLayout }));
+                    try {
+                      const saved = await api.saveNavigationConfig({ screen_layout: nextLayout });
+                      setNavCfg(saved);
+                      if (manifest) {
+                        const refreshed = await api.getProject(manifest.project_id);
+                        setManifest(refreshed.manifest);
+                      }
+                    } catch (err) {
+                      setErrorMsg(String(err));
+                    }
+                  }}
+                >
+                  <option value="portrait">竖版 9:16（默认 · 标题与导航置上下黑边）</option>
+                  <option value="landscape">横版 16:9（原画比例 · 顶部导航条）</option>
+                </select>
+              </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <span style={{ fontSize: 12, color: "var(--text-2)" }}>主题色系（导航 / 卡片 / 封面）</span>
+                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  <select
+                    aria-label="导航主题色系"
+                    style={{ flex: 1 }}
+                    value={navCfg.color_scheme}
+                    onChange={async (e) => {
+                      const nextScheme = e.target.value;
+                      setNavCfg((prev) => ({ ...prev, color_scheme: nextScheme }));
+                      try {
+                        const saved = await api.saveNavigationConfig({ color_scheme: nextScheme });
+                        setNavCfg(saved);
+                        if (manifest) {
+                          const target =
+                            selectedId === "REMIX"
+                              ? "remix"
+                              : selectedId === "COMPILATION"
+                                ? "compilation"
+                                : selectedId === "CLEAN_CUT"
+                                  ? "clean_cut"
+                                  : selectedId || "remix";
+                          try {
+                            const cov = await api.refreshCover(manifest.project_id, target);
+                            setManifest(cov.manifest);
+                            setCoverNonce((n) => n + 1);
+                          } catch {
+                            const refreshed = await api.getProject(manifest.project_id);
+                            setManifest(refreshed.manifest);
+                          }
+                        }
+                      } catch (err) {
+                        setErrorMsg(String(err));
+                      }
+                    }}
+                  >
+                    {(
+                      navCfg.presets || [
+                        { id: "tiffany", label: "蒂芙尼青", hex: "#0ABAB5" },
+                        { id: "amber", label: "琥珀金", hex: "#F59E0B" },
+                        { id: "cobalt", label: "钴蓝科技", hex: "#3B82F6" },
+                        { id: "crimson", label: "绯红醒目", hex: "#EF4444" },
+                        { id: "emerald", label: "翡翠绿", hex: "#10B981" },
+                        { id: "violet", label: "紫罗兰", hex: "#8B5CF6" },
+                      ]
+                    ).map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.label} ({p.hex})
+                      </option>
+                    ))}
+                    <option value="custom">自定义色值 ({navCfg.custom_accent})</option>
+                  </select>
+                  <input
+                    type="color"
+                    aria-label="自定义导航主题色"
+                    value={
+                      navCfg.color_scheme === "custom"
+                        ? navCfg.custom_accent || "#0ABAB5"
+                        : (navCfg.presets || []).find((p) => p.id === navCfg.color_scheme)?.hex || "#0ABAB5"
+                    }
+                    onChange={async (e) => {
+                      const hex = e.target.value.toUpperCase();
+                      setNavCfg((prev) => ({ ...prev, color_scheme: "custom", custom_accent: hex }));
+                      try {
+                        const saved = await api.saveNavigationConfig({
+                          color_scheme: "custom",
+                          custom_accent: hex,
+                        });
+                        setNavCfg(saved);
+                        if (manifest) {
+                          const target =
+                            selectedId === "REMIX"
+                              ? "remix"
+                              : selectedId === "COMPILATION"
+                                ? "compilation"
+                                : selectedId === "CLEAN_CUT"
+                                  ? "clean_cut"
+                                  : selectedId || "remix";
+                          try {
+                            const cov = await api.refreshCover(manifest.project_id, target);
+                            setManifest(cov.manifest);
+                            setCoverNonce((n) => n + 1);
+                          } catch {
+                            const refreshed = await api.getProject(manifest.project_id);
+                            setManifest(refreshed.manifest);
+                          }
+                        }
+                      } catch (err) {
+                        setErrorMsg(String(err));
+                      }
+                    }}
+                    title="自定义主题色"
+                    style={{
+                      width: 32,
+                      height: 28,
+                      padding: 2,
+                      border: "1px solid var(--border)",
+                      borderRadius: 4,
+                      background: "transparent",
+                      cursor: "pointer",
+                    }}
+                  />
+                </div>
+              </label>
+            </div>
+            {(() => {
+              const activeHex =
+                navCfg.color_scheme === "custom"
+                  ? navCfg.custom_accent || "#0ABAB5"
+                  : (navCfg.presets || [
+                      { id: "tiffany", label: "蒂芙尼青", hex: "#0ABAB5" },
+                      { id: "amber", label: "琥珀金", hex: "#F59E0B" },
+                      { id: "cobalt", label: "钴蓝科技", hex: "#3B82F6" },
+                      { id: "crimson", label: "绯红醒目", hex: "#EF4444" },
+                      { id: "emerald", label: "翡翠绿", hex: "#10B981" },
+                      { id: "violet", label: "紫罗兰", hex: "#8B5CF6" },
+                    ]).find((p) => p.id === navCfg.color_scheme)?.hex || "#0ABAB5";
+              return (
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 6,
+                    padding: "6px 8px",
+                    borderRadius: 6,
+                    background: "rgba(11, 15, 24, 0.92)",
+                    border: `1px solid ${activeHex}55`,
+                    fontSize: 11,
+                    alignItems: "center",
+                  }}
+                >
+                  <span style={{ color: "#94a3b8", padding: "2px 6px", borderRadius: 4, background: "rgba(255,255,255,0.06)" }}>
+                    01 已播分段
+                  </span>
+                  <span style={{ color: "#fff", fontWeight: 700, padding: "2px 8px", borderRadius: 4, background: activeHex }}>
+                    02 当前高亮分段
+                  </span>
+                  <span style={{ color: "#94a3b8", padding: "2px 6px", borderRadius: 4, background: "rgba(255,255,255,0.04)" }}>
+                    03 待播分段
+                  </span>
+                  <span style={{ marginLeft: "auto", color: "#94a3b8" }}>
+                    {(navCfg.screen_layout || "portrait") === "portrait" ? "竖版9:16" : "横版16:9"} · 混剪:
+                    {(navCfg.remix_style || navCfg.style) === "both"
+                      ? "导航+卡"
+                      : (navCfg.remix_style || navCfg.style) === "top_nav"
+                        ? "常驻"
+                        : "卡片"}
+                    /精选集:
+                    {(navCfg.compilation_style || navCfg.style) === "both"
+                      ? "导航+卡"
+                      : (navCfg.compilation_style || navCfg.style) === "top_nav"
+                        ? "常驻"
+                        : "卡片"}
+                  </span>
+                </div>
+              );
+            })()}
           </div>
 
           <div>
@@ -4357,35 +5685,94 @@ export default function App() {
           </form>
         </div>
         <div className="dialog-body scroller" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 12, color: "var(--text-2)" }}>选择发布平台与登录态</span>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              {activePublishTarget && activePublishRecords.some((r) => r.status === "error" || r.status === "running") && (
+                <button
+                  type="button"
+                  className="sm"
+                  disabled={jobRunning || pubResettingKey !== null}
+                  onClick={() => handleResetPublish(activePublishTarget)}
+                >
+                  {pubResettingKey === `${activePublishTarget}:all` ? "复位中..." : "复位全部失败状态"}
+                </button>
+              )}
+              <button type="button" className="sm" onClick={() => handleRefreshPublishStatus()}>
+                刷新登录态
+              </button>
+            </div>
+          </div>
+
+          {pubLoginNotice && (
+            <div className="pub-login-notice" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+              <span>{pubLoginNotice}</span>
+              <button type="button" className="sm" onClick={() => setPubLoginNotice(null)}>
+                关闭
+              </button>
+            </div>
+          )}
+
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {(["wechat", "bilibili", "xiaohongshu"] as const).map((plat) => {
               const st = platStatus[plat];
               const logged = Boolean(st?.logged_in);
+              const loginRunning = Boolean(st?.login_running);
+              const updatedClock = formatShortClock(st?.login_updated_at);
+              const targetRec = activePublishRecords.find((r) => r.platform === plat);
+              const hasFailedRec = targetRec?.status === "error";
+              const errView = hasFailedRec && targetRec ? formatPublishErrorView(targetRec) : null;
               return (
                 <div
                   key={plat}
                   style={{
                     display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
+                    flexDirection: "column",
+                    gap: 6,
                     padding: "8px 10px",
                     borderRadius: 8,
                     border: "1px solid var(--border)",
                     background: "var(--bg-2)",
                   }}
                 >
-                  <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-                    <input
-                      type="checkbox"
-                      checked={Boolean(pubPlatforms[plat])}
-                      onChange={(e) => setPubPlatforms((prev) => ({ ...prev, [plat]: e.target.checked }))}
-                    />
-                    <span style={{ fontWeight: 600 }}>{PLAT_LABELS[plat]}</span>
-                    <span className={`tag ${logged ? "cached" : "dirty"}`}>{logged ? "已登录" : "未登录"}</span>
-                  </label>
-                  <button type="button" className="sm" onClick={() => handleLaunchLogin(plat)}>
-                    {logged ? "重扫码" : "扫码登录"}
-                  </button>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                    <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: "pointer", flexWrap: "wrap" }}>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(pubPlatforms[plat])}
+                        onChange={(e) => setPubPlatforms((prev) => ({ ...prev, [plat]: e.target.checked }))}
+                      />
+                      <span style={{ fontWeight: 600 }}>{PLAT_LABELS[plat]}</span>
+                      <span className={`tag ${loginRunning ? "running" : logged ? "cached" : "dirty"}`}>
+                        {loginRunning ? "扫码中..." : logged ? "已登录" : "未登录"}
+                      </span>
+                      {updatedClock && (
+                        <span style={{ fontSize: 11, color: "var(--text-2)" }}>更新 {updatedClock}</span>
+                      )}
+                      {hasFailedRec && <span className="tag dirty">上次失败</span>}
+                    </label>
+                    <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                      {hasFailedRec && activePublishTarget && (
+                        <button
+                          type="button"
+                          className="sm"
+                          disabled={jobRunning || pubResettingKey !== null}
+                          onClick={() => handleResetPublish(activePublishTarget, plat)}
+                        >
+                          {pubResettingKey === `${activePublishTarget}:${plat}` ? "复位中..." : "复位状态"}
+                        </button>
+                      )}
+                      <button type="button" className="sm" onClick={() => handleLaunchLogin(plat)}>
+                        {loginRunning ? "查看登录态" : logged ? "重扫码" : "扫码登录"}
+                      </button>
+                    </div>
+                  </div>
+                  {errView && (
+                    <div style={{ fontSize: 11, lineHeight: 1.45, color: "#fca5a5", paddingLeft: 22 }}>
+                      <div>原因：{errView.errorText}</div>
+                      <div style={{ color: "#fde68a" }}>解决方案：{errView.solutionText}</div>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -4404,8 +5791,19 @@ export default function App() {
           </label>
 
           <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-            <span style={{ fontSize: 12, color: "var(--text-2)" }}>简介文案</span>
-            <textarea rows={3} value={pubDesc} onChange={(e) => setPubDesc(e.target.value)} />
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+              <span style={{ fontSize: 12, color: "var(--text-2)" }}>简介文案</span>
+              <button
+                type="button"
+                className="sm"
+                disabled={pubDescSuggesting || !activePublishTarget}
+                onClick={handleSuggestPublishDesc}
+                title="由 AI 根据全片/片段内容提炼面向观众的中文简介，不含剪辑参数"
+              >
+                {pubDescSuggesting ? "提炼中..." : "AI 提炼简介"}
+              </button>
+            </div>
+            <textarea rows={5} value={pubDesc} onChange={(e) => setPubDesc(e.target.value)} />
           </label>
 
           <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -4414,10 +5812,12 @@ export default function App() {
           </label>
 
           <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-            <span style={{ fontSize: 12, color: "var(--text-2)" }}>视频号合集（上传切片自动创建或存入同名合集，微信限10字）</span>
+            <span style={{ fontSize: 12, color: "var(--text-2)" }}>
+              合集名称（视频号自动创建/选择，限10字自动截断；B站按名匹配已有合集；小红书自动加入/创建）
+            </span>
             <input
               type="text"
-              maxLength={10}
+              maxLength={30}
               placeholder="默认取本片核心中文主题题眼"
               value={pubCollection}
               onChange={(e) => setPubCollection(e.target.value)}
@@ -4437,6 +5837,225 @@ export default function App() {
             开始上传
           </button>
         </div>
+      </dialog>
+
+      {/* Batch Publish Standalone Clips Dialog */}
+      <dialog
+        ref={batchPublishDialogRef}
+        aria-labelledby="batch-publish-title"
+        style={{ width: "min(94vw, 660px)", maxWidth: 660 }}
+        {...({ closedby: "any" } as Record<string, string>)}
+      >
+        <div className="dialog-head">
+          <h2 id="batch-publish-title">批量发布选中切片并归入同一合集</h2>
+          <form method="dialog">
+            <button type="submit" className="sm">
+              关闭
+            </button>
+          </form>
+        </div>
+        {manifest && (
+          <>
+            <div className="dialog-body scroller" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 12, color: "var(--text-1)", fontWeight: 600 }}>
+                    合集名称（本次选中切片统一加入此合集）
+                  </span>
+                  <span style={{ fontSize: 11, color: batchCollection.trim().length > 10 ? "#fcd34d" : "var(--text-2)" }}>
+                    {batchCollection.trim().length} 字{batchCollection.trim().length > 10 ? "（视频号自动取前10字）" : ""}
+                  </span>
+                </div>
+                <input
+                  type="text"
+                  maxLength={30}
+                  placeholder="留空则不指定合集，例如：特朗普芯片访谈"
+                  value={batchCollection}
+                  onChange={(e) => setBatchCollection(e.target.value)}
+                />
+                <span style={{ fontSize: 11, color: "var(--text-2)" }}>
+                  视频号/小红书不存在同名合集时将自动新建；B站按名称匹配已有合集。
+                </span>
+              </label>
+
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                <span style={{ fontSize: 12, color: "var(--text-2)" }}>选择发布平台与登录态</span>
+                <button type="button" className="sm" onClick={() => handleRefreshPublishStatus()}>
+                  刷新登录态
+                </button>
+              </div>
+
+              {pubLoginNotice && (
+                <div className="pub-login-notice" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                  <span>{pubLoginNotice}</span>
+                  <button type="button" className="sm" onClick={() => setPubLoginNotice(null)}>
+                    关闭
+                  </button>
+                </div>
+              )}
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {(["wechat", "bilibili", "xiaohongshu"] as const).map((plat) => {
+                  const st = platStatus[plat];
+                  const logged = Boolean(st?.logged_in);
+                  const loginRunning = Boolean(st?.login_running);
+                  return (
+                    <div
+                      key={plat}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 8,
+                        padding: "7px 10px",
+                        borderRadius: 8,
+                        border: "1px solid var(--border)",
+                        background: "var(--bg-2)",
+                      }}
+                    >
+                      <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(batchPlatforms[plat])}
+                          onChange={(e) => setBatchPlatforms((prev) => ({ ...prev, [plat]: e.target.checked }))}
+                        />
+                        <span style={{ fontWeight: 600 }}>{PLAT_LABELS[plat]}</span>
+                        <span className={`tag ${loginRunning ? "running" : logged ? "cached" : "dirty"}`}>
+                          {loginRunning ? "扫码中..." : logged ? "已登录" : "未登录"}
+                        </span>
+                      </label>
+                      <button type="button" className="sm" onClick={() => handleLaunchLogin(plat)}>
+                        {loginRunning ? "查看登录态" : logged ? "重扫码" : "扫码登录"}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 12, color: "var(--text-1)", fontWeight: 600 }}>
+                    待发布独立切片（{selectedStandaloneClips.filter((c) => c.output_file && batchClipPick[c.clip_id]).length}/{selectedStandaloneClips.length}）
+                  </span>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button
+                      type="button"
+                      className="sm"
+                      onClick={() => {
+                        const next: Record<string, boolean> = {};
+                        selectedStandaloneClips.forEach((c) => {
+                          next[c.clip_id] = Boolean(c.output_file);
+                        });
+                        setBatchClipPick(next);
+                      }}
+                    >
+                      全选已渲染
+                    </button>
+                    <button type="button" className="sm" onClick={() => setBatchClipPick({})}>
+                      全不选
+                    </button>
+                  </div>
+                </div>
+                <div
+                  className="scroller"
+                  style={{
+                    maxHeight: 210,
+                    overflowY: "auto",
+                    border: "1px solid var(--border)",
+                    borderRadius: 8,
+                    padding: 6,
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 4,
+                    background: "var(--bg-0)",
+                  }}
+                >
+                  {selectedStandaloneClips.length === 0 ? (
+                    <div style={{ padding: 12, textAlign: "center", color: "var(--text-2)", fontSize: 12 }}>
+                      左侧尚未勾选任何独立切片
+                    </div>
+                  ) : (
+                    selectedStandaloneClips.map((c) => {
+                      const ready = Boolean(c.output_file);
+                      const checked = ready && Boolean(batchClipPick[c.clip_id]);
+                      return (
+                        <label
+                          key={c.clip_id}
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: 8,
+                            padding: "5px 8px",
+                            borderRadius: 6,
+                            background: "var(--bg-2)",
+                            opacity: ready ? 1 : 0.5,
+                            cursor: ready ? "pointer" : "not-allowed",
+                          }}
+                        >
+                          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                            <input
+                              type="checkbox"
+                              disabled={!ready}
+                              checked={checked}
+                              onChange={(e) =>
+                                setBatchClipPick((prev) => ({ ...prev, [c.clip_id]: e.target.checked }))
+                              }
+                            />
+                            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              #{String(c.index).padStart(2, "0")} {c.title}
+                            </span>
+                          </div>
+                          <div style={{ display: "flex", gap: 4, alignItems: "center", flexShrink: 0 }}>
+                            {!ready && <span className="tag dirty">未渲染·跳过</span>}
+                            {renderPubBadges(c.publish_records)}
+                          </div>
+                        </label>
+                      );
+                    })
+                  )}
+                </div>
+                <span style={{ fontSize: 11, color: "var(--text-2)" }}>
+                  各切片自动使用各自标题、封面标题、简介与标签顺序上传，单条失败不中断其余切片。
+                </span>
+              </div>
+
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={batchSkipPublished}
+                  onChange={(e) => setBatchSkipPublished(e.target.checked)}
+                />
+                <span>跳过所选平台已有成功/草稿记录的切片（防重复上传）</span>
+              </label>
+
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                <input type="checkbox" checked={batchPublic} onChange={(e) => setBatchPublic(e.target.checked)} />
+                <span>公开发布（不勾选则安全模式：存草稿 / 仅自己可见）</span>
+              </label>
+            </div>
+            <div className="dialog-foot">
+              <form method="dialog">
+                <button type="submit" disabled={batchSubmitting}>
+                  取消
+                </button>
+              </form>
+              <button
+                type="button"
+                className="primary"
+                disabled={
+                  batchSubmitting ||
+                  selectedStandaloneClips.filter((c) => c.output_file && batchClipPick[c.clip_id]).length === 0
+                }
+                onClick={handleConfirmBatchPublish}
+              >
+                {batchSubmitting
+                  ? "提交中..."
+                  : `开始批量上传 (${selectedStandaloneClips.filter((c) => c.output_file && batchClipPick[c.clip_id]).length} 支)`}
+              </button>
+            </div>
+          </>
+        )}
       </dialog>
 
       {/* Replan Strategy Confirmation Dialog */}
@@ -4501,7 +6120,7 @@ export default function App() {
             </>
           ) : (
             <div style={{ lineHeight: 1.6 }}>
-              当前尚无已渲染成片文件，但检测到已有分析/扫描记录。继续将彻底清空旧的广告敏感识别、话题地图、切片列表与阶段状态，按最新规则从头重新规划（支持事后点「撤销」恢复旧状态）。
+              当前尚无已渲染成片文件，但检测到已有分析/扫描记录。继续将彻底清空旧的广告敏感识别、话题地图、切片列表与阶段状态，按最新规则从头重新规划。
             </div>
           )}
           <label
@@ -4786,6 +6405,71 @@ export default function App() {
                   {policySaving ? "保存中..." : "保存政审规则"}
                 </button>
               </div>
+            </div>
+          </>
+        )}
+      </dialog>
+
+      {/* Video Metadata Editor Dialog */}
+      <dialog ref={metadataDialogRef} className="modal" style={{ maxWidth: 460 }}>
+        <div className="dialog-head">
+          <span>编辑视频元数据</span>
+          <form method="dialog">
+            <button type="submit" className="sm">
+              关闭
+            </button>
+          </form>
+        </div>
+        {manifest && (
+          <>
+            <div className="dialog-body" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <span style={{ fontSize: 12, color: "var(--text-1)" }}>发布频道 / 栏目</span>
+                <input
+                  type="text"
+                  value={metaChannelDraft}
+                  onChange={(e) => setMetaChannelDraft(e.target.value)}
+                  placeholder="例如：Charlie Rose 访谈"
+                />
+                {manifest.metadata.channel && manifest.metadata.channel !== metaChannelDraft && (
+                  <span style={{ fontSize: 11, color: "var(--text-2)" }}>
+                    原采集值：{manifest.metadata.channel}
+                  </span>
+                )}
+              </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <span style={{ fontSize: 12, color: "var(--text-1)" }}>被访谈人 / 嘉宾</span>
+                <input
+                  type="text"
+                  value={metaGuestDraft}
+                  onChange={(e) => setMetaGuestDraft(e.target.value)}
+                  placeholder="例如：查理·芒格"
+                />
+              </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <span style={{ fontSize: 12, color: "var(--text-1)" }}>发布时间</span>
+                <input
+                  type="text"
+                  value={metaDateDraft}
+                  onChange={(e) => setMetaDateDraft(e.target.value)}
+                  placeholder="例如：2015-05-02"
+                />
+              </label>
+            </div>
+            <div className="dialog-foot" style={{ justifyContent: "flex-end", gap: 8 }}>
+              <form method="dialog">
+                <button type="submit" disabled={metaSaving}>
+                  取消
+                </button>
+              </form>
+              <button
+                type="button"
+                className="primary"
+                disabled={metaSaving}
+                onClick={handleSaveMetadata}
+              >
+                {metaSaving ? "保存中..." : "保存"}
+              </button>
             </div>
           </>
         )}

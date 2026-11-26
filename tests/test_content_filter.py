@@ -177,7 +177,7 @@ def test_scan_cut_segments_preserves_manual_and_snaps_tightly(tmp_path: Path, mo
     pol = next(s for s in out.cut_segments if s.kind == "political_sensitive")
     assert 8.0 <= pol.start_s <= 8.2
     assert 11.0 <= pol.end_s <= 11.2
-    assert "（净版）" in out.clean_cut.title
+    assert "（完整版）" in out.clean_cut.title
     assert out.clean_cut.scanned_at is not None
 
 
@@ -1143,6 +1143,787 @@ def test_filter_drops_speculative_non_target_political_hits():
         "",
         "legacy mock",
     ) is True
+
+
+def test_precise_mask_resolution_audio_spans_and_subtitle_redaction(tmp_path: Path):
+    import json
+    from clipcut.models import CutSegment, MediaSource, ProjectManifest, Utterance
+    from clipcut.pipeline.content_filter import (
+        build_masked_ass_file,
+        describe_applied_filter,
+        get_overlapping_mask_payload,
+        resolve_mask_audio_spans,
+        resolve_segment_action,
+    )
+
+    clean_mp4 = tmp_path / "src.mp4"
+    render_mp4 = tmp_path / "src_hardsub.mp4"
+    clean_mp4.write_bytes(b"clean")
+    render_mp4.write_bytes(b"hardsub")
+
+    ass_p = tmp_path / "src.bi.ass"
+    ass_p.write_text(
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\n\n"
+        "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Default,Arial,52,&H00FFFFFF,&H0000FFFF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,20,20,30,1\n\n"
+        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:06.00,Default,,0,0,0,,俄罗斯是侵略者\\N{\\fs36\\c&HCCCCCC&}Russia invaded and is the aggressor\n"
+        "Dialogue: 0,0:00:10.00,0:00:18.00,Default,,0,0,0,,纯背景讨论中国与美国没有任何敏感词汇\\N{\\fs36\\c&HCCCCCC&}Neutral background China US sentence\n"
+        "Dialogue: 0,0:00:22.00,0:00:28.00,Default,,0,0,0,,中文独有敏感动词撒谎\\N{\\fs36\\c&HCCCCCC&}Context sentence\n",
+        encoding="utf-8",
+    )
+
+    # Whisper timestamps alongside clean source
+    (tmp_path / "transcribe_state.json").write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "words": [
+                            {"word": "Russia", "start": 1.2, "end": 1.6},
+                            {"word": "invaded", "start": 1.65, "end": 2.1},
+                            {"word": "and", "start": 2.15, "end": 2.3},
+                            {"word": "is", "start": 2.35, "end": 2.5},
+                            {"word": "the", "start": 2.55, "end": 2.7},
+                            {"word": "aggressor", "start": 2.75, "end": 3.3},
+                        ]
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    m = ProjectManifest(
+        project_id="test-precise-mask",
+        source=MediaSource(
+            render_video=str(render_mp4),
+            analysis_video=str(clean_mp4),
+            subtitle_path=str(ass_p),
+            duration_s=40.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "out"),
+        ),
+        utterances=[
+            Utterance(id=0, start_s=1.0, end_s=6.0, zh="俄罗斯是侵略者", en="Russia invaded and is the aggressor"),
+            Utterance(id=1, start_s=10.0, end_s=18.0, zh="纯背景讨论中国与美国没有任何敏感词汇", en="Neutral background China US sentence"),
+            Utterance(id=2, start_s=22.0, end_s=28.0, zh="中文独有敏感动词撒谎", en="Context sentence"),
+        ],
+        cut_segments=[
+            CutSegment(
+                cut_id="cut_01",
+                kind="political_sensitive",
+                enabled=True,
+                severity="high",
+                recommended_action="delete",
+                action="inherit",
+                sensitive_terms_zh=["俄罗斯", "侵略者"],
+                sensitive_terms_en=["Russia", "aggressor"],
+                precise_terms_zh=["侵略者"],
+                precise_terms_en=["invade", "aggressor"],
+                precise_terms_extracted=True,
+                start_utt=0,
+                end_utt=0,
+                start_s=1.0,
+                end_s=8.0,
+                reason="侵略定性",
+            ),
+            CutSegment(
+                cut_id="cut_02",
+                kind="political_sensitive",
+                enabled=True,
+                severity="medium",
+                recommended_action="mask",
+                action="inherit",
+                sensitive_terms_zh=["中国", "美国"],
+                sensitive_terms_en=["China", "US"],
+                precise_terms_zh=[],
+                precise_terms_en=[],
+                precise_terms_extracted=True,
+                start_utt=1,
+                end_utt=1,
+                start_s=10.0,
+                end_s=18.0,
+                reason="已提取精准词为空（不回退宽泛词表）",
+            ),
+            CutSegment(
+                cut_id="cut_03",
+                kind="political_sensitive",
+                enabled=True,
+                severity="high",
+                recommended_action="delete",
+                action="inherit",
+                precise_terms_zh=["撒谎"],
+                precise_terms_en=[],
+                precise_terms_extracted=True,
+                start_utt=2,
+                end_utt=2,
+                start_s=22.0,
+                end_s=28.0,
+                reason="中文定性词",
+            ),
+        ],
+    )
+    m.clean_cut.cut_political_sensitive = True
+    m.clean_cut.sensitivity = "strict"
+    m.clean_cut.political_action = "precise_mask"
+
+    assert resolve_segment_action(m.cut_segments[0], m) == "precise_mask"
+    assert resolve_segment_action(m.cut_segments[0], m, allow_mask=False) == "delete"
+    assert "脱敏(精准遮蔽·严格)" in describe_applied_filter(m)
+
+    # Precise mode: cut_01 mutes ONLY 'invaded' (~1.61-2.15) & 'aggressor' (~2.71-3.35), NOT 'Russia' or full 7s span!
+    # cut_02 has empty precise terms -> NOT whole-segment muted!
+    # cut_03 has ZH-only '撒谎' -> short capped window <= 2.0s inside 22-28s!
+    spans_precise = resolve_mask_audio_spans(m, m.cut_segments)
+    assert any(1.5 <= s <= 1.7 and 2.05 <= e <= 2.25 for s, e in spans_precise)
+    assert any(2.65 <= s <= 2.8 and 3.25 <= e <= 3.45 for s, e in spans_precise)
+    assert not any(1.0 <= s <= 1.3 for s, e in spans_precise)  # Russia NOT muted in precise mode
+    assert not any(s >= 9.9 and e <= 18.1 for s, e in spans_precise)  # cut_02 NOT whole-segment muted
+    cut3_spans = [(s, e) for s, e in spans_precise if 22.0 <= s <= 28.0]
+    assert len(cut3_spans) == 1 and (cut3_spans[0][1] - cut3_spans[0][0]) <= 2.05
+
+    ass_precise = build_masked_ass_file(m, m.cut_segments, tmp_path / "sub_out", hash_key="p1")
+    assert ass_precise is not None
+    txt_precise = ass_precise.read_text(encoding="utf-8")
+    assert "俄罗斯是＊＊＊" in txt_precise
+    assert "[已脱敏]" not in txt_precise  # cut_02 not blanket-redacted under precise_mask
+    assert "纯背景讨论中国与美国没有任何敏感词汇" in txt_precise  # cut_02 extracted=[] must NOT fall back to sensitive_terms
+    assert "Neutral background China US sentence" in txt_precise
+    assert "中文独有敏感动词＊＊" in txt_precise
+
+    payload_precise = get_overlapping_mask_payload(0.0, 30.0, m)
+    assert payload_precise[0]["mode"] == "precise_mask"
+    assert payload_precise[0]["terms_zh"] == ["侵略者"]
+
+    # Switching back to legacy 'mask' mode uses sensitive_terms_zh/en ('Russia', '中国', 'US')
+    m.clean_cut.political_action = "mask"
+    assert resolve_segment_action(m.cut_segments[0], m) == "mask"
+    spans_legacy = resolve_mask_audio_spans(m, m.cut_segments[:2])
+    assert any(1.1 <= s <= 1.25 for s, e in spans_legacy)  # Russia IS muted in standard mask
+    assert any(10.0 <= s <= 18.0 for s, e in spans_legacy)  # sensitive_terms China/US ARE muted in standard mask
+    m.cut_segments[1].sensitive_terms_zh = []
+    m.cut_segments[1].sensitive_terms_en = []
+    spans_legacy_empty = resolve_mask_audio_spans(m, m.cut_segments[:2])
+    assert any(abs(s - 10.0) < 0.05 and abs(e - 18.0) < 0.05 for s, e in spans_legacy_empty)  # whole-segment fallback preserved
+    ass_legacy = build_masked_ass_file(m, m.cut_segments[:2], tmp_path / "sub_out", hash_key="m1")
+    assert ass_legacy is not None and "[已脱敏]" in ass_legacy.read_text(encoding="utf-8")
+
+
+def test_extract_precise_terms_endpoint_and_default_config(tmp_path: Path, monkeypatch):
+    import copy
+    from types import SimpleNamespace
+    from fastapi.testclient import TestClient
+    import clipcut.api.server as srv
+    import clipcut.pipeline.content_filter as cf
+    from clipcut.models import CutSegment, MediaSource, ProjectManifest, Utterance
+    from clipcut.receipts import ProjectStore
+
+    clean_mp4 = tmp_path / "src.mp4"
+    render_mp4 = tmp_path / "src_hardsub.mp4"
+    clean_mp4.write_bytes(b"clean")
+    render_mp4.write_bytes(b"hardsub")
+
+    store = ProjectStore(tmp_path / "work")
+    m = ProjectManifest(
+        project_id="test-extract-precise",
+        source=MediaSource(
+            render_video=str(render_mp4),
+            analysis_video=str(clean_mp4),
+            duration_s=30.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "out"),
+        ),
+        utterances=[
+            Utterance(id=0, start_s=2.0, end_s=8.0, zh="习主席与普京正在观察台海局势。", en="Xi Jinping and Putin are watching Taiwan."),
+        ],
+        cut_segments=[
+            CutSegment(
+                cut_id="cut_01",
+                kind="political_sensitive",
+                enabled=True,
+                severity="high",
+                recommended_action="delete",
+                sensitive_terms_zh=["习主席", "台海"],
+                sensitive_terms_en=["Xi Jinping", "Taiwan"],
+                start_utt=0,
+                end_utt=0,
+                start_s=2.0,
+                end_s=8.0,
+                reason="涉及领导人与台海",
+            )
+        ],
+    )
+    m.clean_cut.cut_political_sensitive = True
+    store.save(m)
+
+    mem_cfg: dict = {
+        "content_filter": {
+            "sensitivity": "balanced",
+            "political_action": "auto",
+            "political_profiles": copy.deepcopy(srv.DEFAULT_POLITICAL_PROFILES),
+        }
+    }
+    monkeypatch.setattr(srv, "_get_store", lambda _pid: store)
+    monkeypatch.setattr(srv, "load_editorial_config", lambda: copy.deepcopy(mem_cfg))
+    monkeypatch.setattr(cf, "load_editorial_config", lambda: copy.deepcopy(mem_cfg))
+
+    def fake_save(cfg: dict):
+        mem_cfg.clear()
+        mem_cfg.update(copy.deepcopy(cfg))
+
+    monkeypatch.setattr(srv, "save_editorial_config", fake_save)
+
+    class FakeLLM_Precise:
+        def __init__(self, _cfg):
+            pass
+
+        def generate_json(self, **kw):
+            return SimpleNamespace(
+                parsed={
+                    "items": [
+                        {
+                            "cut_id": "cut_01",
+                            "precise_terms_zh": ["习主席", "不存在幻觉词"],
+                            "precise_terms_en": ["Xi Jinping", "HallucinatedWord"],
+                        }
+                    ]
+                },
+                provider="gemini",
+                model="gemini-2.5-flash",
+                prompt_tokens=1,
+                output_tokens=1,
+                elapsed_ms=1,
+            )
+
+    monkeypatch.setattr(cf, "ClipCutLLM", FakeLLM_Precise)
+
+    client = TestClient(srv.app)
+    # 1. Config endpoint accepts precise_mask as default_political_action
+    r_cfg = client.put("/api/config/content-filter", json={"default_political_action": "precise_mask"})
+    assert r_cfg.status_code == 200
+    assert r_cfg.json()["default_political_action"] == "precise_mask"
+
+    # 2. Extract precise terms filters hallucinated words & stores verbatim terms
+    r_ext = client.post("/api/projects/test-extract-precise/clean-cut/extract-precise-terms", json={})
+    assert r_ext.status_code == 200
+    d_ext = r_ext.json()
+    assert d_ext["updated_count"] == 1
+    seg = d_ext["manifest"]["cut_segments"][0]
+    assert seg["precise_terms_zh"] == ["习主席"]
+    assert seg["precise_terms_en"] == ["Xi Jinping"]
+    assert seg["precise_terms_extracted"] is True
+
+    # 3. PATCH /clean-cut persists precise_mask and manual edits to precise_terms_*
+    r_patch = client.patch(
+        "/api/projects/test-extract-precise/clean-cut",
+        json={
+            "political_action": "precise_mask",
+            "segments": [
+                {
+                    "cut_id": "cut_01",
+                    "action": "precise_mask",
+                    "precise_terms_zh": ["习主席", "普京"],
+                    "precise_terms_en": ["Xi Jinping", "Putin"],
+                }
+            ],
+        },
+    )
+    assert r_patch.status_code == 200
+    seg2 = r_patch.json()["manifest"]["cut_segments"][0]
+    assert r_patch.json()["manifest"]["clean_cut"]["political_action"] == "precise_mask"
+    assert seg2["action"] == "precise_mask"
+    assert seg2["precise_terms_en"] == ["Xi Jinping", "Putin"]
+    assert seg2["precise_terms_extracted"] is True
+
+    # 4. Clearing precise_terms_* explicitly keeps precise_terms_extracted=True (no legacy fallback)
+    r_clr = client.patch(
+        "/api/projects/test-extract-precise/clean-cut",
+        json={
+            "segments": [
+                {
+                    "cut_id": "cut_01",
+                    "precise_terms_zh": [],
+                    "precise_terms_en": [],
+                }
+            ],
+        },
+    )
+    assert r_clr.status_code == 200
+    seg3 = r_clr.json()["manifest"]["cut_segments"][0]
+    assert seg3["precise_terms_zh"] == []
+    assert seg3["precise_terms_en"] == []
+    assert seg3["precise_terms_extracted"] is True
+
+
+def test_parse_provider_model_and_compliance_fallback_routing(monkeypatch):
+    import pytest
+    import clipcut.llm as llm_mod
+    from clipcut.llm import ClipCutLLM, LLMCallResult, parse_provider_model
+    from clipcut.pipeline.content_filter import _select_compliance_llm
+
+    # 1. Bare DashScope & Gemini model inference regardless of default_provider
+    assert parse_provider_model("glm-5.3", "gemini") == ("dashscope", "glm-5.3")
+    assert parse_provider_model("qwen3.8-max", "gemini") == ("dashscope", "qwen3.8-max")
+    assert parse_provider_model("kimi/kimi-k3.1-pro-highspeed", "gemini") == (
+        "dashscope",
+        "kimi/kimi-k3.1-pro-highspeed",
+    )
+    assert parse_provider_model("MiniMax/MiniMax-M3", "gemini") == ("dashscope", "MiniMax/MiniMax-M3")
+    assert parse_provider_model("gemini-2.5-flash", "dashscope") == ("gemini", "gemini-2.5-flash")
+    assert parse_provider_model("gemini-2.5-flash", "vertex") == ("vertex", "gemini-2.5-flash")
+    assert parse_provider_model("bailian:qwen4-max", "gemini") == ("dashscope", "qwen4-max")
+
+    # 2. _select_compliance_llm normalizes bare DashScope fallbacks cleanly
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gem-key")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-ds-key")
+    cfg = {
+        "models": {
+            "text_provider": "dashscope",
+            "text_model": "qwen3.8-max",
+            "text_fallback_models": ["qwen4-max", "glm-5.3", "kimi-k3.1-pro", "gemini:gemini-2.5-flash"],
+        }
+    }
+    llm, scan_prov, scan_mod, scan_fbs = _select_compliance_llm(cfg, prefer_gemini=True)
+    assert scan_prov == "gemini"
+    assert scan_mod == "gemini-2.5-flash"
+    assert scan_fbs[0] == "gemini:gemini-2.5-flash-lite"
+    assert "dashscope:qwen3.8-max" in scan_fbs
+    assert "dashscope:glm-5.3" in scan_fbs
+    assert "dashscope:kimi-k3.1-pro" in scan_fbs
+    assert all(":" in fb for fb in scan_fbs)
+
+    # 3a. Transient Gemini timeout/503 retries once & succeeds without calling DashScope
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(llm_mod, "_sleep_cancellable", lambda _s: None)
+
+    def fake_google_retry(*, provider: str, model: str, **_kw):
+        calls.append((provider, model))
+        if len(calls) == 1:
+            raise RuntimeError("503 UNAVAILABLE: read timeout")
+        return LLMCallResult(
+            text='{"ok": true}',
+            parsed={"ok": True},
+            model=model,
+            provider=provider,
+            prompt_tokens=10,
+            output_tokens=5,
+            elapsed_ms=20,
+        )
+
+    def fail_if_dashscope(**_kw):
+        raise AssertionError("DashScope should not be called after Gemini retry succeeds")
+
+    monkeypatch.setattr(llm, "_call_google", fake_google_retry)
+    monkeypatch.setattr(llm, "_call_dashscope", fail_if_dashscope)
+    res_ok = llm.generate_json(prompt="hi", model=scan_mod, provider=scan_prov, fallback_models=scan_fbs)
+    assert res_ok.parsed == {"ok": True}
+    assert calls == [("gemini", "gemini-2.5-flash"), ("gemini", "gemini-2.5-flash")]
+
+    # 3b. Permanent vertex 403 skips later vertex models; falls back to dashscope (never gemini:glm-5.3)
+    calls_fb: list[tuple[str, str]] = []
+
+    def fake_google_vertex_skip(*, provider: str, model: str, **_kw):
+        calls_fb.append((provider, model))
+        assert model != "glm-5.3", "Bare DashScope model must never route to gemini/vertex"
+        if provider == "gemini" and model == "gemini-2.5-flash":
+            raise RuntimeError("404 NOT_FOUND")
+        if provider == "gemini" and model == "gemini-2.5-flash-lite":
+            return LLMCallResult(
+                text='{"ok": "lite"}',
+                parsed={"ok": "lite"},
+                model=model,
+                provider=provider,
+                prompt_tokens=5,
+                output_tokens=5,
+                elapsed_ms=10,
+            )
+        raise RuntimeError("403 PERMISSION_DENIED: billing required")
+
+    monkeypatch.setattr(llm, "_call_google", fake_google_vertex_skip)
+    res_lite = llm.generate_json(prompt="hi", model=scan_mod, provider=scan_prov, fallback_models=scan_fbs)
+    assert res_lite.model == "gemini-2.5-flash-lite"
+
+    calls_vx: list[tuple[str, str]] = []
+
+    def fake_google_all_fail(*, provider: str, model: str, **_kw):
+        calls_vx.append((provider, model))
+        if provider == "vertex":
+            raise RuntimeError("403 PERMISSION_DENIED: billing required")
+        raise RuntimeError("429 RESOURCE_EXHAUSTED quota")
+
+    ds_calls: list[str] = []
+
+    def fake_dashscope_ok(*, model: str, **_kw):
+        ds_calls.append(model)
+        return LLMCallResult(
+            text='{"ok": "ds"}',
+            parsed={"ok": "ds"},
+            model=model,
+            provider="dashscope",
+            prompt_tokens=5,
+            output_tokens=5,
+            elapsed_ms=10,
+        )
+
+    monkeypatch.setattr(llm, "_call_google", fake_google_all_fail)
+    monkeypatch.setattr(llm, "_call_dashscope", fake_dashscope_ok)
+    res_ds = llm.generate_json(
+        prompt="hi",
+        model="gemini-2.5-flash",
+        provider="gemini",
+        fallback_models=["vertex:gemini-2.5-flash", "vertex:gemini-2.5-pro", "glm-5.3"],
+    )
+    assert res_ds.provider == "dashscope" and res_ds.model == "glm-5.3"
+    # Second vertex model skipped after first vertex 403 PERMISSION_DENIED
+    assert ("vertex", "gemini-2.5-pro") not in calls_vx
+    assert ds_calls == ["glm-5.3"]
+
+    # 3c. Total failure after data_inspection_failed preserves primary error rather than truncating it away
+    monkeypatch.setattr(
+        llm,
+        "_call_dashscope",
+        lambda *, model, **_kw: (_ for _ in ()).throw(
+            RuntimeError("HTTP 400: data_inspection_failed Input text data may contain inappropriate content")
+        ),
+    )
+    monkeypatch.setattr(
+        llm,
+        "_call_google",
+        lambda *, provider, model, **_kw: (_ for _ in ()).throw(RuntimeError(f"fail:{provider}:{model}")),
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        llm.generate_json(
+            prompt="hi",
+            model="qwen3.8-max",
+            provider="dashscope",
+            fallback_models=["qwen4-max", "glm-5.3", "gemini:gemini-2.5-pro", "gemini:gemini-2.0-flash"],
+        )
+    err_txt = str(exc_info.value)
+    assert "dashscope:qwen3.8-max -> HTTP 400: data_inspection_failed" in err_txt
+    assert "gemini:gemini-2.5-flash-lite" in err_txt
+
+
+def test_deterministic_hard_redline_guard_catches_missed_mentions_without_false_positives(tmp_path: Path, monkeypatch):
+    import clipcut.pipeline.content_filter as cf
+    from clipcut.pipeline.visual_ocr import match_hard_redline_text
+
+    # Benign phrases must never trigger deterministic hard redlines
+    for benign in (
+        "我们要认真学习和总结经验，养成良好习惯。",
+        "学习总结报告与实习回顾",
+        "Taiwan Semi TSM gained 3% while NVIDIA rallied.",
+        "Maybe the government should regulate monopolies in Part XI.",
+    ):
+        assert match_hard_redline_text(benign) == [], f"Unexpected false positive on: {benign}"
+
+    # Hard redlines must match verbatim
+    assert any(h["matched"] == "President Xi" for h in match_hard_redline_text("President Xi was waiting for me"))
+    assert any(h["matched"] == "习主席" for h in match_hard_redline_text("习主席在舷梯下面等我"))
+    assert any(h["matched"] == "Xi" for h in match_hard_redline_text("What did Xi say to Beijing?"))
+
+    # Full scan_cut_segments merge behavior when LLM misses praise/question hits and misses adjacent utterance
+    store = ProjectStore(tmp_path)
+    vid = tmp_path / "demo_hardsub.mp4"
+    vid.write_bytes(b"vid")
+    utts = [
+        Utterance(id=0, start_s=0.0, end_s=3.0, zh="今天我们讨论微软和英伟达业绩。", en="Today we discuss Microsoft and NVIDIA."),
+        Utterance(id=1, start_s=4.0, end_s=8.0, zh="我下飞机时，习主席在舷梯下面等我。", en="President Xi was waiting for me at the stairway."),
+        Utterance(id=2, start_s=9.0, end_s=11.0, zh="两家公司的营收增长非常稳健。", en="Both companies saw steady revenue growth."),
+        Utterance(id=3, start_s=12.0, end_s=15.0, zh="除了习主席非常尊重他。", en="Other than President Xi has such respect."),
+        Utterance(id=4, start_s=15.2, end_s=18.0, zh="那个城市非常干净一尘不染。", en="That city was immaculately clean."),
+        Utterance(id=5, start_s=19.0, end_s=21.0, zh="资本支出周期仍在持续。", en="Capex cycle continues."),
+        Utterance(id=6, start_s=22.0, end_s=25.0, zh="您有没有问过习主席这件事？", en="Did you ask President Xi about this?"),
+        Utterance(id=7, start_s=26.0, end_s=28.0, zh="我们再看看下季度的预期。", en="Let us look at next quarter estimates."),
+        Utterance(id=8, start_s=29.0, end_s=33.0, zh="如果我是总统，习主席肯定得考虑。", en="If I were president, she has to think."),
+    ]
+    m = ProjectManifest(
+        project_id="test-guard-01",
+        source=MediaSource(
+            work_dir=str(tmp_path),
+            render_video=str(vid),
+            analysis_video=str(vid),
+            output_dir=str(tmp_path / "clips"),
+            duration_s=35.0,
+        ),
+        metadata=VideoMetadata(original_title="guard"),
+        utterances=utts,
+    )
+    store.save(m)
+
+    # Mock LLM that ONLY finds u0004 and u0008 (missing u0001, u0003, u0006, and missing "习主席" term on u0008)
+    class PartialLLM:
+        def __init__(self, _cfg):
+            pass
+
+        def generate_json(self, **kw):
+            return SimpleNamespace(
+                parsed={
+                    "segments": [
+                        {
+                            "kind": "political_sensitive",
+                            "severity": "medium",
+                            "target_country": "中国",
+                            "is_explicit_criticism": True,
+                            "start_utt": 4,
+                            "end_utt": 4,
+                            "quote": "That city was immaculately clean.",
+                            "reason": "对比中国城市",
+                            "precise_terms_zh": ["一尘不染"],
+                            "precise_terms_en": ["immaculately clean"],
+                        },
+                        {
+                            "kind": "political_sensitive",
+                            "severity": "high",
+                            "target_country": "中国",
+                            "is_explicit_criticism": True,
+                            "start_utt": 8,
+                            "end_utt": 8,
+                            "quote": "she has to think",
+                            "reason": "政治红线",
+                            "precise_terms_zh": [],
+                            "precise_terms_en": [],
+                        },
+                    ]
+                },
+                provider="gemini",
+                model="gemini-2.5-flash",
+                prompt_tokens=1,
+                output_tokens=1,
+                elapsed_ms=1,
+            )
+
+    monkeypatch.setattr(cf, "ClipCutLLM", PartialLLM)
+    monkeypatch.setattr(cf, "detect_visual_ad_spans", lambda _p: [])
+    monkeypatch.setattr(cf, "detect_visual_ocr_redline_segments", lambda *_a, **_kw: [])
+
+    out = cf.scan_cut_segments(m, store, {"content_filter": {}}, "r_guard", scan_ads=False, scan_political=True)
+    # Expect u0001, merged u0003-u0004, u0006, u0008 -> 4 high segments
+    assert len(out.cut_segments) == 4
+    assert all(seg.severity == "high" for seg in out.cut_segments)
+    assert out.cut_segments[0].start_utt == 1 and out.cut_segments[0].end_utt == 1 and "习主席" in out.cut_segments[0].precise_terms_zh
+    # Adjacent merge connected guard u0003 ("除了习主席") + LLM u0004 ("一尘不染")
+    assert out.cut_segments[1].start_utt == 3 and out.cut_segments[1].end_utt == 4
+    assert "习主席" in out.cut_segments[1].precise_terms_zh and "一尘不染" in out.cut_segments[1].precise_terms_zh
+    # Guard caught question u0006 and filled missing term on u0008
+    assert out.cut_segments[2].start_utt == 6 and "President Xi" in out.cut_segments[2].precise_terms_en
+    assert out.cut_segments[3].start_utt == 8 and "习主席" in out.cut_segments[3].precise_terms_zh
+
+
+def test_visual_ocr_segment_model_audio_exclusion_and_ffmpeg_blur_render(tmp_path: Path):
+    import numpy as np
+    from PIL import Image
+    from clipcut.models import VisualMaskBox
+    from clipcut.pipeline.content_filter import (
+        get_overlapping_mask_payload,
+        resolve_mask_audio_spans,
+        resolve_segment_action,
+    )
+    from clipcut.render.renderer import _render_masked_span
+
+    src_mp4 = tmp_path / "banner_test.mp4"
+    # Build synthetic 4s 640x360 video with a sharp white square inside a dark red bottom bar (norm y ~ 0.72..0.84)
+    r_mk = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=navy:s=640x360:d=4.0:r=25",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=f=440:d=4.0:r=44100",
+            "-vf",
+            (
+                "drawbox=x=0:y=258:w=640:h=44:color=darkred:t=fill,"
+                "drawbox=x=185:y=266:w=8:h=24:color=white:t=fill,"
+                "drawbox=x=215:y=266:w=8:h=24:color=white:t=fill,"
+                "drawbox=x=245:y=266:w=8:h=24:color=white:t=fill,"
+                "drawbox=x=275:y=266:w=8:h=24:color=white:t=fill"
+            ),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            str(src_mp4),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert r_mk.returncode == 0, r_mk.stderr
+
+    vis_box = VisualMaskBox(x=0.25, y=0.71, w=0.30, h=0.13, text="PRESIDENT XI")
+    vis_seg = CutSegment(
+        cut_id="cut_vis_01",
+        kind="political_sensitive",
+        subtype="onscreen_text",
+        detector="visual_ocr",
+        action="mask",
+        recommended_action="mask",
+        severity="high",
+        start_utt=None,
+        end_utt=None,
+        start_s=1.0,
+        end_s=3.0,
+        quote="PRESIDENT XI",
+        visual_boxes=[vis_box],
+    )
+    m = ProjectManifest(
+        project_id="test-vis-ocr",
+        source=MediaSource(
+            work_dir=str(tmp_path),
+            render_video=str(src_mp4),
+            analysis_video=str(src_mp4),
+            output_dir=str(tmp_path / "out"),
+            duration_s=4.0,
+            width=640,
+            height=360,
+        ),
+        metadata=VideoMetadata(original_title="vis"),
+        cut_segments=[vis_seg],
+    )
+    m.clean_cut.cut_political_sensitive = True
+    m.clean_cut.political_action = "precise_mask"
+
+    # Visual OCR stays mask even when allow_mask=False unless explicitly delete; never mutes audio
+    assert resolve_segment_action(vis_seg, m, allow_mask=False) == "mask"
+    assert resolve_mask_audio_spans(m, [vis_seg]) == []
+    payload1 = get_overlapping_mask_payload(0.0, 4.0, m)
+    assert len(payload1) == 1 and "visual_boxes" in payload1[0]
+    m.cut_segments[0].visual_boxes[0].x = 0.28
+    assert get_overlapping_mask_payload(0.0, 4.0, m) != payload1
+
+    # Render with local blur box on [1.0, 3.0]
+    out_mp4 = tmp_path / "banner_blurred.mp4"
+    vis_regions = [
+        {
+            "cut_id": "cut_vis_01",
+            "start_s": 1.0,
+            "end_s": 3.0,
+            "boxes": [{"x": 0.25, "y": 0.71, "w": 0.30, "h": 0.13}],
+        }
+    ]
+    ok, _enc, err = _render_masked_span(
+        src_mp4,
+        0.0,
+        4.0,
+        None,
+        None,
+        out_mp4,
+        fade_ms=20,
+        use_vt=False,
+        visual_mask_regions=vis_regions,
+        video_size=(640, 360),
+    )
+    assert ok and out_mp4.exists(), err
+
+    # Compare t=0.4s (unmasked crisp white rectangle) vs t=2.0s (blurred white rectangle blended with dark red)
+    f0 = tmp_path / "f0.png"
+    f1 = tmp_path / "f1.png"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", "0.4", "-i", str(out_mp4), "-frames:v", "1", str(f0)], check=True)
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", "2.0", "-i", str(out_mp4), "-frames:v", "1", str(f1)], check=True)
+    with Image.open(f0) as im0, Image.open(f1) as im1:
+        # Compare stripe region x=180..300, y=266..290: unmasked has crisp high-contrast stripes; blurred collapses std
+        box0 = np.asarray(im0.crop((180, 266, 300, 290)), dtype=np.float32)
+        box1 = np.asarray(im1.crop((180, 266, 300, 290)), dtype=np.float32)
+        assert box0[:, :, 2].std() > 80.0
+        assert box1[:, :, 2].std() < box0[:, :, 2].std() * 0.45
+        assert box1[:, :, 2].max() < 170.0
+
+
+def test_bilibili_normative_terms_and_mss_hard_redline_rules():
+    from clipcut.pipeline.visual_ocr import match_hard_redline_text
+
+    # Positive statutory normative terms, MSS, and separatist expressions
+    assert any(h["rule_id"] == "normative_terms_redline" for h in match_hard_redline_text("Shipping to Mainland China grew 20%."))
+    assert any(h["rule_id"] == "normative_terms_redline" for h in match_hard_redline_text("located in mainland China"))
+    assert any(h["rule_id"] == "normative_terms_redline" for h in match_hard_redline_text("参观南京大屠杀纪念馆"))
+    assert any(h["rule_id"] == "normative_terms_redline" for h in match_hard_redline_text("去往新疆维吾尔族自治区调研"))
+    assert any(h["rule_id"] == "ccp_mss" for h in match_hard_redline_text("与一名国安部官员有接触"))
+    assert any(h["rule_id"] == "ccp_mss" for h in match_hard_redline_text("was in contact with an MSS officer"))
+    assert any(h["rule_id"] == "sovereignty_redline" for h in match_hard_redline_text("鼓吹一边一国或 two Chinas 论调"))
+
+    # Compliant / technical benign strings must never false-positive
+    for benign in (
+        "Shipments to Chinese mainland, China's mainland, and the mainland of China increased.",
+        "我们前往侵华日军南京大屠杀遇难同胞纪念馆献花。",
+        "新疆维吾尔自治区近年来推动清洁能源发展。",
+        "TCP MSS negotiation is 1460 bytes on Ethernet.",
+    ):
+        assert match_hard_redline_text(benign) == [], f"Unexpected false positive on: {benign}"
+
+
+def test_bilibili_policy_profiles_prompt_and_editorial_yaml_sync(tmp_path: Path):
+    import clipcut.pipeline.content_filter as cf
+
+    cfg = load_editorial_config()
+    required_ids = {
+        "hard_redline",
+        "sovereignty_and_normative_terms",
+        "national_honor_and_public_service",
+    }
+    for source_name, profiles in (("default", cf.DEFAULT_POLITICAL_PROFILES), ("editorial.yaml", cf.get_political_profiles(cfg))):
+        for lvl in ("strict", "balanced", "loose"):
+            rules = {r["id"]: r for r in profiles[lvl]["rules"]}
+            for rid in required_ids:
+                assert rid in rules, f"Missing {rid} in {source_name}.{lvl}"
+                assert rules[rid]["severity"] == "high", f"Expected high severity for {rid} in {source_name}.{lvl}"
+
+    m, _ = _make_manifest(tmp_path)
+    prompt = cf._build_filter_prompt(
+        m,
+        m.utterances,
+        scan_ads=False,
+        scan_political=True,
+        sensitivity="balanced",
+        cfg=cfg,
+    )
+    for needle in (
+        "代词",
+        "mainland China",
+        "侵华日军南京大屠杀遇难同胞纪念馆",
+        "新疆维吾尔自治区",
+        "国旗",
+        "英雄烈士",
+    ):
+        assert needle in prompt, f"Expected prompt to include {needle!r}"
+
+    # Validator accepts statutory Bilibili hits even when is_explicit_criticism is False if high + statutory subtype
+    norm_utts = [
+        Utterance(id=0, start_s=0.0, end_s=3.0, zh="他们访问了南京大屠杀纪念馆并讨论了人民币汇率。", en="They visited mainland China."),
+    ]
+    for seg_dict, quote in (
+        (
+            {
+                "kind": "political_sensitive",
+                "subtype": "sovereignty_and_normative_terms",
+                "severity": "high",
+                "target_country": "中国",
+                "is_explicit_criticism": False,
+            },
+            "They visited mainland China.",
+        ),
+        (
+            {
+                "kind": "political_sensitive",
+                "subtype": "national_honor_and_public_service",
+                "severity": "high",
+                "target_country": "中国",
+                "is_explicit_criticism": False,
+            },
+            "并讨论了人民币汇率",
+        ),
+    ):
+        assert cf._is_valid_political_hit(seg_dict, norm_utts, 0, 0, quote, "法定规范与国家荣誉红线") is True
+
+
+
 
 
 

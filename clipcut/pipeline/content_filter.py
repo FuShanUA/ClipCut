@@ -14,42 +14,102 @@ import numpy as np
 
 from ..cancel import JobCancelledError, check_cancelled, run_cancellable_subprocess
 from ..config import load_editorial_config
-from ..llm import ClipCutLLM, DEFAULT_TEXT_FALLBACK_MODELS
-from ..models import CutSegment, ProjectManifest, Utterance, utc_now_iso
+from ..llm import ClipCutLLM, DEFAULT_TEXT_FALLBACK_MODELS, parse_provider_model
+from ..models import CutSegment, ProjectManifest, Utterance, VisualMaskBox, utc_now_iso
 from ..receipts import ProjectStore
+from .visual_ocr import detect_visual_ocr_redline_segments, match_hard_redline_text
 
 
 VALID_SEVERITIES = ("high", "medium", "low")
-VALID_POLITICAL_ACTIONS = ("auto", "delete", "mask")
+VALID_POLITICAL_ACTIONS = ("auto", "delete", "mask", "precise_mask")
+VALID_SEGMENT_ACTIONS = ("inherit", "delete", "mask", "precise_mask")
 
 _DEFAULT_ZH_TO_EN_TERMS: dict[str, list[str]] = {
     "习近平": ["xi jinping", "xi"],
     "习主席": ["xi jinping", "xi"],
+    "普京": ["putin"],
+    "中南海": ["zhongnanhai"],
+    "中国国家安全部": ["mss", "ministry of state security"],
+    "国家安全部": ["mss", "ministry of state security"],
+    "国安部": ["mss", "ministry of state security"],
+    "解放军": ["pla", "people's liberation army"],
     "中国共产党": ["chinese communist party", "ccp"],
     "共产党": ["communist party", "communist", "ccp"],
     "中共": ["ccp", "chinese communist party", "communist party"],
+    "中国大陆": ["mainland china"],
+    "南京大屠杀纪念馆": ["nanjing massacre memorial"],
+    "新疆维吾尔族自治区": ["xinjiang uygur autonomous region"],
     "台海": ["taiwan strait", "taiwan"],
     "台湾": ["taiwan", "taiwanese"],
+    "台独": ["taiwan independence"],
+    "中华民国": ["republic of china"],
+    "台湾总统": ["president of taiwan", "taiwanese president"],
     "香港": ["hong kong"],
+    "港独": ["hong kong independence"],
     "新疆": ["xinjiang"],
     "西藏": ["tibet", "tibetan"],
     "南海": ["south china sea"],
     "北京": ["beijing"],
     "中国": ["china", "chinese"],
     "政权": ["regime"],
+    "政权倒台": ["regime toppled", "regime collapse", "toppled"],
+    "倒台": ["topple", "toppled", "collapse"],
+    "推翻": ["overthrow", "topple", "toppled"],
+    "独裁": ["dictatorship", "dictator", "autocratic"],
+    "独裁者": ["dictator"],
+    "清洗": ["purge", "purges", "purged", "purging"],
+    "侵略": ["aggression", "invade", "invaded", "invasion"],
+    "侵略者": ["aggressor"],
+    "入侵": ["invade", "invaded", "invading", "invasion"],
+    "邪恶": ["evil", "wicked"],
+    "撒谎": ["lie", "lying", "lied", "liar"],
+    "谎言": ["lie", "lies"],
+    "正义": ["righteous", "justice", "just"],
+    "暴政": ["tyranny", "tyrant"],
+    "镇压": ["crackdown", "suppress", "suppression", "oppress"],
+    "迫害": ["persecute", "persecution"],
+    "极端": ["extremist", "extreme"],
+    "恐怖": ["terrorist", "terrorism"],
+    "野蛮": ["barbaric", "brutal"],
+    "强征": ["conscripted", "conscript"],
+    "洗脑": ["brainwash", "brainwashed"],
 }
+
+PRECISE_MASK_RULES_PROMPT = """【精准遮蔽/消音关键词（`precise_terms_zh` / `precise_terms_en`）提取铁律】：
+目标：只给**真正构成政治红线、不规范主权称谓或明确贬损定性的极少数关键词**打码与消音，**最大限度保留前后正常对话与上下文语流，禁止将整句或中性国家名词（如“俄罗斯/乌克兰/美国/伊朗”）打包列入精准词表**。
+每段 `political_sensitive`（无论 `recommended_action` 是 `"delete"` 还是 `"mask"`）都**必须**尽量精确提取以下 3 类词；若某句确实只是一般背景叙述、不包含下列 3 类词，则该段精准词表返回 `[]`（表示精准模式下不触发整段消音）：
+1. **不妥当的政治体或政治人物称谓**：我国国家领导人、政治人物及敏感党政/政权称谓（如 `习主席` / `习近平` / `Xi Jinping`、`政权` / `regime`、`独裁者` / `dictator`、`特朗普` / `Trump` 等若触发人物政治审查）。
+2. **按网信办、外交部与平台规范对中港台地区、国家形象及法定表述的不规范称谓/用语**：如将台湾/香港与中国并列或称“台湾总统 / 中华民国 / 台湾国 / 两个中国 / 一中一台 / 一边一国 / 台独 / 港独”（仅提普通商业/地理事实时不得泛滥标出 `台湾`/`中国`）；英文将“中国大陆”错译为 `mainland China` / `Mainland China`（规范应为 `Chinese mainland` / `China's mainland` / `the mainland of China`）；错将“侵华日军南京大屠杀遇难同胞纪念馆”简称为 `南京大屠杀纪念馆`、错将“新疆维吾尔自治区”写为 `新疆维吾尔族自治区`；以及侮辱/不当使用 `国旗`/`国歌`/`国徽`/`人民币` 或贬损英烈/`解放军`/`武警`/`国安`/`公安`/`司法人员`/`党员` 形象的定性词与称谓词。
+3. **对其他国家、政治人物行为或宗教/文化的定性判断动词、形容词、副词及定性名词**（包括假想推演、举例或引用句中的明确行动/定性措辞，例如 `某国入侵/清洗/倒台`）：如 `侵略` / `侵略者` / `入侵`（`aggressor` / `invasion` / `invaded`，若字幕将 `invasion` 错写为 `evasion` 也请原样摘录 `evasion`）、`正义`（`righteous`/`just`）、`邪恶`（`evil`）、`撒谎`/`谎言`（`lie`/`lying`）、`清洗`（`purges`）、`倒台`/`推翻`（`toppled`/`overthrow`）、`强征`（`conscripted`）、`镇压`/`迫害`/`极端`/`恐怖`/`野蛮`/`洗脑`（及其对宗教、文化群体的定性形容词/动词）。
+4. **原文精确性约束**：
+   - `precise_terms_zh` 必须逐字原样摘自对应句的**中文字幕**；
+   - `precise_terms_en` 必须逐字原样摘自对应句的**英文字幕**（保持字幕实际拼写与时态/单复数，否则音频时间戳与打码将无法命中）。
+5. **涉中国最高领导人评价的指代还原防漏约束**：
+   - 当片段正在评价中国最高领导人的态度、执政能力或外交礼遇（且后续句以代词 `他`/`他们`/`he`/`they` 延续点评）时，不能仅提取 `习主席`/`President Xi` 而漏掉同一语段中暴露领导人外交姿态或评价的核心词句（如 `尊重`/`respect`、`到飞机迎接我`/`met me at the plane`、`信号`/`sign` 等），否则平台审核仍可凭上下文还原指代；此类整段评价在 `recommended_action` 上应优先设为 `"delete"`。"""
 
 DEFAULT_POLITICAL_PROFILES: dict[str, dict[str, Any]] = {
     "strict": {
         "label": "严格从严（推荐视频号/B站）",
-        "description": "适配中国大陆主流平台强审核：覆盖涉华及中国友好国家（俄/朝/伊朗与伊斯兰世界等）的硬红线、明确指责对抗及边缘涉政表述。",
+        "description": "适配中国大陆主流平台强审核：完整覆盖国家法律法规（中国特色社会主义制度与核心地位、分裂国家与规范称谓/版图、损害国家荣誉与英烈军警形象）及涉华/友好国家实质红线与对抗表述。",
         "trigger_severities": ["high", "medium", "low"],
         "rules": [
             {
                 "id": "hard_redline",
-                "name": "硬性政治红线",
+                "name": "危害中国特色社会主义制度与领导人红线",
                 "severity": "high",
-                "description": "直接涉及中国领导人、执政党、政治体制、政权评论或影射；台湾/香港/新疆/西藏/南海主权挑战或台海军事冲突；对中/俄/朝/伊朗等中国友好国家的政权攻击、极端军事打击渲染或直接意识形态攻击。",
+                "description": "攻击、否定、损害、违背中国特色社会主义指导思想、行动指南及马克思主义中国化最新理论成果；攻击、否定、弱化党中央的核心与全党核心地位，以及任何涉及中国最高领导人个人言行、执政或外交礼遇姿态的评论、影射与可还原指代（含连续代词“他/他们”延续句）；历史虚无主义（以一个阶段党和国家发展历史否定另一个阶段）、违背党的百年奋斗重大成就决议、调侃否定新中国成立以来重大方针政策举措、曲解/攻击/调侃宪法及国家重大法律法规；以娱乐化方式篡改解读根本/基本/重要制度、特定政治名词及敏感历史事件；对中/俄/朝/伊朗等中国友好国家的政权攻击、极端军事打击渲染或直接意识形态攻击。",
+            },
+            {
+                "id": "sovereignty_and_normative_terms",
+                "name": "分裂国家、国家主权与规范称谓/版图",
+                "severity": "high",
+                "description": "危害国家统一与主权领土完整，反对、攻击、曲解“一个中国”“一国两制”，反映分裂国家言行、活动、标识、旗帜、标语口号或涉分裂立场艺人/团体节目，以及对领土和历史事件描写不符合国家定论；错用/滥用特定标识、呼号、称谓与用语：杜绝将“中国大陆”英译为 mainland China/Mainland China（应为 Chinese mainland/China's mainland/the mainland of China）、杜绝将“侵华日军南京大屠杀遇难同胞纪念馆”简称为“南京大屠杀纪念馆”、杜绝将“新疆维吾尔自治区”错写为“新疆维吾尔族自治区”、杜绝“台湾总统/中华民国/两个中国/一中一台/一边一国”；涉及中国地图残缺、地名不完整或篡改等国家版图缺失展示。",
+            },
+            {
+                "id": "national_honor_and_public_service",
+                "name": "损害国家荣誉利益、英烈及公务人员形象",
+                "severity": "high",
+                "description": "贬损、玷污、恶搞国家和民族形象、精神气质，焚烧/毁损/涂划/玷污/践踏/恶搞或不适宜娱乐商业场合使用国歌、国旗、国徽、人民币；贬损、恶搞、损害革命领袖、英雄烈士及中国共产党党员形象名誉；贬损、恶搞、损害人民军队（解放军）、武警、国安（国安部/MSS）、公安、行政、司法人员等国家公务人员形象名誉（含恶意截取执法营造暴力执法效果、泛娱乐化夸张展现解放军、传播未证实军装冲突或冒充公务人员）；美化反面人物、对已定性负面人物歌功颂德、曲解国史党史军史。",
             },
             {
                 "id": "geopolitics_confrontation",
@@ -73,14 +133,26 @@ DEFAULT_POLITICAL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "balanced": {
         "label": "平衡",
-        "description": "聚焦硬红线及针对中国或友好国家（俄/朝/伊朗等）的明确指责与对抗；放行一般技术对比、商业讨论及欧美内政。",
+        "description": "严守法律法规红线（制度与核心地位、分裂主权与规范称谓/版图、国家荣誉与英烈军警形象），并覆盖对华及友好国家的明确指责与对抗；放行一般技术对比、商业讨论及欧美内政。",
         "trigger_severities": ["high", "medium"],
         "rules": [
             {
                 "id": "hard_redline",
-                "name": "硬性政治红线",
+                "name": "危害中国特色社会主义制度与领导人红线",
                 "severity": "high",
-                "description": "直接涉及中国领导人、执政党、政治体制或政权评价/影射；台湾/香港/新疆/西藏/南海主权议题；对中/俄/朝/伊朗等中国友好国家的政权攻击或直接意识形态攻击。",
+                "description": "攻击、否定、违背中国特色社会主义制度、指导思想、党中央权威与核心地位，及涉中国最高领导人言行/外交姿态的评论、影射与连续代词指代；历史虚无主义、否定重大方针政策或曲解宪法法律；敏感历史政治事件；对中/俄/朝/伊朗等中国友好国家的政权攻击或直接意识形态攻击。",
+            },
+            {
+                "id": "sovereignty_and_normative_terms",
+                "name": "分裂国家、国家主权与规范称谓/版图",
+                "severity": "high",
+                "description": "反对“一个中国”“一国两制”、分裂言行标识及不符合定论的领土历史描写；杜绝 mainland China/Mainland China、南京大屠杀纪念馆（应含“侵华日军…遇难同胞”）、新疆维吾尔族自治区（应无“族”字）、台湾总统/中华民国/一边一国等不规范称谓；杜绝中国版图缺失或地名篡改。",
+            },
+            {
+                "id": "national_honor_and_public_service",
+                "name": "损害国家荣誉利益、英烈及公务人员形象",
+                "severity": "high",
+                "description": "侮辱或不当使用国歌、国旗、国徽、人民币；贬损革命领袖、英雄烈士、中国共产党党员；贬损恶搞人民军队、武警、国安（国安部/MSS）、公安、行政、司法人员等公务人员或恶意截取执法画面；美化反面人物或曲解国史党史军史。",
             },
             {
                 "id": "geopolitics_confrontation",
@@ -98,14 +170,26 @@ DEFAULT_POLITICAL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "loose": {
         "label": "仅硬红线",
-        "description": "仅识别直接触及国内法律法规与平台红线的高危内容；一般地缘竞争、产业讨论、历史类比与欧美内政均放行。",
+        "description": "仅识别直接触及国家法律法规与平台法定红线的高危内容；一般地缘竞争、产业讨论、历史类比与欧美内政均放行。",
         "trigger_severities": ["high"],
         "rules": [
             {
                 "id": "hard_redline",
-                "name": "硬性政治红线",
+                "name": "危害中国特色社会主义制度与领导人红线",
                 "severity": "high",
-                "description": "直接涉及中国领导人、执政党、政治体制或政权评论与影射；台湾/香港/新疆/西藏/南海主权挑战；敏感政治历史事件、违禁人物与直接意识形态攻击。",
+                "description": "直接危害中国特色社会主义制度、指导思想、党中央权威与核心地位，及涉中国最高领导人言行/外交姿态的评论、影射与连续代词指代；历史虚无主义、曲解宪法法律与敏感政治历史事件；直接意识形态攻击。",
+            },
+            {
+                "id": "sovereignty_and_normative_terms",
+                "name": "分裂国家、国家主权与规范称谓/版图",
+                "severity": "high",
+                "description": "危害国家统一与领土完整、反对“一个中国”“一国两制”、分裂标识言行；错用 mainland China/Mainland China、南京大屠杀纪念馆、新疆维吾尔族自治区、台湾总统/中华民国等不规范称谓；中国地图残缺或地名篡改。",
+            },
+            {
+                "id": "national_honor_and_public_service",
+                "name": "损害国家荣誉利益、英烈及公务人员形象",
+                "severity": "high",
+                "description": "侮辱或不当使用国歌/国旗/国徽/人民币；贬损革命领袖、英雄烈士、中国共产党党员；贬损恶搞人民军队、武警、国安（国安部/MSS）、公安、司法等国家公务人员；美化反面人物或曲解国史党史军史。",
             },
             {
                 "id": "exclude_general_geopolitics",
@@ -216,7 +300,7 @@ def segment_matches_sensitivity(
 CONTENT_FILTER_SYSTEM = """你是面向中国大陆视频平台（微信视频号、B站、小红书）的精准合规剪辑审核员。
 你的任务是精确识别长视频字幕中的两类需要处理的片段：
 1. 商业广告与推广植入（kind = "ad"，必须包含明确第三方品牌/赞助产品或具体付费导流诉求）
-2. 针对中国、台海/港澳疆藏南海主权，或针对俄罗斯、朝鲜、伊朗/伊斯兰世界等中国友好国家的实质性政治红线或明确政权/政策指责对抗（kind = "political_sensitive"）
+2. 危害中国特色社会主义制度与领导人/核心地位、分裂国家与不规范国家称谓/版图（如错用 `mainland China`/`南京大屠杀纪念馆`/`新疆维吾尔族自治区` 或台湾/港澳疆藏南海主权问题）、损害国家荣誉利益与英烈/党员/军警国安公务人员形象，以及针对俄罗斯、朝鲜、伊朗/伊斯兰世界等中国友好国家的实质性政权/政策攻击或对抗（kind = "political_sensitive"）
 严禁进行“可能引发对中国政府/平台监管联想”“可能引发群体对立/社会争议”之类的滑坡式过度推断；不得将泛指“政府”、商业垄断批评（Apple/Google/Meta）、欧美内政文化争议（woke/Elon/Trump）或粗口标为涉政。
 你必须精准定位字幕句号范围 `[start_utt, end_utt]`，只输出严格的 JSON，不要输出 Markdown 代码块或多余文字。"""
 
@@ -247,30 +331,91 @@ def has_clean_source_video(manifest: ProjectManifest) -> bool:
     return True
 
 
+def is_visual_ocr_segment(seg: CutSegment) -> bool:
+    """Return True if segment masks on-screen video text rather than speech/subtitles."""
+    return str(getattr(seg, "detector", "") or "") == "visual_ocr" or bool(getattr(seg, "visual_boxes", None))
+
+
 def resolve_segment_action(
     seg: CutSegment,
     manifest: ProjectManifest,
     *,
     allow_mask: bool | None = None,
-) -> Literal["delete", "mask"]:
-    """Resolve effective handling action ('delete' or 'mask') for a CutSegment."""
+) -> Literal["delete", "mask", "precise_mask"]:
+    """Resolve effective handling action ('delete', 'mask', or 'precise_mask') for a CutSegment."""
     if seg.kind != "political_sensitive":
         return "delete"
+    seg_act = str(getattr(seg, "action", "inherit") or "inherit").strip().lower()
+    if is_visual_ocr_segment(seg):
+        if seg_act == "delete":
+            return "delete"
+        if seg_act in ("mask", "precise_mask"):
+            return seg_act  # type: ignore[return-value]
+        global_act = str(getattr(manifest.clean_cut, "political_action", "delete") or "delete").strip().lower()
+        return "precise_mask" if global_act == "precise_mask" else "mask"
     can_mask = has_clean_source_video(manifest) if allow_mask is None else bool(allow_mask)
     if not can_mask:
         return "delete"
-    seg_act = str(getattr(seg, "action", "inherit") or "inherit").strip().lower()
-    if seg_act == "mask":
-        return "mask"
-    if seg_act == "delete":
-        return "delete"
+    if seg_act in ("mask", "precise_mask", "delete"):
+        return seg_act  # type: ignore[return-value]
     global_act = str(getattr(manifest.clean_cut, "political_action", "delete") or "delete").strip().lower()
+    if global_act == "precise_mask":
+        return "precise_mask"
     if global_act == "mask":
         return "mask"
     if global_act == "auto":
         rec = str(getattr(seg, "recommended_action", "delete") or "delete").strip().lower()
         return "mask" if rec == "mask" else "delete"
     return "delete"
+
+
+def resolve_visual_mask_regions(
+    manifest: ProjectManifest,
+    mask_segments: list[CutSegment],
+) -> list[dict[str, Any]]:
+    """Return active on-screen visual blur regions [{cut_id, start_s, end_s, boxes}]."""
+    _ = manifest
+    regions: list[dict[str, Any]] = []
+    for seg in mask_segments:
+        if not is_visual_ocr_segment(seg) or seg.end_s <= seg.start_s:
+            continue
+        boxes = [
+            {
+                "x": round(float(b.x), 4),
+                "y": round(float(b.y), 4),
+                "w": round(float(b.w), 4),
+                "h": round(float(b.h), 4),
+            }
+            for b in (getattr(seg, "visual_boxes", None) or [])
+            if float(b.w) > 0 and float(b.h) > 0
+        ]
+        if not boxes:
+            continue
+        regions.append(
+            {
+                "cut_id": seg.cut_id,
+                "start_s": round(float(seg.start_s), 3),
+                "end_s": round(float(seg.end_s), 3),
+                "boxes": boxes,
+            }
+        )
+    return regions
+
+
+def resolve_segment_mask_terms(
+    seg: CutSegment,
+    action: Literal["mask", "precise_mask"],
+) -> tuple[list[str], list[str]]:
+    """Return (zh_terms, en_terms) active for the segment's resolved masking mode."""
+    p_zh = [str(x).strip() for x in (getattr(seg, "precise_terms_zh", None) or []) if str(x).strip()]
+    p_en = [str(x).strip() for x in (getattr(seg, "precise_terms_en", None) or []) if str(x).strip()]
+    s_zh = [str(x).strip() for x in (seg.sensitive_terms_zh or []) if str(x).strip()]
+    s_en = [str(x).strip() for x in (seg.sensitive_terms_en or []) if str(x).strip()]
+    if action == "precise_mask":
+        if p_zh or p_en or bool(getattr(seg, "precise_terms_extracted", False)):
+            return p_zh, p_en
+        return s_zh, s_en
+    return s_zh, s_en
 
 
 def get_active_cut_segments(
@@ -320,7 +465,7 @@ def get_active_mask_segments(
     return [
         seg
         for seg in get_active_cut_segments(manifest, cfg)
-        if resolve_segment_action(seg, manifest, allow_mask=allow_mask) == "mask"
+        if resolve_segment_action(seg, manifest, allow_mask=allow_mask) in ("mask", "precise_mask")
     ]
 
 
@@ -430,24 +575,59 @@ def _load_whisper_words(ts_path: Path) -> list[tuple[str, float, float]]:
     return out
 
 
+def _en_base_stems(tok: str) -> set[str]:
+    stems = {tok}
+    if len(tok) < 4:
+        return stems
+    if tok.endswith("ies") and len(tok) > 4:
+        stems.add(tok[:-3] + "y")
+        stems.add(tok[:-1])
+    elif tok.endswith("ying") and len(tok) > 4:
+        stems.add(tok[:-4] + "ie")
+        stems.add(tok[:-3])
+    elif tok.endswith("ing") and len(tok) > 5:
+        stems.add(tok[:-3])
+        stems.add(tok[:-3] + "e")
+    elif tok.endswith("ied") and len(tok) > 4:
+        stems.add(tok[:-3] + "y")
+        stems.add(tok[:-1])
+    elif tok.endswith("ed") and len(tok) > 4:
+        stems.add(tok[:-2])
+        stems.add(tok[:-1])
+    elif tok.endswith("es") and len(tok) > 4:
+        stems.add(tok[:-2])
+        stems.add(tok[:-1])
+    elif tok.endswith("s") and not tok.endswith("ss"):
+        stems.add(tok[:-1])
+    return stems
+
+
 def _tokens_match(word_tok: str, term_tok: str) -> bool:
     if word_tok == term_tok:
         return True
     if len(term_tok) >= 3 and (word_tok == term_tok + "s" or term_tok == word_tok + "s"):
         return True
+    if min(len(word_tok), len(term_tok)) >= 4 and (_en_base_stems(word_tok) & _en_base_stems(term_tok)):
+        return True
     return False
 
 
-def _collect_search_en_terms(seg: CutSegment) -> list[str]:
+def _collect_search_en_terms(
+    seg: CutSegment,
+    terms_zh: list[str] | None = None,
+    terms_en: list[str] | None = None,
+) -> list[str]:
+    src_en = seg.sensitive_terms_en if terms_en is None else terms_en
+    src_zh = seg.sensitive_terms_zh if terms_zh is None else terms_zh
     terms: list[str] = []
     seen: set[str] = set()
-    for t in seg.sensitive_terms_en or []:
+    for t in src_en or []:
         s = str(t or "").strip()
         if s and s.lower() not in seen:
             seen.add(s.lower())
             terms.append(s)
     if not terms:
-        for zt in seg.sensitive_terms_zh or []:
+        for zt in src_zh or []:
             z_clean = str(zt or "").strip()
             if not z_clean:
                 continue
@@ -486,12 +666,17 @@ def resolve_mask_audio_spans(
 
     raw_spans: list[tuple[float, float]] = []
     for seg in mask_segments:
-        terms_zh = [str(x).strip() for x in (seg.sensitive_terms_zh or []) if str(x).strip()]
-        en_terms = _collect_search_en_terms(seg)
-        if not terms_zh and not (seg.sensitive_terms_en or []):
-            raw_spans.append((seg.start_s, seg.end_s))
+        if is_visual_ocr_segment(seg) and seg.start_utt is None:
             continue
-        if not en_terms:
+        eff_action = resolve_segment_action(seg, manifest, allow_mask=True)
+        is_precise = eff_action == "precise_mask"
+        terms_zh, terms_en = resolve_segment_mask_terms(seg, "precise_mask" if is_precise else "mask")
+        en_terms = _collect_search_en_terms(seg, terms_zh=terms_zh, terms_en=terms_en)
+        if not terms_zh and not terms_en:
+            if not is_precise:
+                raw_spans.append((seg.start_s, seg.end_s))
+            continue
+        if not en_terms and not is_precise:
             raw_spans.append((seg.start_s, seg.end_s))
             continue
 
@@ -501,6 +686,7 @@ def resolve_mask_audio_spans(
 
         unmatched_terms: list[str] = []
         seg_matched = False
+        seg_spans: list[tuple[float, float]] = []
         for term in en_terms:
             t_toks = _normalize_en_tokens(term)
             if not t_toks:
@@ -510,19 +696,19 @@ def resolve_mask_audio_spans(
             if len(win_words) >= n_t:
                 for i in range(len(win_words) - n_t + 1):
                     if all(_tokens_match(win_words[i + j][0], t_toks[j]) for j in range(n_t)):
-                        raw_spans.append(
-                            (
-                                max(0.0, win_words[i][1] - 0.04),
-                                win_words[i + n_t - 1][2] + 0.05,
-                            )
+                        sp = (
+                            max(0.0, win_words[i][1] - 0.04),
+                            win_words[i + n_t - 1][2] + 0.05,
                         )
+                        raw_spans.append(sp)
+                        seg_spans.append(sp)
                         found_in_whisper = True
                         seg_matched = True
             if not found_in_whisper:
                 unmatched_terms.append(term)
 
-        if unmatched_terms and utts:
-            seg_utts = [
+        seg_utts = (
+            [
                 u
                 for u in utts
                 if (
@@ -532,6 +718,11 @@ def resolve_mask_audio_spans(
                 )
                 or (u.end_s > seg.start_s - 0.3 and u.start_s < seg.end_s + 0.3)
             ]
+            if utts
+            else []
+        )
+
+        if unmatched_terms and seg_utts:
             for term in unmatched_terms:
                 pat = _compile_en_term_pattern(term)
                 if pat is None:
@@ -545,10 +736,37 @@ def resolve_mask_audio_spans(
                     for m in pat.finditer(en_txt):
                         ws = u.start_s + (m.start() / L) * u_dur - 0.12
                         we = u.start_s + (m.end() / L) * u_dur + 0.12
-                        raw_spans.append((max(win_lo, ws), min(win_hi, we)))
+                        sp = (max(win_lo, ws), min(win_hi, we))
+                        raw_spans.append(sp)
+                        seg_spans.append(sp)
                         seg_matched = True
 
-        if not seg_matched and not (seg.sensitive_terms_en or []):
+        # Surgical precise_mask fallback: if Whisper/EN left a matched Chinese term utterance uncovered,
+        # emit only a tight short proportional window around the term instead of muting the whole segment.
+        if is_precise and terms_zh and seg_utts:
+            for u in seg_utts:
+                zh_txt = u.zh or ""
+                if not zh_txt:
+                    continue
+                has_u_span = any(min(u.end_s, pe) - max(u.start_s, ps) > 0.02 for ps, pe in seg_spans)
+                if has_u_span:
+                    continue
+                L_zh = max(1, len(zh_txt))
+                u_dur = max(0.2, u.end_s - u.start_s)
+                for tz in terms_zh:
+                    pat_zh = re.compile(re.escape(tz), re.IGNORECASE)
+                    for m in pat_zh.finditer(zh_txt):
+                        center = u.start_s + (((m.start() + m.end()) / 2.0) / L_zh) * u_dur
+                        half = min(1.0, max(0.4, (len(tz) * 0.35 + 0.5) / 2.0))
+                        ws = max(win_lo, max(0.0, u.start_s - 0.08), center - half)
+                        we = min(win_hi, u.end_s + 0.08, center + half)
+                        if we - ws > 0.05:
+                            sp = (ws, we)
+                            raw_spans.append(sp)
+                            seg_spans.append(sp)
+                            seg_matched = True
+
+        if not is_precise and not seg_matched and not terms_en:
             raw_spans.append((seg.start_s, seg.end_s))
 
     clamped: list[tuple[float, float]] = []
@@ -570,7 +788,13 @@ def _ass_ts_to_seconds(ts: str) -> float:
         return 0.0
 
 
-def redact_ass_dialogue_text(text: str, terms_zh: list[str], terms_en: list[str]) -> str:
+def redact_ass_dialogue_text(
+    text: str,
+    terms_zh: list[str],
+    terms_en: list[str],
+    *,
+    allow_blanket: bool = True,
+) -> str:
     """Redact sensitive Chinese/English terms inside ASS Dialogue text while preserving override tags."""
     clean_zh = sorted({str(t).strip() for t in (terms_zh or []) if str(t).strip()}, key=len, reverse=True)
     clean_en = sorted({str(t).strip() for t in (terms_en or []) if str(t).strip()}, key=len, reverse=True)
@@ -606,6 +830,8 @@ def redact_ass_dialogue_text(text: str, terms_zh: list[str], terms_en: list[str]
         i += 1
 
     if not clean_zh and not clean_en:
+        if not allow_blanket:
+            return text
         # Blanket redaction keeping inline ASS styling intact
         head_tags = "".join(re.findall(r"^(\{[^}]*\})+", text))
         has_cjk = bool(re.search(r"[\u4e00-\u9fff]", "".join(zh_chars)))
@@ -684,13 +910,20 @@ def build_masked_ass_file(
     mask_segments: list[CutSegment],
     work_dir: Path,
     hash_key: str = "",
+    *,
+    allow_visual_passthrough: bool = False,
 ) -> Path | None:
     """Create a temporary masked ASS copy in work_dir without modifying source subtitles."""
     if not mask_segments:
         return None
+    text_segs = [seg for seg in mask_segments if not is_visual_ocr_segment(seg)]
+    if not text_segs and not allow_visual_passthrough:
+        return None
     base_ass = _resolve_base_ass_path(manifest, work_dir)
     if base_ass is None or not base_ass.is_file():
         return None
+    if not text_segs:
+        return base_ass
 
     work_dir.mkdir(parents=True, exist_ok=True)
     out_ass = work_dir / f"masked_{hash_key or 'active'}.ass"
@@ -732,21 +965,34 @@ def build_masked_ass_file(
                     ev_e = _ass_ts_to_seconds(parts[end_col])
                     hitting = [
                         seg
-                        for seg in mask_segments
+                        for seg in text_segs
                         if min(ev_e, seg.end_s) - max(ev_s, seg.start_s) > 0.05
                     ]
                     if hitting:
                         zh_terms: list[str] = []
                         en_terms: list[str] = []
+                        want_blanket = False
                         for seg in hitting:
-                            zh_terms.extend(seg.sensitive_terms_zh or [])
-                            en_terms.extend(seg.sensitive_terms_en or [])
+                            eff_act = resolve_segment_action(seg, manifest, allow_mask=True)
+                            mode_key: Literal["mask", "precise_mask"] = (
+                                "precise_mask" if eff_act == "precise_mask" else "mask"
+                            )
+                            t_zh, t_en = resolve_segment_mask_terms(seg, mode_key)
+                            if mode_key == "mask" and not t_zh and not t_en:
+                                want_blanket = True
+                            zh_terms.extend(t_zh)
+                            en_terms.extend(t_en)
                         if not en_terms and zh_terms:
                             for zt in zh_terms:
                                 for zh_k, en_l in _DEFAULT_ZH_TO_EN_TERMS.items():
                                     if zh_k in zt or zt in zh_k:
                                         en_terms.extend(en_l)
-                        parts[-1] = redact_ass_dialogue_text(ev_text, zh_terms, en_terms)
+                        parts[-1] = redact_ass_dialogue_text(
+                            ev_text,
+                            zh_terms,
+                            en_terms,
+                            allow_blanket=want_blanket,
+                        )
                         out_lines.append("Dialogue:" + ",".join(parts))
                         continue
         out_lines.append(line)
@@ -773,17 +1019,31 @@ def get_overlapping_mask_payload(
     if not hitting:
         return []
     audio_spans = resolve_mask_audio_spans(manifest, hitting)
-    return [
-        {
+    out: list[dict[str, Any]] = []
+    for seg in hitting:
+        eff_act = resolve_segment_action(seg, manifest, allow_mask=True)
+        mode_key: Literal["mask", "precise_mask"] = (
+            "precise_mask" if eff_act == "precise_mask" else "mask"
+        )
+        is_vis_only = is_visual_ocr_segment(seg) and seg.start_utt is None
+        t_zh, t_en = resolve_segment_mask_terms(seg, mode_key)
+        item_payload: dict[str, Any] = {
             "cut_id": seg.cut_id,
+            "mode": mode_key,
             "start_s": round(seg.start_s, 3),
             "end_s": round(seg.end_s, 3),
-            "terms_zh": sorted({str(x).strip() for x in (seg.sensitive_terms_zh or []) if str(x).strip()}),
-            "terms_en": sorted({str(x).strip() for x in (seg.sensitive_terms_en or []) if str(x).strip()}),
+            "terms_zh": sorted({str(x).strip() for x in t_zh if str(x).strip()}) if not is_vis_only else [],
+            "terms_en": sorted({str(x).strip() for x in t_en if str(x).strip()}) if not is_vis_only else [],
             "audio_spans": [[round(s, 3), round(e, 3)] for s, e in audio_spans if e > start_s and s < end_s],
         }
-        for seg in hitting
-    ]
+        vis_boxes = [
+            [round(float(b.x), 4), round(float(b.y), 4), round(float(b.w), 4), round(float(b.h), 4)]
+            for b in (getattr(seg, "visual_boxes", None) or [])
+        ]
+        if vis_boxes:
+            item_payload["visual_boxes"] = vis_boxes
+        out.append(item_payload)
+    return out
 
 
 def describe_applied_filter(
@@ -794,7 +1054,6 @@ def describe_applied_filter(
     """Summarize the content filter state applied to target intervals (or whole project if spans is None)."""
     cc = manifest.clean_cut
     sens_map = {"strict": "严格", "balanced": "平衡", "loose": "红线"}
-    act_map = {"auto": "智能", "delete": "删段", "mask": "遮蔽"}
     sens_zh = sens_map.get(str(cc.sensitivity or "strict"), "严格")
 
     def _overlaps(seg: CutSegment) -> bool:
@@ -811,12 +1070,22 @@ def describe_applied_filter(
     mask_pol_cnt = sum(
         1 for s in active_segs if s.kind == "political_sensitive" and resolve_segment_action(s, manifest) == "mask"
     )
+    precise_pol_cnt = sum(
+        1
+        for s in active_segs
+        if s.kind == "political_sensitive" and resolve_segment_action(s, manifest) == "precise_mask"
+    )
 
     parts: list[str] = []
     if ad_cnt > 0:
         parts.append("去广")
-    if del_pol_cnt > 0 and mask_pol_cnt > 0:
+    any_mask_cnt = mask_pol_cnt + precise_pol_cnt
+    if del_pol_cnt > 0 and any_mask_cnt > 0:
         parts.append(f"脱敏(智能·{sens_zh})")
+    elif precise_pol_cnt > 0 and mask_pol_cnt > 0:
+        parts.append(f"脱敏(混合遮蔽·{sens_zh})")
+    elif precise_pol_cnt > 0:
+        parts.append(f"脱敏(精准遮蔽·{sens_zh})")
     elif mask_pol_cnt > 0:
         parts.append(f"脱敏(遮蔽·{sens_zh})")
     elif del_pol_cnt > 0:
@@ -1106,12 +1375,14 @@ def _build_filter_prompt(
      3. 中性提及中国或中国科技公司（如参访宇树科技 Unitree、客观比较中美开发者对 AGI 时间表的不同判断，不含政治贬损或制度攻击）；
      4. 纯商业平台与产品批评（如批评 Apple 30% 抽成、macOS 弹窗、围墙花园、Google/Meta 双头垄断、AI 安全研究员观点、普通口语粗口如 fucking）；
      5. 非指向中国或友好国家现实政治批评的历史常识/类比（如奥本海默、回溯过去 50 年冷战未核毁灭）。
-   - 而直接评论或影射**中国最高领导人（如 Xi / 习近平）或台海军事打击/中国政权更迭**的段落必须标为 `high`。
+   - 而直接评论或影射**中国最高领导人（如 Xi / 习近平）、中国特色社会主义制度/核心地位、分裂国家与不规范法定表述（如 `mainland China`/`Mainland China` 误译、`南京大屠杀纪念馆`、`新疆维吾尔族自治区`）、损害国歌/国旗/国徽/人民币/英烈/党员/人民军队/武警/国安（国安部/MSS）/公安/司法形象、国家版图缺失或台海军事打击/中国政权更迭**的段落必须标为 `high`。
    - 若整块字幕无实质涉政指责或红线内容，**直接返回空数组，严禁凑数输出中性提及中国/企业的 low 片段**；每条命中必须写出具体指责对象与违规原因（`reason` 不可为空）。
 
-   【脱敏策略推荐（`recommended_action`）与精确词表要求】：
-   - `"recommended_action": "mask"`（遮蔽敏感词字幕+哔音）：适用于正常科技/商业/工程讨论中**仅顺带提及敏感地名/国别/机构/人名**（删掉或遮住 1~2 个词，整句技术/商业含义依然成立），例如 "Chinese destroyer"、"China's chip policy"、"Taiwan" 作为例子顺带提到；务必在 `sensitive_terms_zh` / `sensitive_terms_en` 列出该段字幕中实际出现的所有需打码词。
-   - `"recommended_action": "delete"`（整段删除）：适用于整段或连续数句**围绕政权倒台/领导人评价/台海军事威慑/体制政治攻击展开论证**，仅打码无法消除敏感语境的片段（仍建议列出核心关键词）。广告段固定填 `"delete"` 且词表填 `[]`。"""
+   【脱敏策略推荐（`recommended_action`）与两级精确词表要求】：
+   - `"recommended_action": "mask"`（遮蔽敏感词字幕+哔音）：适用于正常科技/商业/工程讨论中**仅顺带提及敏感地名/国别/机构/不规范用语**（删掉或遮住 1~2 个词，整句技术/商业含义依然成立），例如 "Chinese destroyer"、"China's chip policy"、"Taiwan" 作为例子顺带提到或单独错用 `mainland China`；务必在 `sensitive_terms_zh` / `sensitive_terms_en` 列出该段字幕中实际出现的所有需打码词。
+   - `"recommended_action": "delete"`（整段删除）：适用于整段或连续数句**围绕中国最高领导人评价与外交姿态点评、政权倒台/领导人评价、台海军事威慑、国安军警/体制政治攻击展开论证**，仅打码姓氏/人名仍可通过上下文代词还原语境的片段（仍建议列出 `sensitive_terms_zh` / `sensitive_terms_en`）。广告段固定填 `"delete"` 且词表均填 `[]`。
+   - **重要**：每条 `political_sensitive`（包括 `recommended_action="delete"`）还必须额外提取 **精准模式词表**（`precise_terms_zh` / `precise_terms_en`），遵循以下铁律：
+{PRECISE_MASK_RULES_PROMPT}"""
         tasks.append(pol_rules)
 
     ch_lines = [
@@ -1139,6 +1410,7 @@ def _build_filter_prompt(
 - 必填 `"quote"`：从命中的字幕原文（`[uXXXX ...]` 行中 `|` 前后）逐字摘抄触发句（单句/短段摘 15~40 字/词原文；多句连续段落可用 `"首句原文...尾句原文"` 格式），严禁改写或杜撰。
 - `start_utt` 填触发段的第一句整数编号（必须与 `[uXXXX]` 完全一致），`end_utt` 填结束前最后一句整数编号。
 - 对于政治敏感内容（`political_sensitive`），可能紧挨正常技术/商业对话出现，**务必紧贴敏感论证起止句，不要把前后安全对话一起标进来**；如果单句就能遮蔽处理，就只标这 1~2 句。
+- **代词延续完整性铁律**：当某句提及**中国最高领导人**或触发法定硬红线（制度/主权/国家荣誉与国安军警形象），且后续连续句子仍用代词（`他` / `他们` / `he` / `him` / `they`）延续评价其态度、外交礼遇或行为（如“他之前并不尊重……后来他到飞机迎接我……”）时，**`end_utt` 必须连续延伸至该人物/事件点评彻底结束、话题切换前的最后一句**，严禁在代词延续句中途截断。
 - 连续的同类整段敏感论战或广告片段应合并为单一区间，不要碎片化拆分。
 
 【输出 JSON Schema】
@@ -1146,7 +1418,7 @@ def _build_filter_prompt(
   "segments": [
     {{
       "kind": "ad | political_sensitive",
-      "subtype": "sponsor | midroll | outro | intro | hard_redline | geopolitics_confrontation | policy_sensitive",
+      "subtype": "sponsor | midroll | outro | intro | hard_redline | sovereignty_and_normative_terms | national_honor_and_public_service | geopolitics_confrontation | policy_sensitive",
       "brand": "仅 ad 填写具体赞助品牌/产品/平台名（无具体品牌严禁标为广告）；political_sensitive 填 \"\"",
       "target_country": "仅 political_sensitive 填字幕上下文实际谈及的目标国家/地区（如 中国 / 台海 / 俄罗斯 / 朝鲜 / 伊朗 / 伊斯兰世界 等）；若实为泛指政府、美国/欧美或商业公司，填 \"非目标\"",
       "is_explicit_criticism": true,
@@ -1155,8 +1427,10 @@ def _build_filter_prompt(
       "end_utt": 19,
       "severity": "high | medium | low",
       "recommended_action": "delete | mask",
-      "sensitive_terms_zh": ["需打码的中文原文词（从上述中文字幕原样摘录）"],
-      "sensitive_terms_en": ["term to mute/redact verbatim from English subtitle"],
+      "sensitive_terms_zh": ["常规遮蔽需打码的中文原文词（从上述中文字幕原样摘录）"],
+      "sensitive_terms_en": ["term for normal mask verbatim from English subtitle"],
+      "precise_terms_zh": ["精准模式仅遮蔽政治体/领导人/不规范中港台称谓/定性判断词的中文原文"],
+      "precise_terms_en": ["surgical precise-mode keyword verbatim from English subtitle"],
       "reason": "简短中文原因说明"
     }}
   ]
@@ -1183,9 +1457,11 @@ def _term_in_utterance(term: str, utt: Utterance) -> bool:
         return False
     zh = utt.zh or ""
     en = utt.en or ""
-    if re.fullmatch(r"[A-Za-z0-9\s\-']+", t):
-        t_low = t.lower()
-        return bool(re.search(r"(?<![a-z0-9])" + re.escape(t_low) + r"(?![a-z0-9])", en.lower()))
+    if re.fullmatch(r"[A-Za-z0-9\s.'’\-]+", t):
+        pat = _compile_en_term_pattern(t)
+        if pat is None:
+            return False
+        return bool(pat.search(en) or pat.search(zh))
     return (t in zh) or (t.lower() in en.lower())
 
 
@@ -1410,11 +1686,11 @@ _POLITICAL_STOP_TOKENS = {"国家", "政府", "世界", "地区", "问题", "政
 
 _POLITICAL_TARGET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"中国|中共|共产党|北京|中南海|习近平|习主席|台湾|台海|香港|新疆|西藏|南海|解放军|天安门|文革|法轮功|达赖|维吾尔"
+        r"中国|中共|共产党|北京|中南海|习近平|习主席|台湾|台海|香港|新疆|西藏|南海|解放军|武警|国安部|公安|司法|烈士|英烈|革命领袖|国旗|国歌|国徽|人民币|南京大屠杀|新疆维吾尔|宪法|一国两制|一个中国|中国大陆|党史|军史|国史|天安门|文革|法轮功|达赖|维吾尔"
     ),
     re.compile(r"俄罗斯|俄国|普京|莫斯科|苏联|朝鲜|平壤|金正恩|伊朗|德黑兰|哈梅内伊|伊斯兰|穆斯林|巴勒斯坦|哈马斯|叙利亚|阿富汗|塔利班|巴基斯坦|古巴|委内瑞拉|白俄罗斯|塞尔维亚"),
     re.compile(
-        r"(?<![a-z0-9])(china|chinese|ccp|prc|beijing|taiwan|taiwanese|hong\s+kong|xinjiang|tibet|tibetan|south\s+china\s+sea|pla|xi\s+jinping|xi|uyghur|tiananmen|dalai|russia|russian|putin|moscow|north\s+korea|pyongyang|kim\s+jong|iran|iranian|tehran|khamenei|islam|islamic|muslim|palestine|palestinian|hamas|syria|afghanistan|taliban|pakistan|cuba|venezuela|belarus|serbia)(?![a-z0-9])",
+        r"(?<![a-z0-9])(china|chinese|ccp|prc|beijing|mainland\s+china|taiwan|taiwanese|hong\s+kong|xinjiang|tibet|tibetan|south\s+china\s+sea|pla|mss|one\s+china|nanjing\s+massacre|renminbi|rmb|xi\s+jinping|xi|uyghur|tiananmen|dalai|russia|russian|putin|moscow|north\s+korea|pyongyang|kim\s+jong|iran|iranian|tehran|khamenei|islam|islamic|muslim|palestine|palestinian|hamas|syria|afghanistan|taliban|pakistan|cuba|venezuela|belarus|serbia)(?![a-z0-9])",
         re.IGNORECASE,
     ),
 )
@@ -1428,7 +1704,32 @@ def _is_valid_political_hit(
     quote_txt: str,
     reason: str,
 ) -> bool:
-    """Verify AI political hit targets China/friendly countries (not speculative generic 'government' or US/tech)."""
+    """Verify AI political hit targets China/friendly countries or matches hard redlines regardless of tone."""
+    id_to_idx = {u.id: idx for idx, u in enumerate(utts)}
+    s_idx = id_to_idx.get(su, 0)
+    e_idx = id_to_idx.get(eu, s_idx)
+    if s_idx > e_idx:
+        s_idx, e_idx = e_idx, s_idx
+    win_lo = max(0, s_idx - 3)
+    win_hi = min(len(utts), e_idx + 4)
+    ctx_parts = [f"{u.zh or ''} {u.en or ''}" for u in utts[win_lo:win_hi]]
+    if quote_txt:
+        ctx_parts.append(quote_txt)
+    ctx_text = " ".join(ctx_parts)
+    ctx_lower = ctx_text.lower()
+
+    # Zero-tolerance hard redlines & statutory Bilibili redlines stay valid even if non-critical
+    sev_norm = str(seg.get("severity") or "").strip().lower()
+    sub_norm = str(seg.get("subtype") or "").strip().lower()
+    if sev_norm == "high" and match_hard_redline_text(ctx_text):
+        return True
+    if (
+        sev_norm == "high"
+        and sub_norm in ("hard_redline", "sovereignty_and_normative_terms", "national_honor_and_public_service")
+        and any(pat.search(ctx_text) for pat in _POLITICAL_TARGET_PATTERNS)
+    ):
+        return True
+
     if "target_country" not in seg and "is_explicit_criticism" not in seg:
         return True
 
@@ -1443,19 +1744,6 @@ def _is_valid_political_hit(
     for nt in _NON_TARGET_POLITICAL_TOKENS:
         if tc == nt or re.match(r"^" + re.escape(nt) + r"(?:[\s/·,，(（]|$)", tc):
             return False
-
-    id_to_idx = {u.id: idx for idx, u in enumerate(utts)}
-    s_idx = id_to_idx.get(su, 0)
-    e_idx = id_to_idx.get(eu, s_idx)
-    if s_idx > e_idx:
-        s_idx, e_idx = e_idx, s_idx
-    win_lo = max(0, s_idx - 3)
-    win_hi = min(len(utts), e_idx + 4)
-    ctx_parts = [f"{u.zh or ''} {u.en or ''}" for u in utts[win_lo:win_hi]]
-    if quote_txt:
-        ctx_parts.append(quote_txt)
-    ctx_text = " ".join(ctx_parts)
-    ctx_lower = ctx_text.lower()
 
     if any(pat.search(ctx_text) for pat in _POLITICAL_TARGET_PATTERNS):
         return True
@@ -1476,6 +1764,129 @@ def _is_valid_political_hit(
     return False
 
 
+def _select_compliance_llm(
+    cfg: dict[str, Any] | None,
+    *,
+    prefer_gemini: bool = True,
+) -> tuple[ClipCutLLM, str, str, list[str]]:
+    models_cfg = (cfg or {}).get("models", {})
+    text_provider = str(models_cfg.get("text_provider") or "dashscope")
+    text_model = str(models_cfg.get("text_model") or "qwen3.8-max")
+    p_main, m_main = parse_provider_model(text_model, text_provider)
+    primary_spec = f"{p_main}:{m_main}"
+    raw_fallbacks = list(models_cfg.get("text_fallback_models") or DEFAULT_TEXT_FALLBACK_MODELS)
+
+    normalized_text_fallbacks: list[str] = []
+    for fb in raw_fallbacks:
+        if not fb:
+            continue
+        p_fb, m_fb = parse_provider_model(str(fb), p_main)
+        spec = f"{p_fb}:{m_fb}"
+        if spec != primary_spec and spec not in normalized_text_fallbacks:
+            normalized_text_fallbacks.append(spec)
+
+    llm = ClipCutLLM(models_cfg)
+    has_gemini = bool(getattr(llm, "gemini_key", None))
+    if prefer_gemini and has_gemini:
+        scan_provider = "gemini"
+        scan_model = "gemini-2.5-flash"
+        ordered = [
+            "gemini:gemini-2.5-flash-lite",
+            "vertex:gemini-2.5-flash",
+            "vertex:gemini-2.5-pro",
+            primary_spec,
+            *normalized_text_fallbacks,
+        ]
+        scan_fallbacks: list[str] = []
+        for spec in ordered:
+            if spec != "gemini:gemini-2.5-flash" and spec not in scan_fallbacks:
+                scan_fallbacks.append(spec)
+        return llm, scan_provider, scan_model, scan_fallbacks
+
+    scan_fallbacks = list(normalized_text_fallbacks)
+    if has_gemini:
+        for gem_spec in ("gemini:gemini-2.5-flash", "gemini:gemini-2.5-flash-lite"):
+            if gem_spec != primary_spec and gem_spec not in scan_fallbacks:
+                scan_fallbacks.append(gem_spec)
+    return llm, p_main, m_main, scan_fallbacks
+
+
+def _clean_term_list(raw: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in raw or []:
+        if not isinstance(x, (str, int, float)):
+            continue
+        s = str(x).strip()
+        if not s:
+            continue
+        low = s.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(s)
+    return out
+
+
+def _scan_deterministic_hard_redlines(utts: list[Utterance]) -> list[dict[str, Any]]:
+    """Deterministic zero-tolerance subtitle guard ensuring hard redlines are never missed by LLM."""
+    guard_hits: list[dict[str, Any]] = []
+    for u in utts:
+        hits_zh = match_hard_redline_text(u.zh or "")
+        hits_en = match_hard_redline_text(u.en or "")
+        if not hits_zh and not hits_en:
+            continue
+        t_zh: list[str] = []
+        seen_zh: set[str] = set()
+        for h in hits_zh:
+            m = h["matched"]
+            if m.lower() not in seen_zh:
+                seen_zh.add(m.lower())
+                t_zh.append(m)
+        t_en: list[str] = []
+        seen_en: set[str] = set()
+        for h in hits_en:
+            m = h["matched"]
+            if m.lower() not in seen_en:
+                seen_en.add(m.lower())
+                t_en.append(m)
+        labels: list[str] = []
+        for h in (*hits_zh, *hits_en):
+            if h["label"] not in labels:
+                labels.append(h["label"])
+        guard_hits.append(
+            {
+                "kind": "political_sensitive",
+                "subtype": "hard_redline_guard",
+                "su": u.id,
+                "eu": u.id,
+                "severity": "high",
+                "recommended_action": "mask",
+                "terms_zh": list(t_zh),
+                "terms_en": list(t_en),
+                "precise_zh": list(t_zh),
+                "precise_en": list(t_en),
+                "reason": f"硬红线词兜底命中（{'、'.join(labels)}）",
+            }
+        )
+    return guard_hits
+
+
+def _filter_terms_in_utterances(terms: list[str], utts_slice: list[Utterance]) -> list[str]:
+    if not terms or not utts_slice:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_t in terms:
+        t = str(raw_t or "").strip()
+        if not t or t.lower() in seen:
+            continue
+        if any(_term_in_utterance(t, u) for u in utts_slice):
+            seen.add(t.lower())
+            out.append(t)
+    return out
+
+
 def scan_cut_segments(
     manifest: ProjectManifest,
     store: ProjectStore,
@@ -1493,9 +1904,17 @@ def scan_cut_segments(
     cf_cfg = cfg.get("content_filter", {})
     eff_ads = bool(cf_cfg.get("cut_ads", True)) if scan_ads is None else bool(scan_ads)
     eff_pol = bool(cf_cfg.get("cut_political_sensitive", True)) if scan_political is None else bool(scan_political)
-    eff_sens = str(sensitivity or manifest.clean_cut.sensitivity or cf_cfg.get("sensitivity", "strict"))
+    cfg_sens = str(cf_cfg.get("sensitivity") or "strict").strip().lower()
+    if cfg_sens not in ("strict", "balanced", "loose"):
+        cfg_sens = "strict"
+    if sensitivity:
+        eff_sens = str(sensitivity).strip().lower()
+    elif manifest.clean_cut.scanned_at is None:
+        eff_sens = cfg_sens
+    else:
+        eff_sens = str(manifest.clean_cut.sensitivity or cfg_sens).strip().lower()
     if eff_sens not in ("strict", "balanced", "loose"):
-        eff_sens = "strict"
+        eff_sens = cfg_sens
 
     manifest.clean_cut.sensitivity = eff_sens  # type: ignore[assignment]
     cfg_action = str(cf_cfg.get("political_action") or "").strip().lower()
@@ -1518,22 +1937,7 @@ def scan_cut_segments(
 
     manual_segments = [seg.model_copy(deep=True) for seg in manifest.cut_segments if seg.detector == "manual"]
 
-    models_cfg = cfg.get("models", {})
-    text_provider = models_cfg.get("text_provider", "dashscope")
-    text_model = models_cfg.get("text_model", "qwen3.8-max")
-    text_fallbacks = list(models_cfg.get("text_fallback_models") or DEFAULT_TEXT_FALLBACK_MODELS)
-    llm = ClipCutLLM(models_cfg)
-    scan_provider = text_provider
-    scan_model = text_model
-    scan_fallbacks = list(text_fallbacks)
-    if eff_pol and getattr(llm, "gemini_key", None):
-        scan_provider = "gemini"
-        scan_model = "gemini-2.5-flash"
-        scan_fallbacks = ["vertex:gemini-2.5-pro", f"{text_provider}:{text_model}"] + [
-            fb
-            for fb in text_fallbacks
-            if fb not in ("gemini:gemini-2.5-flash", "vertex:gemini-2.5-pro")
-        ]
+    llm, scan_provider, scan_model, scan_fallbacks = _select_compliance_llm(cfg, prefer_gemini=bool(eff_pol))
 
     used_model_label = f"{scan_provider}:{scan_model}"
     raw_ai_hits: list[dict[str, Any]] = []
@@ -1602,16 +2006,10 @@ def scan_cut_segments(
                 rec_act = str(seg.get("recommended_action") or "delete").strip().lower()
                 if kind == "ad" or rec_act not in ("delete", "mask"):
                     rec_act = "delete"
-                terms_zh = [
-                    str(x).strip()
-                    for x in (seg.get("sensitive_terms_zh") or [])
-                    if isinstance(x, (str, int, float)) and str(x).strip()
-                ]
-                terms_en = [
-                    str(x).strip()
-                    for x in (seg.get("sensitive_terms_en") or [])
-                    if isinstance(x, (str, int, float)) and str(x).strip()
-                ]
+                terms_zh = _clean_term_list(seg.get("sensitive_terms_zh"))
+                terms_en = _clean_term_list(seg.get("sensitive_terms_en"))
+                precise_zh = _clean_term_list(seg.get("precise_terms_zh"))
+                precise_en = _clean_term_list(seg.get("precise_terms_en"))
                 quote_txt = str(seg.get("quote") or "").strip()
                 raw_reason = str(seg.get("reason") or "").strip()
                 if kind == "ad" and not _is_valid_ai_ad_hit(seg, quote_txt, raw_reason):
@@ -1631,8 +2029,8 @@ def scan_cut_segments(
                     chunk_lo,
                     chunk_hi,
                     quote_txt,
-                    terms_zh if kind == "political_sensitive" else [],
-                    terms_en if kind == "political_sensitive" else [],
+                    [*terms_zh, *precise_zh] if kind == "political_sensitive" else [],
+                    [*terms_en, *precise_en] if kind == "political_sensitive" else [],
                 )
                 if anchored is None:
                     store.log(
@@ -1648,6 +2046,7 @@ def scan_cut_segments(
                         f"(target={seg.get('target_country')!r}, crit={seg.get('is_explicit_criticism')!r}, quote={quote_txt[:40]!r})"
                     )
                     continue
+                seg_utts = [u for u in utts if su <= u.id <= eu]
                 raw_ai_hits.append(
                     {
                         "kind": kind,
@@ -1658,10 +2057,22 @@ def scan_cut_segments(
                         "recommended_action": rec_act,
                         "terms_zh": terms_zh if kind == "political_sensitive" else [],
                         "terms_en": terms_en if kind == "political_sensitive" else [],
+                        "precise_zh": _filter_terms_in_utterances(precise_zh, seg_utts)
+                        if kind == "political_sensitive"
+                        else [],
+                        "precise_en": _filter_terms_in_utterances(precise_en, seg_utts)
+                        if kind == "political_sensitive"
+                        else [],
                         "reason": raw_reason or ("广告内容" if kind == "ad" else "涉政/合规风险"),
                     }
                 )
             store.log(f"[clean_cut] AI 扫描分块 {ch_idx + 1}/{len(chunks)} 完成（本块命中 {len(segs)} 处）")
+
+    if eff_pol:
+        guard_hits = _scan_deterministic_hard_redlines(utts)
+        if guard_hits:
+            raw_ai_hits.extend(guard_hits)
+            store.log(f"[clean_cut] 硬红线字幕兜底命中 {len(guard_hits)} 句，已纳入强脱敏清单")
 
     # Merge overlapping same-kind hits across chunks
     deduped_ai: list[dict[str, Any]] = []
@@ -1677,12 +2088,10 @@ def scan_cut_segments(
                     prev["severity"] = "medium"
                 if h.get("recommended_action") == "delete":
                     prev["recommended_action"] = "delete"
-                for tz in h.get("terms_zh") or []:
-                    if tz not in prev["terms_zh"]:
-                        prev["terms_zh"].append(tz)
-                for te in h.get("terms_en") or []:
-                    if te not in prev["terms_en"]:
-                        prev["terms_en"].append(te)
+                for key in ("terms_zh", "terms_en", "precise_zh", "precise_en"):
+                    for val in h.get(key) or []:
+                        if val not in prev[key]:
+                            prev[key].append(val)
                 if h["reason"] and h["reason"] not in prev["reason"]:
                     prev["reason"] = f"{prev['reason']}；{h['reason']}"[:160]
             else:
@@ -1691,6 +2100,8 @@ def scan_cut_segments(
                         **h,
                         "terms_zh": list(h.get("terms_zh") or []),
                         "terms_en": list(h.get("terms_en") or []),
+                        "precise_zh": list(h.get("precise_zh") or []),
+                        "precise_en": list(h.get("precise_en") or []),
                     }
                 )
 
@@ -1733,6 +2144,9 @@ def scan_cut_segments(
                 recommended_action=item.get("recommended_action", "delete"),  # type: ignore[arg-type]
                 sensitive_terms_zh=list(item.get("terms_zh") or []),
                 sensitive_terms_en=list(item.get("terms_en") or []),
+                precise_terms_zh=list(item.get("precise_zh") or []),
+                precise_terms_en=list(item.get("precise_en") or []),
+                precise_terms_extracted=(item["kind"] == "political_sensitive"),
                 start_utt=su,
                 end_utt=eu,
                 start_s=round(max(0.0, s_t), 3),
@@ -1773,6 +2187,51 @@ def scan_cut_segments(
                 )
             )
 
+    # On-screen embedded banner/title OCR scan for hard redlines
+    check_cancelled()
+    visual_ocr_count = 0
+    if eff_pol:
+        clean_exists = has_clean_source_video(manifest)
+        ocr_video = (
+            Path(manifest.source.analysis_video).expanduser()
+            if clean_exists
+            else Path(manifest.source.render_video).expanduser()
+        )
+        vis_ocr_hits = detect_visual_ocr_redline_segments(
+            ocr_video,
+            dur,
+            exclude_bottom_subtitle_band=not clean_exists,
+            log_fn=store.log,
+        )
+        for vh in vis_ocr_hits:
+            vis_boxes = [VisualMaskBox(**b) for b in (vh.get("visual_boxes") or [])]
+            if not vis_boxes:
+                continue
+            vs = round(float(vh["start_s"]), 3)
+            ve = round(float(vh["end_s"]), 3)
+            visual_ocr_count += 1
+            scanned_segments.append(
+                CutSegment(
+                    cut_id="",
+                    kind="political_sensitive",
+                    subtype="onscreen_text",
+                    enabled=True,
+                    detector="visual_ocr",
+                    action="mask",
+                    recommended_action="mask",
+                    precise_terms_extracted=True,
+                    visual_boxes=vis_boxes,
+                    start_utt=None,
+                    end_utt=None,
+                    start_s=vs,
+                    end_s=ve,
+                    quote=str(vh.get("quote") or ""),
+                    reason=f"画面文字命中硬红线（{vh.get('matched_labels', '硬红线')}）：局部模糊画面文字，保留原声与字幕",
+                    severity="high",
+                    chapter_title=_find_chapter_for_time(manifest, vs),
+                )
+            )
+
     all_segments = scanned_segments + manual_segments
     all_segments.sort(key=lambda x: (x.start_s, x.end_s))
     for idx, seg in enumerate(all_segments, 1):
@@ -1787,9 +2246,24 @@ def scan_cut_segments(
     manifest.clean_cut.cut_ads = has_ads
     manifest.clean_cut.cut_political_sensitive = has_pol
     manifest.clean_cut.enabled = bool(get_active_cut_segments(manifest, cfg))
-    if all_segments and not manifest.clean_cut.title:
-        base_title = (manifest.metadata.original_theme_zh or manifest.metadata.original_title or "全片").strip()
-        manifest.clean_cut.title = f"{base_title}（净版）"
+    if all_segments:
+        from .verify_and_plan import (
+            build_default_clean_cut_title,
+            distill_clean_cut_title,
+            is_untranslated_clean_cut_title,
+        )
+
+        if is_untranslated_clean_cut_title(manifest, manifest.clean_cut.title):
+            cand_title = build_default_clean_cut_title(manifest)
+            if is_untranslated_clean_cut_title(manifest, cand_title):
+                cand_title = distill_clean_cut_title(
+                    manifest,
+                    None,
+                    cfg,
+                    run_id=run_id,
+                    llm=ClipCutLLM(cfg.get("models", {})),
+                )
+            manifest.clean_cut.title = cand_title
     manifest.clean_cut.scanned_at = utc_now_iso()
     check_cancelled()
     sync_all_render_hashes(manifest, cfg)
@@ -1802,7 +2276,7 @@ def scan_cut_segments(
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     summary = (
         f"净版合规扫描完成：命中 {len(all_segments)} 段"
-        f"（广告 {ad_cnt} 段，政治敏感 {pol_cnt} 段，共 {total_cut_s:.1f}s，标准: {eff_sens}）"
+        f"（广告 {ad_cnt} 段，政治敏感 {pol_cnt} 段 [含画面文字 {visual_ocr_count} 段]，共 {total_cut_s:.1f}s，标准: {eff_sens}）"
     )
     store.log(f"[clean_cut] {summary}")
     store.append_receipt(
@@ -1816,9 +2290,202 @@ def scan_cut_segments(
         details={
             "ads": ad_cnt,
             "political_sensitive": pol_cnt,
+            "visual_ocr_count": visual_ocr_count,
             "manual_preserved": len(manual_segments),
             "total_cut_seconds": round(total_cut_s, 1),
             "sensitivity": eff_sens,
         },
     )
     return manifest
+
+
+def _segment_overlapping_utterances(manifest: ProjectManifest, seg: CutSegment) -> list[Utterance]:
+    if not manifest.utterances:
+        return []
+    if seg.start_utt is not None and seg.end_utt is not None:
+        su = max(0, min(seg.start_utt, seg.end_utt))
+        eu = max(seg.start_utt, seg.end_utt)
+        hits = [u for u in manifest.utterances if su <= u.id <= eu]
+        if hits:
+            return hits
+    return [
+        u
+        for u in manifest.utterances
+        if u.end_s > seg.start_s - 0.3 and u.start_s < seg.end_s + 0.3
+    ]
+
+
+def extract_precise_terms_for_segments(
+    manifest: ProjectManifest,
+    store: ProjectStore | None,
+    cfg: dict[str, Any] | None = None,
+    run_id: str = "precise_terms",
+    *,
+    cut_ids: list[str] | None = None,
+    force: bool = False,
+) -> tuple[ProjectManifest, int]:
+    """Extract surgical keyword-only redaction/mute terms (`precise_terms_*`) for existing political segments."""
+    t0 = time.monotonic()
+    resolved_cfg = _safe_load_cfg(cfg)
+    want_ids = {str(cid).strip() for cid in (cut_ids or []) if str(cid).strip()} if cut_ids else None
+    targets: list[CutSegment] = []
+    for seg in manifest.cut_segments:
+        if seg.kind != "political_sensitive" or is_visual_ocr_segment(seg):
+            continue
+        if want_ids is not None and seg.cut_id not in want_ids:
+            continue
+        has_existing = bool(seg.precise_terms_extracted or seg.precise_terms_zh or seg.precise_terms_en)
+        if not force and has_existing:
+            continue
+        targets.append(seg)
+
+    if not targets:
+        return manifest, 0
+
+    seg_blocks: list[str] = []
+    seg_utts_by_id: dict[str, list[Utterance]] = {}
+    for seg in targets:
+        seg_utts = _segment_overlapping_utterances(manifest, seg)
+        seg_utts_by_id[seg.cut_id] = seg_utts
+        if seg_utts:
+            lines = "\n".join(
+                f"  [u{u.id:04d} {_fmt_ts(u.start_s)}–{_fmt_ts(u.end_s)}] {u.zh or ''} | {u.en or ''}".strip()
+                for u in seg_utts
+            )
+        else:
+            lines = f"  [{_fmt_ts(seg.start_s)}–{_fmt_ts(seg.end_s)}] {seg.quote}"
+        seg_blocks.append(
+            f"### Segment `{seg.cut_id}` ({_fmt_ts(seg.start_s)}–{_fmt_ts(seg.end_s)}, severity={seg.severity})\n"
+            f"- 违规说明: {seg.reason or '涉政敏感'}\n"
+            f"- 既有宽泛词表参考: zh={seg.sensitive_terms_zh} / en={seg.sensitive_terms_en}\n"
+            f"- 对话原文:\n{lines}"
+        )
+
+    prompt = f"""请为以下已标出的涉政/合规片段提取**精准遮蔽与消音模式（Surgical Keyword Mode）**的最小核心关键词清单。
+
+{PRECISE_MASK_RULES_PROMPT}
+
+【附加实操提示】
+- 你只输出每个片段字幕中**真正必须遮蔽/消音的少数核心关键词**（例如 `习主席`/`Xi Jinping`、`政权`/`regime`、`侵略者`/`aggressor`、`入侵`/`invaded`、`清洗`/`purges`、`台湾总统`/`中华民国`、`强征`/`conscripted`、`台湾`/`Taiwan` 等具体构成主权/领导人/定性行为风险的词）；
+- 若整段只是背景叙事或泛谈战略（不包含上述 3 类核心词），该段可以输出空数组 `[]`；
+- 禁止把中性国名（如纯地名 `俄罗斯`/`Russia`、`乌克兰`/`Ukraine`、`伊朗`/`Iran`、`中国`/`China`）与正常商业科技词混入精准词表，除非该词本身就是不规范主权并列称谓的核心组成部分。
+
+【待提取片段】
+{chr(10).join(seg_blocks)}
+
+【输出 JSON Schema】
+{{
+  "items": [
+    {{
+      "cut_id": "cut_01",
+      "precise_terms_zh": ["逐字摘自中文字幕的核心敏感词"],
+      "precise_terms_en": ["verbatim English keyword from English subtitle"]
+    }}
+  ]
+}}"""
+
+    llm, provider, model, fallbacks = _select_compliance_llm(resolved_cfg, prefer_gemini=True)
+    res = llm.generate_json(
+        prompt=prompt,
+        model=model,
+        provider=provider,
+        fallback_models=fallbacks,
+        system_instruction="你是严格执行最小影响原则的视频合规字幕/音轨词级脱敏提取器，只输出合法 JSON。",
+        temperature=0.05,
+        max_output_tokens=8192,
+    )
+    used_model_label = f"{getattr(res, 'provider', provider)}:{getattr(res, 'model', model)}"
+    parsed = res.parsed if isinstance(res.parsed, dict) else {}
+    items = parsed.get("items") if isinstance(parsed, dict) else None
+    if not isinstance(items, list):
+        items = []
+
+    by_id = {seg.cut_id: seg for seg in targets}
+    updated_segs: list[CutSegment] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("cut_id") or "").strip()
+        seg = by_id.get(cid)
+        if seg is None:
+            continue
+        seg_utts = seg_utts_by_id.get(cid, [])
+        raw_zh = _clean_term_list(item.get("precise_terms_zh"))
+        raw_en = _clean_term_list(item.get("precise_terms_en"))
+        if seg_utts:
+            seg.precise_terms_zh = _filter_terms_in_utterances(raw_zh, seg_utts)
+            seg.precise_terms_en = _filter_terms_in_utterances(raw_en, seg_utts)
+        else:
+            seg.precise_terms_zh = raw_zh
+            seg.precise_terms_en = raw_en
+        seg.precise_terms_extracted = True
+        updated_segs.append(seg)
+    for seg in targets:
+        seg.precise_terms_extracted = True
+
+    sync_all_render_hashes(manifest, resolved_cfg)
+    if store is not None:
+        store.save(manifest)
+        mute_spans = resolve_mask_audio_spans(
+            manifest,
+            [
+                seg.model_copy(update={"action": "precise_mask"})
+                for seg in updated_segs
+            ],
+        )
+        mute_s = sum(max(0.0, e - s) for s, e in mute_spans)
+        raw_s = sum(max(0.0, seg.end_s - seg.start_s) for seg in updated_segs)
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        summary = (
+            f"精准脱敏关键词提取完成：更新 {len(updated_segs)}/{len(targets)} 段"
+            f"（原段总长 {raw_s:.1f}s -> 精准消音约 {mute_s:.2f}s）"
+        )
+        store.log(f"[clean_cut] {summary}")
+        store.append_receipt(
+            run_id=run_id,
+            stage="clean_cut",
+            actor="ai",
+            action="extract_precise_terms",
+            model=used_model_label,
+            elapsed_ms=elapsed_ms,
+            summary=summary,
+            details={
+                "updated_count": len(updated_segs),
+                "target_count": len(targets),
+                "raw_seconds": round(raw_s, 1),
+                "precise_mute_seconds": round(mute_s, 2),
+            },
+        )
+    return manifest, len(updated_segs)
+
+
+def ensure_precise_terms_if_needed(
+    manifest: ProjectManifest,
+    store: ProjectStore | None,
+    cfg: dict[str, Any] | None = None,
+) -> None:
+    """Best-effort extract surgical terms before rendering when any active precise_mask segment lacks them."""
+    if store is None:
+        return
+    missing_ids = [
+        seg.cut_id
+        for seg in get_active_mask_segments(manifest, cfg)
+        if not is_visual_ocr_segment(seg)
+        and resolve_segment_action(seg, manifest, allow_mask=True) == "precise_mask"
+        and not seg.precise_terms_extracted
+        and not seg.precise_terms_zh
+        and not seg.precise_terms_en
+    ]
+    if not missing_ids:
+        return
+    try:
+        extract_precise_terms_for_segments(
+            manifest,
+            store,
+            cfg,
+            run_id=f"precise_auto_{int(time.time())}",
+            cut_ids=missing_ids,
+            force=False,
+        )
+    except Exception as exc:
+        store.log(f"[clean_cut] 精准遮蔽关键词自动提取失败，将仅按已填写关键词执行: {exc}")

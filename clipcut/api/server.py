@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,7 +25,10 @@ from ..models import CutSegment, ProjectManifest, PublishRecord, RemixItem, Subt
 from ..pipeline.content_filter import (
     DEFAULT_POLITICAL_PROFILES,
     VALID_POLITICAL_ACTIONS,
+    VALID_SEGMENT_ACTIONS,
     VALID_SEVERITIES,
+    compute_clean_cut_render_hash,
+    extract_precise_terms_for_segments,
     get_active_cut_segments,
     get_active_cut_spans,
     get_active_delete_spans,
@@ -43,16 +46,31 @@ from ..pipeline.orchestrator import (
     run_existing_project_stages,
 )
 from ..pipeline.verify_and_plan import (
+    GENERIC_COMPILATION_TITLES,
+    _has_cjk,
     _load_audio_envelope,
+    build_default_clean_cut_title,
+    build_default_compilation_title,
     compute_clip_render_hash,
     compute_compilation_render_hash,
     compute_remix_render_hash,
     compute_remix_source_signature,
+    distill_clean_cut_title,
+    distill_compilation_title,
+    distill_target_publish_description,
     get_compilation_clips,
+    is_untranslated_clean_cut_title,
     select_curated_top_clips,
     snap_bounds_with_acoustic_guard,
 )
-from ..publish import get_platforms_status, launch_platform_login, publish_to_platforms
+from ..publish import (
+    get_platforms_status,
+    launch_platform_login,
+    publish_batch_targets,
+    publish_to_platforms,
+    reset_publish_records,
+)
+from ..publish.publishers import _default_target_metadata
 from ..receipts import ProjectStore
 from ..render.renderer import (
     refresh_single_cover,
@@ -85,8 +103,28 @@ async def _no_cache_html(request: Request, call_next):
 # Background job state per project_id
 _ACTIVE_JOBS: dict[str, dict[str, Any]] = {}
 _JOB_CANCEL_TOKENS: dict[str, JobCancelToken] = {}
+_ACTIVE_PUBLISH_JOBS: dict[str, dict[str, dict[str, Any]]] = {}
+_PUBLISH_CANCEL_TOKENS: dict[str, dict[str, JobCancelToken]] = {}
 _JOBS_LOCK = threading.Lock()
 _SERVER_STARTED_AT = utc_now_iso()
+
+
+def _list_running_publish_jobs_unlocked(project_id: str) -> list[dict[str, Any]]:
+    proj_jobs = _ACTIVE_PUBLISH_JOBS.get(project_id) or {}
+    return [copy.deepcopy(entry) for entry in proj_jobs.values() if entry.get("running")]
+
+
+def _list_running_publish_jobs(project_id: str) -> list[dict[str, Any]]:
+    with _JOBS_LOCK:
+        return _list_running_publish_jobs_unlocked(project_id)
+
+
+def _has_running_publish_for_target(project_id: str, target: str) -> bool:
+    with _JOBS_LOCK:
+        for entry in (_ACTIVE_PUBLISH_JOBS.get(project_id) or {}).values():
+            if entry.get("running") and target in (entry.get("targets") or []):
+                return True
+    return False
 
 
 def _start_job_entry(
@@ -100,6 +138,8 @@ def _start_job_entry(
     with _JOBS_LOCK:
         if _ACTIVE_JOBS.get(project_id, {}).get("running"):
             raise HTTPException(status_code=409, detail="该项目已有流水线任务正在运行中")
+        if _list_running_publish_jobs_unlocked(project_id):
+            raise HTTPException(status_code=409, detail="该项目有发布任务正在运行中，请先等待完成或中止后再执行规划/渲染")
         _ACTIVE_JOBS[project_id] = {
             "job_id": job_id,
             "running": True,
@@ -132,6 +172,82 @@ def _finish_job_entry(
             cur["error"] = error
         if token is not None and _JOB_CANCEL_TOKENS.get(project_id) is token:
             _JOB_CANCEL_TOKENS.pop(project_id, None)
+
+
+def _start_publish_job_entry(
+    project_id: str,
+    job_id: str,
+    *,
+    kind: str,
+    targets: list[str],
+    platforms: list[str],
+    collection: str = "",
+) -> JobCancelToken:
+    token = JobCancelToken()
+    target_set = set(targets)
+    with _JOBS_LOCK:
+        if _ACTIVE_JOBS.get(project_id, {}).get("running"):
+            raise HTTPException(status_code=409, detail="该项目有渲染或规划任务正在运行，请等待完成或先中止")
+        for existing in (_ACTIVE_PUBLISH_JOBS.get(project_id) or {}).values():
+            if existing.get("running") and target_set.intersection(existing.get("targets") or []):
+                raise HTTPException(status_code=409, detail="目标条目正在发布中，请等待完成或先中止")
+        _ACTIVE_PUBLISH_JOBS.setdefault(project_id, {})[job_id] = {
+            "job_id": job_id,
+            "kind": kind,
+            "running": True,
+            "cancelling": False,
+            "cancelled": False,
+            "targets": list(targets),
+            "current_target": targets[0] if targets else None,
+            "completed_targets": [],
+            "failed_targets": [],
+            "skipped_targets": [],
+            "platforms": list(platforms),
+            "collection": collection,
+            "error": None,
+            "started_at": utc_now_iso(),
+            "finished_at": None,
+        }
+        _PUBLISH_CANCEL_TOKENS.setdefault(project_id, {})[job_id] = token
+    return token
+
+
+def _update_publish_job_entry(project_id: str, job_id: str, **fields: Any) -> None:
+    with _JOBS_LOCK:
+        cur = (_ACTIVE_PUBLISH_JOBS.get(project_id) or {}).get(job_id)
+        if cur is None:
+            return
+        cur.update(fields)
+
+
+def _finish_publish_job_entry(
+    project_id: str,
+    job_id: str,
+    token: JobCancelToken | None,
+    *,
+    cancelled: bool = False,
+    error: str | None = None,
+) -> None:
+    with _JOBS_LOCK:
+        proj_jobs = _ACTIVE_PUBLISH_JOBS.get(project_id)
+        if proj_jobs and job_id in proj_jobs:
+            cur = proj_jobs[job_id]
+            cur["running"] = False
+            cur["cancelling"] = False
+            cur["cancelled"] = cancelled
+            cur["current_target"] = None
+            cur["error"] = error
+            cur["finished_at"] = utc_now_iso()
+            # Prune finished entries while keeping any still-running jobs
+            for k in [k for k, v in proj_jobs.items() if not v.get("running")]:
+                proj_jobs.pop(k, None)
+            if not proj_jobs:
+                _ACTIVE_PUBLISH_JOBS.pop(project_id, None)
+        proj_tokens = _PUBLISH_CANCEL_TOKENS.get(project_id)
+        if proj_tokens and token is not None and proj_tokens.get(job_id) is token:
+            proj_tokens.pop(job_id, None)
+            if not proj_tokens:
+                _PUBLISH_CANCEL_TOKENS.pop(project_id, None)
 
 
 def _is_before_server_start(ts: str) -> bool:
@@ -191,6 +307,8 @@ def _cleanup_stale_running_publish_records(store: ProjectStore, job_running: boo
                     rec.progress_stage = ""
                     rec.message = "上传因服务重启中断"
                     rec.error = "上次上传未完成（服务已重启），请重新发布"
+                    rec.error_code = "interrupted"
+                    rec.solution = "点击「复位状态」清除旧状态后重新发起上传。"
                     rec.updated_at = now_iso
         for st in m.stages.values():
             if st.status == "running" and _is_before_server_start(st.started_at or m.updated_at):
@@ -314,6 +432,8 @@ class PatchRemixRequest(BaseModel):
     enable_bgm: bool | None = None
     bgm_volume: float | None = None
     sfx_volume: float | None = None
+    source_mode: str | None = None
+    custom_prompt: str | None = None
     source_clip_ids: list[str] | None = None
     clear_source_clip_ids: bool = False
     manual_script_locked: bool | None = None
@@ -346,11 +466,18 @@ class CutSegmentPatch(BaseModel):
     action: str | None = None
     sensitive_terms_zh: list[str] | None = None
     sensitive_terms_en: list[str] | None = None
+    precise_terms_zh: list[str] | None = None
+    precise_terms_en: list[str] | None = None
     start_utt: int | None = None
     end_utt: int | None = None
     start_s: float | None = None
     end_s: float | None = None
     reason: str | None = None
+
+
+class ExtractPreciseTermsRequest(BaseModel):
+    force: bool = False
+    cut_ids: list[str] | None = None
 
 
 class AddCutSegmentPayload(BaseModel):
@@ -375,6 +502,12 @@ class PatchCleanCutRequest(BaseModel):
     delete_ids: list[str] | None = None
 
 
+class PatchMetadataRequest(BaseModel):
+    channel_zh: str | None = None
+    guest_zh: str | None = None
+    published_date: str | None = None
+
+
 class RefreshCoverRequest(BaseModel):
     target: str = "remix"
 
@@ -390,6 +523,11 @@ class ReorderClipsRequest(BaseModel):
     clip_ids: list[str]
 
 
+class CancelJobRequest(BaseModel):
+    job_id: str | None = None
+    target: str | None = None
+
+
 class PublishRequest(BaseModel):
     target: str
     platforms: list[str]
@@ -401,6 +539,26 @@ class PublishRequest(BaseModel):
     collection: str | None = None
     tid: int | None = None
     ui_schema: int | None = None
+
+
+class SuggestPublishDescRequest(BaseModel):
+    target: str
+
+
+class BatchPublishRequest(BaseModel):
+    targets: list[str] | None = None
+    platforms: list[str]
+    is_public: bool = False
+    collection: str | None = None
+    skip_already_published: bool = True
+    tid: int | None = None
+    extra_tags: list[str] | None = None
+
+
+class ResetPublishRequest(BaseModel):
+    target: str
+    platform: str | None = None
+    only_errors: bool | None = None
 
 
 class UpdateEditorialRequest(BaseModel):
@@ -429,6 +587,15 @@ class UpdateContentFilterConfigRequest(BaseModel):
 
 class ResetContentFilterConfigRequest(BaseModel):
     profile: str | None = None
+
+
+class UpdateNavigationConfigRequest(BaseModel):
+    style: str | None = None
+    remix_style: str | None = None
+    compilation_style: str | None = None
+    screen_layout: str | None = None
+    color_scheme: str | None = None
+    custom_accent: str | None = None
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -532,16 +699,65 @@ def get_project(project_id: str):
     store = _get_store(project_id)
     with _JOBS_LOCK:
         job = dict(_ACTIVE_JOBS.get(project_id) or {"running": False})
-    manifest = _cleanup_stale_running_publish_records(store, bool(job.get("running")))
+        running_pub_jobs = _list_running_publish_jobs_unlocked(project_id)
+    manifest = _cleanup_stale_running_publish_records(
+        store,
+        bool(job.get("running")) or bool(running_pub_jobs),
+    )
     if not bool(job.get("running")) and manifest.clean_cut.enabled:
         cfg = load_editorial_config()
         if not get_active_cut_segments(manifest, cfg):
             manifest.clean_cut.enabled = False
             sync_all_render_hashes(manifest, cfg=cfg)
             store.save(manifest)
+    if (
+        not bool(job.get("running"))
+        and manifest.clips
+        and (manifest.compilation.title or "").strip() in GENERIC_COMPILATION_TITLES
+    ):
+        cand_title = build_default_compilation_title(manifest)
+        if cand_title and cand_title not in GENERIC_COMPILATION_TITLES:
+            manifest.compilation.title = cand_title
+            manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
+            store.save(manifest)
+    if (
+        not bool(job.get("running"))
+        and (manifest.cut_segments or manifest.clean_cut.output_file)
+        and is_untranslated_clean_cut_title(manifest, manifest.clean_cut.title)
+    ):
+        cand_cc_title = build_default_clean_cut_title(manifest)
+        if cand_cc_title and _has_cjk(cand_cc_title) and cand_cc_title != manifest.clean_cut.title:
+            cfg = load_editorial_config()
+            cc = manifest.clean_cut
+            was_up_to_date = bool(
+                cc.output_file and Path(cc.output_file).exists() and cc.render_hash == cc.last_rendered_hash
+            )
+            cc.title = cand_cc_title
+            cc.render_hash = compute_clean_cut_render_hash(manifest, cfg)
+            if was_up_to_date:
+                cc.last_rendered_hash = cc.render_hash
+            store.save(manifest)
+            if cc.cover_file and not cc.cover_title:
+                refresh_single_cover(manifest, store, cfg, "clean_cut")
+                manifest = store.load()
+    if not bool(job.get("running")):
+        dirty_hashes = False
+        if manifest.remix.items:
+            exp_rh = compute_remix_render_hash(manifest)
+            if exp_rh != manifest.remix.render_hash:
+                manifest.remix.render_hash = exp_rh
+                dirty_hashes = True
+        if manifest.clips:
+            exp_ch = compute_compilation_render_hash(manifest)
+            if exp_ch != manifest.compilation.render_hash:
+                manifest.compilation.render_hash = exp_ch
+                dirty_hashes = True
+        if dirty_hashes:
+            store.save(manifest)
     return {
         "manifest": manifest.model_dump(),
         "job": job,
+        "publish_jobs": running_pub_jobs,
         "assets": inspect_rendered_assets(manifest),
         "can_mask": has_clean_source_video(manifest),
     }
@@ -577,21 +793,73 @@ def run_project_stages(project_id: str, req: RunStagesRequest):
 
 
 @app.post("/api/projects/{project_id}/cancel")
-def cancel_project_job(project_id: str):
+def cancel_project_job(project_id: str, req: CancelJobRequest | None = Body(default=None)):
     store = _get_store(project_id)
     _ = store
-    with _JOBS_LOCK:
-        job = _ACTIVE_JOBS.get(project_id)
-        if not job or not job.get("running"):
-            return {"cancelled": False, "message": "当前没有正在运行的任务"}
-        token = _JOB_CANCEL_TOKENS.get(project_id)
-        if token is None:
-            raise HTTPException(status_code=400, detail="当前任务类型不支持中途取消")
-        job["cancelling"] = True
-        job_id = str(job.get("job_id") or "")
+    req_job_id = (req.job_id or "").strip() if req and req.job_id else ""
+    req_target = (req.target or "").strip() if req and req.target else ""
 
-    token.cancel()
-    return {"cancelled": True, "job_id": job_id, "message": "已发送中止信号，正在停止任务..."}
+    tokens_to_cancel: list[JobCancelToken] = []
+    cancelled_job_ids: list[str] = []
+
+    with _JOBS_LOCK:
+        pub_jobs = _ACTIVE_PUBLISH_JOBS.get(project_id) or {}
+        pub_tokens = _PUBLISH_CANCEL_TOKENS.get(project_id) or {}
+
+        if req_job_id:
+            if req_job_id in pub_jobs and pub_jobs[req_job_id].get("running"):
+                tok = pub_tokens.get(req_job_id)
+                if tok is None:
+                    raise HTTPException(status_code=400, detail="当前发布任务不支持中途取消")
+                pub_jobs[req_job_id]["cancelling"] = True
+                tokens_to_cancel.append(tok)
+                cancelled_job_ids.append(req_job_id)
+            else:
+                job = _ACTIVE_JOBS.get(project_id)
+                if job and job.get("running") and job.get("job_id") == req_job_id:
+                    tok = _JOB_CANCEL_TOKENS.get(project_id)
+                    if tok is None:
+                        raise HTTPException(status_code=400, detail="当前任务类型不支持中途取消")
+                    job["cancelling"] = True
+                    tokens_to_cancel.append(tok)
+                    cancelled_job_ids.append(req_job_id)
+        elif req_target:
+            for jid, entry in pub_jobs.items():
+                if entry.get("running") and req_target in (entry.get("targets") or []):
+                    tok = pub_tokens.get(jid)
+                    if tok is not None:
+                        entry["cancelling"] = True
+                        tokens_to_cancel.append(tok)
+                        cancelled_job_ids.append(jid)
+        else:
+            job = _ACTIVE_JOBS.get(project_id)
+            if job and job.get("running"):
+                tok = _JOB_CANCEL_TOKENS.get(project_id)
+                if tok is None:
+                    raise HTTPException(status_code=400, detail="当前任务类型不支持中途取消")
+                job["cancelling"] = True
+                tokens_to_cancel.append(tok)
+                cancelled_job_ids.append(str(job.get("job_id") or ""))
+            else:
+                for jid, entry in pub_jobs.items():
+                    if entry.get("running"):
+                        tok = pub_tokens.get(jid)
+                        if tok is not None:
+                            entry["cancelling"] = True
+                            tokens_to_cancel.append(tok)
+                            cancelled_job_ids.append(jid)
+
+    if not tokens_to_cancel:
+        return {"cancelled": False, "message": "当前没有正在运行的对应任务"}
+
+    for tok in tokens_to_cancel:
+        tok.cancel()
+    return {
+        "cancelled": True,
+        "job_id": cancelled_job_ids[0],
+        "job_ids": cancelled_job_ids,
+        "message": "已发送中止信号，正在停止任务...",
+    }
 
 
 @app.get("/api/projects/{project_id}/rendered-assets")
@@ -947,6 +1215,18 @@ def patch_remix(project_id: str, req: PatchRemixRequest):
         r.sfx_volume = max(0.0, min(1.0, float(req.sfx_volume)))
 
     clip_by_id = {c.clip_id: c for c in manifest.clips}
+    if req.source_mode is not None:
+        sm = str(req.source_mode).strip().lower()
+        if sm not in ("compilation", "manual_clips", "prompt", "ai_auto"):
+            raise HTTPException(status_code=400, detail=f"未知混剪素材模式: {req.source_mode}")
+        r.source_mode = sm  # type: ignore[assignment]
+        r.manual_script_locked = False
+        if sm != "manual_clips" and req.source_clip_ids is None:
+            r.source_clip_ids = None
+    if req.custom_prompt is not None:
+        r.custom_prompt = str(req.custom_prompt).strip()
+        if r.source_mode == "prompt":
+            r.manual_script_locked = False
     if req.clear_source_clip_ids:
         r.source_clip_ids = None
         r.manual_script_locked = False
@@ -958,6 +1238,8 @@ def patch_remix(project_id: str, req: PatchRemixRequest):
                 deduped_src.append(cid)
                 seen_src.add(cid)
         r.source_clip_ids = deduped_src
+        if req.source_mode is None:
+            r.source_mode = "manual_clips" if deduped_src else "ai_auto"
         r.manual_script_locked = False
 
     if req.add_clip_id:
@@ -984,12 +1266,14 @@ def patch_remix(project_id: str, req: PatchRemixRequest):
                 reason="人工手动加入混剪",
             )
         )
+        r.publish_desc = ""
         r.manual_script_locked = True
 
     if req.remove_remix_id:
         r.items = [it for it in r.items if it.remix_id != req.remove_remix_id]
         for idx, it in enumerate(sorted(r.items, key=lambda x: x.order), 1):
             it.order = idx
+        r.publish_desc = ""
         r.manual_script_locked = True
 
     if req.items is not None:
@@ -1028,6 +1312,7 @@ def patch_remix(project_id: str, req: PatchRemixRequest):
                 it.start_s = s_t
                 it.end_s = e_t
         r.items.sort(key=lambda x: x.order)
+        r.publish_desc = ""
         r.manual_script_locked = True
 
     if req.manual_script_locked is not None:
@@ -1157,6 +1442,7 @@ def patch_compilation(project_id: str, req: PatchCompilationRequest):
             cover_title_changed = True
     if req.clear_clip_ids:
         c.clip_ids = []
+        c.publish_desc = ""
     elif req.clip_ids is not None:
         valid_ids = {cl.clip_id for cl in manifest.clips}
         deduped_cids: list[str] = []
@@ -1166,6 +1452,7 @@ def patch_compilation(project_id: str, req: PatchCompilationRequest):
                 deduped_cids.append(cid)
                 seen_cids.add(cid)
         c.clip_ids = deduped_cids
+        c.publish_desc = ""
     if req.card_duration_s is not None:
         c.card_duration_s = max(0.5, min(5.0, float(req.card_duration_s)))
     if req.card_fade_s is not None:
@@ -1184,6 +1471,26 @@ def patch_compilation(project_id: str, req: PatchCompilationRequest):
         summary=f"人工更新切片精选集设置（启用:{c.enabled}，片头卡片停留:{c.card_duration_s:.1f}s，已选 {len(get_compilation_clips(manifest))} 支切片）",
     )
     return {"manifest": manifest.model_dump()}
+
+
+@app.post("/api/projects/{project_id}/compilation/suggest-title")
+def suggest_compilation_title_endpoint(project_id: str):
+    store = _get_store(project_id)
+    cfg = load_editorial_config()
+    manifest = store.load()
+    if not manifest.clips:
+        raise HTTPException(status_code=400, detail="该项目尚无切片可用于提炼精选集标题")
+    store.save_undo_snapshot(manifest, "AI 提炼精选集标题")
+    distilled = distill_compilation_title(
+        manifest,
+        store,
+        cfg,
+        run_id=f"comptitle_{uuid.uuid4().hex[:6]}",
+    )
+    if manifest.compilation.cover_file and not manifest.compilation.cover_title:
+        refresh_single_cover(manifest, store, cfg, "compilation")
+        manifest = store.load()
+    return {"manifest": manifest.model_dump(), "title": distilled}
 
 
 @app.post("/api/projects/{project_id}/compilation/render")
@@ -1241,6 +1548,22 @@ def scan_clean_cut_endpoint(project_id: str, req: ScanCleanCutRequest):
     return {"started": True, "job_id": job_id}
 
 
+@app.patch("/api/projects/{project_id}/metadata")
+def patch_metadata(project_id: str, req: PatchMetadataRequest):
+    store = _get_store(project_id)
+    manifest = store.load()
+    if req.channel_zh is not None:
+        manifest.metadata.channel_zh = req.channel_zh.strip()
+    if req.guest_zh is not None:
+        manifest.metadata.guest_zh = req.guest_zh.strip()
+    if req.published_date is not None:
+        manifest.metadata.published_date = req.published_date.strip()
+    manifest.remix.render_hash = compute_remix_render_hash(manifest)
+    manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
+    store.save(manifest)
+    return {"manifest": manifest.model_dump()}
+
+
 @app.patch("/api/projects/{project_id}/clean-cut")
 def patch_clean_cut(project_id: str, req: PatchCleanCutRequest):
     store = _get_store(project_id)
@@ -1249,6 +1572,21 @@ def patch_clean_cut(project_id: str, req: PatchCleanCutRequest):
     store.save_undo_snapshot(manifest, "修改全片净版设置与剪除区间")
 
     cc = manifest.clean_cut
+    was_up_to_date = bool(
+        cc.output_file and Path(cc.output_file).exists() and cc.render_hash == cc.last_rendered_hash
+    )
+    only_title_fields = (
+        req.enabled is None
+        and req.cut_ads is None
+        and req.cut_political_sensitive is None
+        and req.sensitivity is None
+        and req.political_action is None
+        and req.apply_to_clips is None
+        and req.cut_mode is None
+        and req.segments is None
+        and req.add_segment is None
+        and req.delete_ids is None
+    )
     prev_sens = str(cc.sensitivity or "strict")
     prev_has_pol = any(
         s.kind == "political_sensitive" and segment_matches_sensitivity(s, prev_sens, cfg)
@@ -1296,12 +1634,18 @@ def patch_clean_cut(project_id: str, req: PatchCleanCutRequest):
                 seg.kind = upd.kind  # type: ignore[assignment]
             if upd.severity in ("high", "medium", "low"):
                 seg.severity = upd.severity  # type: ignore[assignment]
-            if upd.action in ("inherit", "delete", "mask"):
+            if upd.action in VALID_SEGMENT_ACTIONS:
                 seg.action = upd.action  # type: ignore[assignment]
             if upd.sensitive_terms_zh is not None:
                 seg.sensitive_terms_zh = [str(x).strip() for x in upd.sensitive_terms_zh if str(x).strip()]
             if upd.sensitive_terms_en is not None:
                 seg.sensitive_terms_en = [str(x).strip() for x in upd.sensitive_terms_en if str(x).strip()]
+            if upd.precise_terms_zh is not None:
+                seg.precise_terms_zh = [str(x).strip() for x in upd.precise_terms_zh if str(x).strip()]
+                seg.precise_terms_extracted = True
+            if upd.precise_terms_en is not None:
+                seg.precise_terms_en = [str(x).strip() for x in upd.precise_terms_en if str(x).strip()]
+                seg.precise_terms_extracted = True
             if upd.reason is not None:
                 seg.reason = upd.reason.strip()
             utt_bounds_changed = False
@@ -1394,6 +1738,8 @@ def patch_clean_cut(project_id: str, req: PatchCleanCutRequest):
         cc.enabled = False
 
     sync_all_render_hashes(manifest, cfg=cfg)
+    if only_title_fields and was_up_to_date:
+        cc.last_rendered_hash = cc.render_hash
     store.save(manifest)
     if (cover_title_changed or (title_changed and not cc.cover_title)) and cc.cover_file:
         refresh_single_cover(manifest, store, cfg, "clean_cut")
@@ -1406,6 +1752,24 @@ def patch_clean_cut(project_id: str, req: PatchCleanCutRequest):
         summary=f"人工更新全片净版设置（启用:{cc.enabled}，广告:{cc.cut_ads}，政敏:{cc.cut_political_sensitive}，同步切片:{cc.apply_to_clips}，分段 {len(manifest.cut_segments)} 处）",
     )
     return {"manifest": manifest.model_dump()}
+
+
+@app.post("/api/projects/{project_id}/clean-cut/suggest-title")
+def suggest_clean_cut_title_endpoint(project_id: str):
+    store = _get_store(project_id)
+    cfg = load_editorial_config()
+    manifest = store.load()
+    store.save_undo_snapshot(manifest, "AI 提炼全片净版标题")
+    distilled = distill_clean_cut_title(
+        manifest,
+        store,
+        cfg,
+        run_id=f"cctitle_{uuid.uuid4().hex[:6]}",
+    )
+    if manifest.clean_cut.cover_file and not manifest.clean_cut.cover_title:
+        refresh_single_cover(manifest, store, cfg, "clean_cut")
+        manifest = store.load()
+    return {"manifest": manifest.model_dump(), "title": distilled}
 
 
 @app.post("/api/projects/{project_id}/clean-cut/render")
@@ -1426,6 +1790,26 @@ def render_clean_cut_endpoint(project_id: str, force: bool = False):
         "全片净版",
         lambda m: render_clean_cut_and_cover(m, store, cfg, force=force),
     )
+
+
+@app.post("/api/projects/{project_id}/clean-cut/extract-precise-terms")
+def extract_precise_terms_endpoint(project_id: str, req: ExtractPreciseTermsRequest):
+    store = _get_store(project_id)
+    cfg = load_editorial_config()
+    manifest = store.load()
+    store.save_undo_snapshot(manifest, "AI 提取精准脱敏关键词")
+    try:
+        updated_manifest, updated_count = extract_precise_terms_for_segments(
+            manifest,
+            store,
+            cfg,
+            run_id=f"precise_{uuid.uuid4().hex[:6]}",
+            cut_ids=req.cut_ids,
+            force=req.force,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"提取精准关键词失败: {exc}")
+    return {"manifest": updated_manifest.model_dump(), "updated_count": updated_count}
 
 
 
@@ -1461,8 +1845,24 @@ def api_publish_project(project_id: str, req: PublishRequest):
     store = _get_store(project_id)
     if not req.platforms:
         raise HTTPException(status_code=400, detail="请至少选择一个发布平台")
+    manifest_chk = store.load()
+    try:
+        vpath, _, _, _, _, _ = _default_target_metadata(manifest_chk, req.target)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    if vpath is None or not vpath.exists():
+        raise HTTPException(status_code=400, detail="目标视频尚未渲染，请先执行渲染后再发布")
+
     job_id = f"pub_{uuid.uuid4().hex[:8]}"
-    _start_job_entry(project_id, job_id, ["publish"], cancellable=False)
+    col_str = (req.collection or "").strip()
+    token = _start_publish_job_entry(
+        project_id,
+        job_id,
+        kind="single",
+        targets=[req.target],
+        platforms=req.platforms,
+        collection=col_str,
+    )
 
     def _worker():
         try:
@@ -1478,13 +1878,159 @@ def api_publish_project(project_id: str, req: PublishRequest):
                 collection=req.collection,
                 tid=req.tid,
                 ui_schema=req.ui_schema,
+                cancel_token=token,
             )
-            _finish_job_entry(project_id, job_id, None)
+            _finish_publish_job_entry(project_id, job_id, token)
+        except JobCancelledError:
+            _finish_publish_job_entry(project_id, job_id, token, cancelled=True, error=None)
         except Exception as exc:
-            _finish_job_entry(project_id, job_id, None, error=str(exc))
+            _finish_publish_job_entry(project_id, job_id, token, error=str(exc))
 
     threading.Thread(target=_worker, daemon=True).start()
     return {"started": True, "job_id": job_id, "target": req.target, "platforms": req.platforms}
+
+
+@app.post("/api/projects/{project_id}/publish/suggest-desc")
+def suggest_publish_desc_endpoint(project_id: str, req: SuggestPublishDescRequest):
+    store = _get_store(project_id)
+    cfg = load_editorial_config()
+    manifest = store.load()
+    target = str(req.target or "").strip()
+    if target not in ("clean_cut", "remix", "compilation") and not any(c.clip_id == target for c in manifest.clips):
+        raise HTTPException(status_code=404, detail=f"未找到发布目标: {req.target}")
+    store.save_undo_snapshot(manifest, f"AI 提炼 {target} 发布简介")
+    distilled = distill_target_publish_description(
+        manifest,
+        store,
+        cfg,
+        target,
+        run_id=f"pubdesc_{uuid.uuid4().hex[:6]}",
+    )
+    return {"manifest": manifest.model_dump(), "desc": distilled}
+
+
+@app.post("/api/projects/{project_id}/publish/batch")
+def api_publish_batch_project(project_id: str, req: BatchPublishRequest):
+    store = _get_store(project_id)
+    if not req.platforms:
+        raise HTTPException(status_code=400, detail="请至少选择一个发布平台")
+
+    manifest_chk = store.load()
+    clip_by_id = {c.clip_id: c for c in manifest_chk.clips}
+    if req.targets is not None:
+        raw_targets = list(dict.fromkeys(str(t).strip() for t in req.targets if str(t).strip()))
+        unknown = [t for t in raw_targets if t not in clip_by_id]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"包含未知或非独立切片目标: {', '.join(unknown)}")
+    else:
+        raw_targets = [c.clip_id for c in manifest_chk.clips if c.enabled]
+
+    if not raw_targets:
+        raise HTTPException(status_code=400, detail="当前没有选中的独立切片可发布")
+
+    skipped_unrendered: list[str] = []
+    skipped_already_published: list[str] = []
+    runnable_targets: list[str] = []
+    for cid in raw_targets:
+        clip = clip_by_id[cid]
+        vpath = Path(clip.output_file) if clip.output_file else None
+        if vpath is None or not vpath.exists():
+            skipped_unrendered.append(cid)
+            continue
+        if req.skip_already_published:
+            done_plats = {r.platform for r in clip.publish_records if r.status in ("published", "draft")}
+            if all(p in done_plats for p in req.platforms):
+                skipped_already_published.append(cid)
+                continue
+        runnable_targets.append(cid)
+
+    if not runnable_targets:
+        if skipped_unrendered and not skipped_already_published:
+            raise HTTPException(status_code=400, detail="所选切片均尚未渲染，请先点击「渲染选中」生成成片")
+        if skipped_already_published:
+            raise HTTPException(status_code=400, detail="所选已渲染切片在目标平台均已存草稿或已发布（如需重传请取消「跳过已上传」）")
+        raise HTTPException(status_code=400, detail="没有符合批量上传条件的已渲染切片")
+
+    job_id = f"pubbatch_{uuid.uuid4().hex[:8]}"
+    col_str = (req.collection or "").strip()
+    token = _start_publish_job_entry(
+        project_id,
+        job_id,
+        kind="batch",
+        targets=runnable_targets,
+        platforms=req.platforms,
+        collection=col_str,
+    )
+
+    def _on_progress(prog: dict[str, Any]) -> None:
+        _update_publish_job_entry(
+            project_id,
+            job_id,
+            current_target=prog.get("current_target"),
+            completed_targets=prog.get("completed_targets", []),
+            failed_targets=prog.get("failed_targets", []),
+            skipped_targets=prog.get("skipped_targets", []),
+        )
+
+    def _worker():
+        try:
+            res = publish_batch_targets(
+                store=store,
+                targets=runnable_targets,
+                platforms=req.platforms,
+                is_public=req.is_public,
+                collection=col_str,
+                skip_already_published=req.skip_already_published,
+                tid=req.tid,
+                extra_tags=req.extra_tags,
+                run_id=job_id,
+                cancel_token=token,
+                on_progress=_on_progress,
+            )
+            _update_publish_job_entry(
+                project_id,
+                job_id,
+                completed_targets=res.get("completed_targets", []),
+                failed_targets=res.get("failed_targets", []),
+                skipped_targets=res.get("skipped_targets", []),
+            )
+            _finish_publish_job_entry(project_id, job_id, token)
+        except JobCancelledError:
+            _finish_publish_job_entry(project_id, job_id, token, cancelled=True, error=None)
+        except Exception as exc:
+            _finish_publish_job_entry(project_id, job_id, token, error=str(exc))
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return {
+        "started": True,
+        "job_id": job_id,
+        "targets": runnable_targets,
+        "platforms": req.platforms,
+        "collection": col_str,
+        "skipped_unrendered": skipped_unrendered,
+        "skipped_already_published": skipped_already_published,
+    }
+
+
+@app.post("/api/projects/{project_id}/publish/reset")
+def api_reset_publish_records(project_id: str, req: ResetPublishRequest):
+    store = _get_store(project_id)
+    with _JOBS_LOCK:
+        if _ACTIVE_JOBS.get(project_id, {}).get("running"):
+            raise HTTPException(status_code=409, detail="当前有规划或渲染任务正在运行，请先中止后再复位发布状态")
+    if _has_running_publish_for_target(project_id, req.target):
+        raise HTTPException(status_code=409, detail="该条目正在发布中，请先中止后再复位发布状态")
+    eff_only_errors = req.only_errors if req.only_errors is not None else (req.platform is None)
+    try:
+        manifest, removed = reset_publish_records(
+            store,
+            req.target,
+            platform=req.platform,
+            only_errors=eff_only_errors,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"manifest": manifest.model_dump(), "removed": removed}
 
 
 @app.post("/api/projects/{project_id}/open-output")
@@ -1756,6 +2302,69 @@ def reset_content_filter_config(req: ResetContentFilterConfigRequest):
     return {
         "reset": True,
         **get_content_filter_config(),
+    }
+
+
+@app.get("/api/config/navigation")
+def get_navigation_config():
+    from ..render.renderer import NAV_COLOR_PRESETS, resolve_navigation_settings
+
+    cfg = load_editorial_config()
+    settings = resolve_navigation_settings(cfg)
+    return {
+        **settings,
+        "presets": [
+            {"id": k, "label": v["label"], "hex": v["hex"]}
+            for k, v in NAV_COLOR_PRESETS.items()
+        ],
+    }
+
+
+@app.put("/api/config/navigation")
+def put_navigation_config(req: UpdateNavigationConfigRequest):
+    from ..render.renderer import NAV_COLOR_PRESETS, _normalize_hex_color
+
+    cfg = load_editorial_config()
+    nav = cfg.setdefault("navigation", {})
+    valid_styles = ("top_nav", "both", "title_card")
+    if req.style is not None:
+        st = str(req.style).strip().lower()
+        if st not in valid_styles:
+            raise HTTPException(status_code=400, detail=f"未知导航模式: {req.style}")
+        nav["style"] = st
+        if req.remix_style is None:
+            nav["remix_style"] = st
+        if req.compilation_style is None:
+            nav["compilation_style"] = st
+    if req.remix_style is not None:
+        rst = str(req.remix_style).strip().lower()
+        if rst not in valid_styles:
+            raise HTTPException(status_code=400, detail=f"未知混剪导航模式: {req.remix_style}")
+        nav["remix_style"] = rst
+    if req.compilation_style is not None:
+        cst = str(req.compilation_style).strip().lower()
+        if cst not in valid_styles:
+            raise HTTPException(status_code=400, detail=f"未知精选集导航模式: {req.compilation_style}")
+        nav["compilation_style"] = cst
+    if req.screen_layout is not None:
+        sl = str(req.screen_layout).strip().lower()
+        if sl not in ("portrait", "landscape"):
+            raise HTTPException(status_code=400, detail=f"未知屏幕布局: {req.screen_layout}")
+        nav["screen_layout"] = sl
+    if req.color_scheme is not None:
+        sc = str(req.color_scheme).strip().lower()
+        if sc not in NAV_COLOR_PRESETS and sc != "custom":
+            raise HTTPException(status_code=400, detail=f"未知导航色系: {req.color_scheme}")
+        nav["color_scheme"] = sc
+    if req.custom_accent is not None:
+        norm = _normalize_hex_color(req.custom_accent)
+        if not norm:
+            raise HTTPException(status_code=400, detail=f"自定义颜色格式无效（需 #RRGGBB）: {req.custom_accent}")
+        nav["custom_accent"] = norm
+    save_editorial_config(cfg)
+    return {
+        "saved": True,
+        **get_navigation_config(),
     }
 
 

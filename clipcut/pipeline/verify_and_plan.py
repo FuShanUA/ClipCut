@@ -25,6 +25,7 @@ from ..models import (
 from ..receipts import ProjectStore
 from .content_filter import (
     clip_overlapping_cut_spans,
+    compute_clean_cut_render_hash,
     get_active_cut_spans,
     get_active_delete_spans,
     get_overlapping_mask_payload,
@@ -202,6 +203,322 @@ def _collect_interval_filters(
     return merged_del, masks_sorted
 
 
+GENERIC_COMPILATION_TITLES = {"", "切片精选集", "精选集", "精选合辑", "中长集锦"}
+GENERIC_CLEAN_CUT_TITLES = {"", "全片净版", "全片（净版）", "全片（完整版）", "净版全片", "完整版", "全片"}
+_GENERIC_REMIX_TITLES = {"", "高光混剪集锦", "全片高光集锦", "高光集锦", "速览混剪"}
+
+COMPILATION_TITLE_SUFFIX = "（中长集锦）"
+REMIX_TITLE_SUFFIX = "（速览混剪）"
+CLEAN_CUT_TITLE_SUFFIX = "（完整版）"
+
+_FORMAT_SUFFIX_RE = re.compile(
+    r"(?:[\s·\-—]*[\(（]\s*(?:净版|完整版|中长集锦|速览混剪|精选|高光混剪|混剪)\s*[\)）]"
+    r"|[\s·\-—]+(?:高光混剪|高光集锦|混剪集锦|速览混剪|中长集锦|切片精选集|全片净版|完整版|净版|混剪)"
+    r"|(?:全片净版|净版))$",
+)
+
+
+def strip_format_title_suffix(text: str) -> str:
+    s = str(text or "").strip()
+    while s:
+        nxt = _FORMAT_SUFFIX_RE.sub("", s).strip(" ·-—")
+        if nxt == s:
+            break
+        s = nxt
+    return s
+
+
+def _ensure_format_suffix(raw: str, suffix: str, max_total_len: int = 30) -> str:
+    core = strip_format_title_suffix(raw)
+    if not core:
+        return f"全片{suffix}"
+    budget = max(8, max_total_len - len(suffix))
+    return f"{_trim_zh_title(core, budget)}{suffix}"
+
+
+def resolve_unified_base_title(manifest: ProjectManifest, raw_title: str = "") -> str:
+    """Resolve one canonical shared Chinese base title for Compilation, Remix, and Clean Cut."""
+    cleaned_raw = strip_format_title_suffix(raw_title)
+    if (
+        cleaned_raw
+        and cleaned_raw not in GENERIC_COMPILATION_TITLES
+        and cleaned_raw not in GENERIC_CLEAN_CUT_TITLES
+        and cleaned_raw not in _GENERIC_REMIX_TITLES
+        and not is_untranslated_clean_cut_title(manifest, cleaned_raw)
+    ):
+        return cleaned_raw
+
+    for cand in (
+        manifest.remix.title,
+        manifest.metadata.original_theme_zh,
+        manifest.compilation.title,
+        manifest.clean_cut.title,
+    ):
+        stripped = strip_format_title_suffix(cand)
+        if (
+            stripped
+            and stripped not in GENERIC_COMPILATION_TITLES
+            and stripped not in GENERIC_CLEAN_CUT_TITLES
+            and stripped not in _GENERIC_REMIX_TITLES
+            and _has_cjk(stripped)
+        ):
+            return stripped
+
+    comp_clips = get_compilation_clips(manifest) or list(manifest.clips)
+    if comp_clips:
+        first_zh = next((strip_format_title_suffix(c.title) for c in comp_clips if _has_cjk(c.title)), "")
+        if first_zh:
+            return first_zh
+
+    orig_t = strip_format_title_suffix(manifest.metadata.original_title)
+    if orig_t:
+        return orig_t
+    return "全片"
+
+
+def _has_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", str(text or "")))
+
+
+def _trim_zh_title(text: str, max_len: int) -> str:
+    s = str(text or "").strip()
+    if len(s) <= max_len:
+        return s
+    head = s[:max_len]
+    for sep in ("：", ":", "，", ",", "、", "；", ";", "·", "—", "-"):
+        pos = head.rfind(sep)
+        if pos >= max(4, max_len // 2):
+            trimmed = head[:pos].strip(" ：:，,、；;·—-")
+            if trimmed:
+                return trimmed
+    return head.rstrip(" ：:，,、；;·—-")
+
+
+def is_untranslated_clean_cut_title(manifest: ProjectManifest, title: str | None = None) -> bool:
+    """Return True if Clean Cut title is blank, generic, or an untranslated fallback from original_title."""
+    t = str(manifest.clean_cut.title if title is None else title or "").strip()
+    if t in GENERIC_CLEAN_CUT_TITLES:
+        return True
+    core = strip_format_title_suffix(t)
+    if not core:
+        return True
+    if _has_cjk(core):
+        return False
+    orig = str(manifest.metadata.original_title or "").strip()
+    if orig and (core.lower() == orig.lower() or orig.lower().startswith(core.lower())):
+        return True
+    if _has_cjk(manifest.metadata.original_theme_zh):
+        return True
+    return False
+
+
+def _ensure_clean_cut_suffix(raw: str, max_total_len: int = 30) -> str:
+    return _ensure_format_suffix(raw, CLEAN_CUT_TITLE_SUFFIX, max_total_len=max_total_len)
+
+
+def build_default_clean_cut_title(manifest: ProjectManifest, raw_title: str = "") -> str:
+    """Derive a concise Chinese Clean Cut title with unified （完整版） suffix."""
+    base = resolve_unified_base_title(manifest, raw_title)
+    if not _has_cjk(base):
+        orig_t = strip_format_title_suffix(manifest.metadata.original_title)
+        return f"{orig_t}{CLEAN_CUT_TITLE_SUFFIX}" if orig_t else f"全片{CLEAN_CUT_TITLE_SUFFIX}"
+    return _ensure_format_suffix(base, CLEAN_CUT_TITLE_SUFFIX, max_total_len=30)
+
+
+def build_default_remix_title(manifest: ProjectManifest, raw_title: str = "") -> str:
+    """Derive a concise Chinese Remix title sharing the unified base title + （速览混剪）."""
+    base = resolve_unified_base_title(manifest, raw_title)
+    return _ensure_format_suffix(base, REMIX_TITLE_SUFFIX, max_total_len=30)
+
+
+def distill_clean_cut_title(
+    manifest: ProjectManifest,
+    store: ProjectStore | None,
+    cfg: dict[str, Any] | None = None,
+    run_id: str = "cleancut_title",
+    llm: ClipCutLLM | None = None,
+) -> str:
+    """Use LLM (with deterministic fallback) to generate a concise Chinese Clean Cut title."""
+    fallback_title = build_default_clean_cut_title(manifest)
+    resolved_cfg = cfg or {}
+    models_cfg = resolved_cfg.get("models", {})
+    text_provider = models_cfg.get("text_provider", "dashscope")
+    text_model = models_cfg.get("text_model", "qwen3.8-max")
+    text_fallbacks = list(models_cfg.get("text_fallback_models") or DEFAULT_TEXT_FALLBACK_MODELS)
+    llm = llm or ClipCutLLM(models_cfg)
+
+    topic_lines = "\n".join(
+        f"- {t.title}: {(t.summary or '')[:70]}"
+        for t in manifest.topic_map[:10]
+        if not t.is_filler and t.title
+    )
+    if not topic_lines and manifest.clips:
+        topic_lines = "\n".join(
+            f"- {c.title}: {(c.summary or c.hook or '')[:70]}"
+            for c in manifest.clips[:10]
+            if c.title
+        )
+    if not topic_lines and manifest.utterances:
+        topic_lines = "\n".join(
+            f"- {(u.zh or u.en or '').strip()[:80]}"
+            for u in manifest.utterances[:20]
+            if (u.zh or u.en or "").strip()
+        )
+
+    prompt = f"""请为下面这部完整访谈/节目的“全片净版”拟定一个准确、有吸引力的中文标题。
+
+【节目信息】
+- 嘉宾: {manifest.metadata.guest_zh or "未知"}
+- 栏目: {manifest.metadata.channel_zh or manifest.metadata.channel or "未知"}
+- 原片标题: {manifest.metadata.original_title or ""}
+- 原片简介: {(manifest.metadata.description or "")[:300]}
+- 核心中文主题: {manifest.metadata.original_theme_zh or ""}
+
+【全片核心内容摘要】
+{topic_lines or "（暂无分段摘要）"}
+
+【要求】
+- 必须使用自然流畅的简体中文，严禁直接照抄英文原标题；
+- 主体长度 <= 22 个汉字，突出核心人物、焦点事件或核心矛盾；
+- 结尾可自然附带“（净版）”或保留完整句意，严禁“全网最全”“独家揭秘”等空洞套话；
+- 仅输出合法 JSON：{{"clean_cut_title": "..."}}"""
+
+    distilled = ""
+    used_model = f"{text_provider}:{text_model}"
+    elapsed_ms = 0
+    try:
+        res = llm.generate_json(
+            prompt=prompt,
+            model=text_model,
+            provider=text_provider,
+            fallback_models=text_fallbacks,
+            system_instruction="你是深耕科技与商业财经访谈的资深总编，只输出合法 JSON。",
+            temperature=0.25,
+            max_output_tokens=512,
+        )
+        parsed = res.parsed if isinstance(res.parsed, dict) else {}
+        cand = str(parsed.get("clean_cut_title") or "").strip()
+        if cand and cand not in GENERIC_CLEAN_CUT_TITLES and _has_cjk(cand):
+            distilled = _ensure_clean_cut_suffix(cand, max_total_len=28)
+        used_model = f"{getattr(res, 'provider', text_provider)}:{getattr(res, 'model', text_model)}"
+        elapsed_ms = int(getattr(res, "elapsed_ms", 0) or 0)
+    except Exception:
+        distilled = ""
+
+    final_title = distilled or fallback_title
+    cc = manifest.clean_cut
+    was_up_to_date = bool(
+        cc.output_file and Path(cc.output_file).exists() and cc.render_hash == cc.last_rendered_hash
+    )
+    cc.title = final_title
+    cc.render_hash = compute_clean_cut_render_hash(manifest, cfg)
+    if was_up_to_date:
+        cc.last_rendered_hash = cc.render_hash
+
+    if store is not None:
+        store.save(manifest)
+        store.append_receipt(
+            run_id=run_id,
+            stage="human_edit",
+            actor="ai" if distilled else "system",
+            action="distill_clean_cut_title",
+            model=used_model if distilled else "",
+            elapsed_ms=elapsed_ms,
+            summary=f"提炼全片净版标题：{final_title}",
+        )
+    return final_title
+
+
+def build_default_compilation_title(manifest: ProjectManifest, raw_title: str = "") -> str:
+    """Derive a concise thematic Chinese title for Compilation sharing the unified base title + （中长集锦）."""
+    base = resolve_unified_base_title(manifest, raw_title)
+    if base == "全片" and not (manifest.metadata.original_theme_zh or manifest.metadata.original_title or manifest.clips):
+        return f"切片精选{COMPILATION_TITLE_SUFFIX}"
+    return _ensure_format_suffix(base, COMPILATION_TITLE_SUFFIX, max_total_len=30)
+
+
+def distill_compilation_title(
+    manifest: ProjectManifest,
+    store: ProjectStore | None,
+    cfg: dict[str, Any] | None = None,
+    run_id: str = "comp_title",
+) -> str:
+    """Use LLM (with deterministic fallback) to distill a thematic Chinese title for selected Compilation clips."""
+    clips = get_compilation_clips(manifest) or list(manifest.clips)
+    fallback_title = build_default_compilation_title(manifest)
+    if not clips:
+        manifest.compilation.title = fallback_title
+        manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
+        if store is not None:
+            store.save(manifest)
+        return fallback_title
+
+    resolved_cfg = cfg or {}
+    models_cfg = resolved_cfg.get("models", {})
+    text_provider = models_cfg.get("text_provider", "dashscope")
+    text_model = models_cfg.get("text_model", "qwen3.8-max")
+    text_fallbacks = list(models_cfg.get("text_fallback_models") or DEFAULT_TEXT_FALLBACK_MODELS)
+    llm = ClipCutLLM(models_cfg)
+
+    clip_lines = "\n".join(
+        f"- #{c.index:02d} [{c.title}]（{round(max(0.0, c.end_s - c.start_s) / 60.0, 1)}m）: {(c.summary or c.hook or '')[:80]}"
+        for c in clips[:12]
+    )
+    prompt = f"""请为下面由多支独立切片串联而成的长视频合辑提炼一个凝练、吸引点开的中文标题。
+
+【访谈信息】
+- 嘉宾: {manifest.metadata.guest_zh or "未知"}
+- 栏目: {manifest.metadata.channel_zh or manifest.metadata.channel or "未知"}
+- 原片标题: {manifest.metadata.original_title or ""}
+- 核心主题: {manifest.metadata.original_theme_zh or ""}
+
+【合辑包含的 {len(clips)} 支精选切片】
+{clip_lines}
+
+【要求】
+- 长度 <= 22 个汉字/字符，信息密度高，体现核心矛盾、人物或关键议题；
+- 严禁包含“切片精选集”“合辑第X集”“全网最全”等空洞字眼；
+- 仅输出合法 JSON：{{"compilation_title": "..."}}"""
+
+    distilled = ""
+    used_model = f"{text_provider}:{text_model}"
+    elapsed_ms = 0
+    try:
+        res = llm.generate_json(
+            prompt=prompt,
+            model=text_model,
+            provider=text_provider,
+            fallback_models=text_fallbacks,
+            system_instruction="你是深耕科技与商业财经访谈的资深总编，只输出合法 JSON。",
+            temperature=0.25,
+            max_output_tokens=512,
+        )
+        parsed = res.parsed if isinstance(res.parsed, dict) else {}
+        cand = str(parsed.get("compilation_title") or "").strip()
+        if cand and cand not in GENERIC_COMPILATION_TITLES:
+            distilled = _ensure_format_suffix(cand, COMPILATION_TITLE_SUFFIX, max_total_len=30)
+        used_model = f"{getattr(res, 'provider', text_provider)}:{getattr(res, 'model', text_model)}"
+        elapsed_ms = int(getattr(res, "elapsed_ms", 0) or 0)
+    except Exception:
+        distilled = ""
+
+    final_title = distilled or fallback_title
+    manifest.compilation.title = final_title
+    manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
+    if store is not None:
+        store.save(manifest)
+        store.append_receipt(
+            run_id=run_id,
+            stage="human_edit",
+            actor="ai" if distilled else "system",
+            action="distill_compilation_title",
+            model=used_model if distilled else "",
+            elapsed_ms=elapsed_ms,
+            summary=f"提炼精选集标题：{final_title}",
+        )
+    return final_title
+
+
 def get_compilation_clips(manifest: ProjectManifest) -> list[ClipItem]:
     """Return Compilation's selected clips (independent clip_ids if set, else legacy clip.enabled fallback)."""
     by_id = {c.clip_id: c for c in manifest.clips}
@@ -210,25 +527,417 @@ def get_compilation_clips(manifest: ProjectManifest) -> list[ClipItem]:
     return [c for c in manifest.clips if c.enabled]
 
 
+def _format_program_context(manifest: ProjectManifest) -> str:
+    guest = str(manifest.metadata.guest_zh or "").strip()
+    channel = str(manifest.metadata.channel_zh or manifest.metadata.channel or "").strip()
+    theme = str(manifest.metadata.original_theme_zh or "").strip()
+    if guest and channel:
+        return f"{guest}做客{channel}的访谈"
+    if channel:
+        return f"{channel}本期节目"
+    if guest:
+        return f"{guest}本期访谈"
+    if theme:
+        return f"《{theme}》"
+    return "本期节目"
+
+
+def _pick_spread_items(items: list[Any], max_count: int) -> list[Any]:
+    if max_count <= 0 or not items:
+        return []
+    if len(items) <= max_count:
+        return list(items)
+    if max_count == 1:
+        return [items[0]]
+    indices: list[int] = []
+    for i in range(max_count):
+        idx = round(i * (len(items) - 1) / (max_count - 1))
+        if idx not in indices:
+            indices.append(idx)
+    return [items[idx] for idx in indices]
+
+
+def _dedupe_labels(labels: list[str], max_count: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in labels:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        key = re.sub(r"\s+", "", s).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+        if len(out) >= max_count:
+            break
+    return out
+
+
+def build_default_clean_cut_description(
+    manifest: ProjectManifest,
+    *,
+    ignore_cached: bool = False,
+) -> str:
+    """Build an audience-facing Chinese full-video description for Clean Cut without editing parameters."""
+    if not ignore_cached:
+        cached = str(manifest.clean_cut.publish_desc or "").strip()
+        if cached:
+            return cached
+        full_summary = str(manifest.metadata.full_summary_zh or "").strip()
+        if full_summary:
+            return full_summary
+
+    lead = _format_program_context(manifest)
+    theme = str(manifest.metadata.original_theme_zh or "").strip()
+    if theme and theme not in lead:
+        if lead.endswith(("访谈", "节目")):
+            opening = f"本期为{lead}完整版，核心围绕“{theme}”展开深入对话。"
+        else:
+            opening = f"本期带来{lead}完整内容，核心围绕“{theme}”展开深入对话。"
+    else:
+        opening = f"本期为{lead}完整内容。"
+
+    topics = [
+        t
+        for t in manifest.topic_map
+        if not t.is_filler and (str(t.title or "").strip() or str(t.summary or "").strip())
+    ]
+    detail_line = ""
+    if topics:
+        if len(topics) <= 3:
+            parts: list[str] = []
+            total_len = 0
+            for t in topics:
+                frag = str(t.summary or t.title or "").strip().rstrip("。；;")
+                if not frag:
+                    continue
+                if total_len + len(frag) > 260 and parts:
+                    break
+                parts.append(frag)
+                total_len += len(frag) + 1
+            if parts:
+                detail_line = f"全片重点探讨：{'；'.join(parts)}。"
+        else:
+            picked = _pick_spread_items(topics, 6)
+            titles = _dedupe_labels(
+                [str(t.title or t.summary[:24] or "").strip().rstrip("。；;") for t in picked],
+                6,
+            )
+            if titles:
+                detail_line = f"全片涵盖：{'；'.join(titles)}等核心议题。"
+    elif manifest.clips:
+        picked_clips = _pick_spread_items(list(manifest.clips), 6)
+        titles = _dedupe_labels(
+            [str(c.title or "").strip().rstrip("。；;") for c in picked_clips],
+            6,
+        )
+        if titles:
+            detail_line = f"全片涵盖：{'；'.join(titles)}等核心议题。"
+    else:
+        raw_desc = str(manifest.metadata.description or "").strip()
+        if raw_desc and _has_cjk(raw_desc):
+            detail_line = raw_desc[:220]
+
+    return f"{opening}\n{detail_line}".strip() if detail_line else opening
+
+
+def build_default_remix_description(
+    manifest: ProjectManifest,
+    *,
+    ignore_cached: bool = False,
+) -> str:
+    """Build an audience-facing Chinese description for AI Remix highlighting featured segments."""
+    if not ignore_cached:
+        cached = str(manifest.remix.publish_desc or "").strip()
+        if cached:
+            return cached
+
+    sorted_items = sorted(manifest.remix.items, key=lambda x: x.order)
+    active_items = [it for it in sorted_items if it.enabled] or sorted_items
+    clip_by_id = {c.clip_id: c for c in manifest.clips}
+
+    raw_labels: list[str] = []
+    for it in active_items:
+        src_title = ""
+        if it.source_clip_id and it.source_clip_id in clip_by_id:
+            src_title = str(clip_by_id[it.source_clip_id].title or "").strip()
+        cand = (
+            str(it.card_title or "").strip()
+            or str(it.group_label or "").strip()
+            or src_title
+            or str(it.quote or "").strip()[:36]
+        )
+        if cand:
+            raw_labels.append(cand)
+    unique_labels = _dedupe_labels(raw_labels, 8)
+    lead = _format_program_context(manifest)
+    if unique_labels:
+        opening = f"本视频为{lead}的高光混剪，浓缩串联全片核心观点与高能片段："
+        bullets = "\n".join(f"{idx}. {label}" for idx, label in enumerate(unique_labels, 1))
+        return f"{opening}\n{bullets}"
+    return f"本视频为{lead}的高光混剪，提炼全片最具看点的核心观点与精彩对话。"
+
+
+def build_default_compilation_description(
+    manifest: ProjectManifest,
+    *,
+    ignore_cached: bool = False,
+) -> str:
+    """Build an audience-facing Chinese description for Compilation listing its selected clips."""
+    if not ignore_cached:
+        cached = str(manifest.compilation.publish_desc or "").strip()
+        if cached:
+            return cached
+
+    selected_clips = get_compilation_clips(manifest)
+    titles = _dedupe_labels(
+        [str(c.title or c.cover_title or "").strip() for c in selected_clips],
+        12,
+    )
+    lead = _format_program_context(manifest)
+    if titles:
+        opening = f"本视频为{lead}的精选片段合辑，完整收录以下核心内容："
+        bullets = "\n".join(f"{idx}. {title}" for idx, title in enumerate(titles, 1))
+        return f"{opening}\n{bullets}"
+    return f"本视频为{lead}的精选片段合辑，收录全片核心精彩对话。"
+
+
+def build_default_target_description(
+    manifest: ProjectManifest,
+    target: str,
+    *,
+    ignore_cached: bool = False,
+) -> str:
+    """Resolve default audience-facing description for clean_cut, remix, compilation, or a clip."""
+    if target == "clean_cut":
+        return build_default_clean_cut_description(manifest, ignore_cached=ignore_cached)
+    if target == "remix":
+        return build_default_remix_description(manifest, ignore_cached=ignore_cached)
+    if target == "compilation":
+        return build_default_compilation_description(manifest, ignore_cached=ignore_cached)
+    for clip in manifest.clips:
+        if clip.clip_id == target:
+            return str(clip.summary or clip.reason or clip.title or "").strip()
+    raise ValueError(f"未找到目标切片或成片: {target}")
+
+
+def distill_target_publish_description(
+    manifest: ProjectManifest,
+    store: ProjectStore | None,
+    cfg: dict[str, Any] | None,
+    target: str,
+    run_id: str = "pub_desc",
+) -> str:
+    """Use LLM (with deterministic fallback) to distill a natural Chinese publish description."""
+    target_clip: ClipItem | None = None
+    if target not in ("clean_cut", "remix", "compilation"):
+        target_clip = next((c for c in manifest.clips if c.clip_id == target), None)
+        if target_clip is None:
+            raise ValueError(f"未找到目标切片或成片: {target}")
+
+    fallback_desc = build_default_target_description(manifest, target, ignore_cached=True)
+    resolved_cfg = cfg or {}
+    models_cfg = resolved_cfg.get("models", {})
+    text_provider = models_cfg.get("text_provider", "dashscope")
+    text_model = models_cfg.get("text_model", "qwen3.8-max")
+    text_fallbacks = list(models_cfg.get("text_fallback_models") or DEFAULT_TEXT_FALLBACK_MODELS)
+    llm = ClipCutLLM(models_cfg)
+
+    guest = manifest.metadata.guest_zh or "未知"
+    channel = manifest.metadata.channel_zh or manifest.metadata.channel or "未知"
+    theme = manifest.metadata.original_theme_zh or manifest.metadata.original_title or ""
+
+    if target == "clean_cut":
+        topic_lines = "\n".join(
+            f"- {t.title}: {t.summary}"
+            for t in manifest.topic_map
+            if not t.is_filler and (t.title or t.summary)
+        )
+        if not topic_lines and manifest.clips:
+            topic_lines = "\n".join(
+                f"- {c.title}: {(c.summary or c.hook or '')[:90]}"
+                for c in manifest.clips
+                if c.title
+            )
+        if not topic_lines and manifest.utterances:
+            topic_lines = "\n".join(
+                f"- {(u.zh or u.en or '').strip()[:80]}"
+                for u in _pick_spread_items(manifest.utterances, 24)
+                if (u.zh or u.en or "").strip()
+            )
+        prompt = f"""请为下面这部完整访谈/节目的“全片完整版”撰写一段面向观众的视频简介文案（120~220字）。
+
+【节目信息】
+- 嘉宾: {guest}
+- 栏目: {channel}
+- 核心主题: {theme}
+- 原片简介: {(manifest.metadata.description or "")[:300]}
+
+【全片话题脉络】
+{topic_lines or "（暂无分段摘要）"}
+
+【写作要求】
+- 使用自然流畅、信息密度高的简体中文，写给平台观众看：讲清人物/节目背景、核心议题与主要观点/结论；
+- 严禁出现任何剪辑/合规技术参数或内部处理词（如“广告”“删敏”“遮蔽”“剪除”“净版参数”“字幕句数”“切片数”等）；
+- 严禁空洞营销套话；
+- 仅输出合法 JSON：{{"description": "..."}}"""
+    elif target == "remix":
+        sorted_items = sorted(manifest.remix.items, key=lambda x: x.order)
+        active_items = [it for it in sorted_items if it.enabled] or sorted_items
+        seen_segs: set[str] = set()
+        seg_lines_list: list[str] = []
+        clip_by_id = {c.clip_id: c for c in manifest.clips}
+        for it in active_items:
+            src_title = clip_by_id[it.source_clip_id].title if it.source_clip_id in clip_by_id else ""
+            title_part = str(it.card_title or it.group_label or src_title or "").strip()
+            detail_part = str(it.macro_intent or it.reason or it.quote or "").strip()[:90]
+            dedupe_key = re.sub(r"\s+", "", f"{title_part}|{detail_part}").lower()
+            if dedupe_key in seen_segs:
+                continue
+            seen_segs.add(dedupe_key)
+            seg_lines_list.append(f"- {title_part}: {detail_part}" if title_part else f"- {detail_part}")
+        prompt = f"""请为下面这支“高光混剪”视频撰写一段面向观众的简体中文简介文案（100~220字）。
+
+【节目信息】
+- 嘉宾: {guest}
+- 栏目: {channel}
+- 混剪标题: {manifest.remix.title or theme}
+
+【混剪串联的核心片段】
+{chr(10).join(seg_lines_list) or "（暂无片段明细）"}
+
+【写作要求】
+- 明确说明本视频为全片的高光混剪，并用清晰条理介绍片中串联的核心片段与亮点观点；
+- 严禁抄录后台编导术语或技术参数（如“舍弃旁支”“避免流水账”“BGM”“段落数”“切片参数”等）；
+- 仅输出合法 JSON：{{"description": "..."}}"""
+    elif target == "compilation":
+        comp_clips = get_compilation_clips(manifest)
+        clip_lines = "\n".join(
+            f"- {c.title}: {(c.summary or c.hook or '')[:90]}"
+            for c in comp_clips
+            if c.title or c.summary
+        )
+        prompt = f"""请为下面这支“精选片段合辑”长视频撰写一段面向观众的简体中文简介文案（100~260字）。
+
+【节目信息】
+- 嘉宾: {guest}
+- 栏目: {channel}
+- 合辑标题: {manifest.compilation.title or theme}
+
+【收录的精选片段】
+{clip_lines or "（暂无片段明细）"}
+
+【写作要求】
+- 明确说明本视频为访谈的精选片段合辑，并清晰介绍所收录的各个核心片段内容，帮助观众快速了解看点；
+- 严禁使用“独立切片”“共X支”或时长、渲染等技术参数口吻；
+- 仅输出合法 JSON：{{"description": "..."}}"""
+    else:
+        assert target_clip is not None
+        prompt = f"""请为下面这支访谈精彩片段撰写一段面向观众的简体中文简介文案（80~160字）。
+
+【节目与片段信息】
+- 嘉宾: {guest}
+- 栏目: {channel}
+- 片段标题: {target_clip.title}
+- 现有摘要: {target_clip.summary or ""}
+- 开场钩子: {target_clip.hook or ""}
+- 核心金句: {target_clip.key_quote or ""}
+
+【写作要求】
+- 自然流畅的简体中文，直接交代谈话核心问题与嘉宾关键判断；
+- 严禁技术参数、时间戳或后台字段词；
+- 仅输出合法 JSON：{{"description": "..."}}"""
+
+    distilled = ""
+    used_model = f"{text_provider}:{text_model}"
+    elapsed_ms = 0
+    try:
+        res = llm.generate_json(
+            prompt=prompt,
+            model=text_model,
+            provider=text_provider,
+            fallback_models=text_fallbacks,
+            system_instruction="你是深耕科技与商业财经访谈的资深总编，只输出合法 JSON。",
+            temperature=0.3,
+            max_output_tokens=1024,
+        )
+        parsed = res.parsed if isinstance(res.parsed, dict) else {}
+        cand = str(parsed.get("description") or "").strip()
+        if cand and _has_cjk(cand):
+            distilled = cand
+        used_model = f"{getattr(res, 'provider', text_provider)}:{getattr(res, 'model', text_model)}"
+        elapsed_ms = int(getattr(res, "elapsed_ms", 0) or 0)
+    except Exception:
+        distilled = ""
+
+    final_desc = distilled or fallback_desc
+    if target == "clean_cut":
+        manifest.clean_cut.publish_desc = final_desc
+        manifest.metadata.full_summary_zh = final_desc
+    elif target == "remix":
+        manifest.remix.publish_desc = final_desc
+    elif target == "compilation":
+        manifest.compilation.publish_desc = final_desc
+    elif target_clip is not None:
+        target_clip.summary = final_desc
+
+    if store is not None:
+        store.save(manifest)
+        store.append_receipt(
+            run_id=run_id,
+            stage="human_edit",
+            actor="ai" if distilled else "system",
+            action="distill_publish_desc",
+            model=used_model if distilled else "",
+            elapsed_ms=elapsed_ms,
+            summary=f"提炼 {target} 发布简介（{len(final_desc)} 字）",
+        )
+    return final_desc
+
+
+def resolve_remix_source_mode(manifest: ProjectManifest) -> str:
+    """Resolve effective Remix source mode: compilation (default) | manual_clips | prompt | ai_auto."""
+    raw = str(getattr(manifest.remix, "source_mode", "compilation") or "compilation").strip().lower()
+    if raw not in ("compilation", "manual_clips", "prompt", "ai_auto"):
+        raw = "compilation"
+    # Backwards compatibility for legacy manifests/tests that only set source_clip_ids
+    if raw == "compilation" and manifest.remix.source_clip_ids is not None:
+        return "manual_clips" if len(manifest.remix.source_clip_ids) > 0 else "ai_auto"
+    return raw
+
+
 def get_remix_source_clips(manifest: ProjectManifest) -> tuple[list[ClipItem], bool]:
-    """Return (candidate_clips, user_filtered) for AI Remix planning."""
-    if manifest.remix.source_clip_ids is not None:
-        by_id = {c.clip_id: c for c in manifest.clips}
-        picked = [by_id[cid] for cid in manifest.remix.source_clip_ids if cid in by_id]
-        if picked:
-            return picked, True
+    """Return (candidate_clips, user_filtered) for AI Remix planning according to source_mode."""
+    mode = resolve_remix_source_mode(manifest)
+    if mode == "ai_auto":
         return list(manifest.clips), False
-    enabled_clips = [c for c in manifest.clips if c.enabled]
-    if enabled_clips:
-        return enabled_clips, True
+    if mode == "prompt":
+        return list(manifest.clips), False
+    if mode == "manual_clips":
+        if manifest.remix.source_clip_ids is not None:
+            by_id = {c.clip_id: c for c in manifest.clips}
+            picked = [by_id[cid] for cid in manifest.remix.source_clip_ids if cid in by_id]
+            if picked:
+                return picked, True
+        enabled_clips = [c for c in manifest.clips if c.enabled]
+        if enabled_clips:
+            return enabled_clips, True
+        return list(manifest.clips), False
+    # Default: "compilation" — strictly follow clips selected in Compilation
+    comp_clips = get_compilation_clips(manifest)
+    if comp_clips:
+        return comp_clips, True
     return list(manifest.clips), False
 
 
 def compute_remix_source_signature(manifest: ProjectManifest) -> str:
     source_clips, user_filtered = get_remix_source_clips(manifest)
-    mode = "selected" if user_filtered else "auto_all"
+    eff_mode = resolve_remix_source_mode(manifest)
     payload: dict[str, Any] = {
-        "mode": mode,
+        "mode": eff_mode if eff_mode in ("prompt", "ai_auto") else ("selected" if user_filtered else "auto_all"),
+        "source_mode": eff_mode,
+        "custom_prompt": (manifest.remix.custom_prompt or "").strip() if eff_mode == "prompt" else "",
         "clips": [
             {"id": c.clip_id, "start_utt": c.start_utt, "end_utt": c.end_utt}
             for c in source_clips
@@ -248,12 +957,44 @@ def compute_remix_source_signature(manifest: ProjectManifest) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
+def _resolve_nav_hash_fields(target: str = "remix") -> dict[str, str]:
+    try:
+        from ..config import load_editorial_config
+
+        nav = load_editorial_config().get("navigation", {}) or {}
+    except Exception:
+        nav = {}
+    valid_styles = ("top_nav", "both", "title_card")
+    base_style = str(nav.get("style") or "top_nav").strip().lower()
+    if base_style not in valid_styles:
+        base_style = "top_nav"
+    key = "compilation_style" if target == "compilation" else "remix_style"
+    style = str(nav.get(key) or base_style).strip().lower()
+    if style not in valid_styles:
+        style = base_style
+    screen_layout = str(nav.get("screen_layout") or "portrait").strip().lower()
+    if screen_layout not in ("portrait", "landscape"):
+        screen_layout = "portrait"
+    scheme = str(nav.get("color_scheme") or "tiffany").strip().lower()
+    custom_accent = str(nav.get("custom_accent") or "#0ABAB5").strip().upper()
+    return {
+        "nav_style": style,
+        "screen_layout": screen_layout,
+        "nav_color_scheme": scheme,
+        "nav_custom_accent": custom_accent if scheme == "custom" else "",
+    }
+
+
 def compute_remix_render_hash(manifest: ProjectManifest) -> str:
     r = manifest.remix
     enabled_items = [it for it in sorted(r.items, key=lambda x: x.order) if it.enabled]
+    nav_fields = _resolve_nav_hash_fields("remix")
     payload: dict[str, Any] = {
         "video": manifest.source.render_video,
-        "card_template": "v2-vision-pip",
+        "card_template": "v6-top-nav-bar" if nav_fields["nav_style"] in ("top_nav", "both") else "v6-title-card",
+        **nav_fields,
+        "channel_zh": manifest.metadata.channel_zh or manifest.metadata.channel,
+        "guest_zh": manifest.metadata.guest_zh,
         "published_date": manifest.metadata.published_date,
         "card_mode": r.card_mode,
         "card_duration_s": r.card_duration_s,
@@ -294,8 +1035,14 @@ def compute_remix_render_hash(manifest: ProjectManifest) -> str:
 def compute_compilation_render_hash(manifest: ProjectManifest) -> str:
     comp = manifest.compilation
     enabled_clips = get_compilation_clips(manifest)
+    nav_fields = _resolve_nav_hash_fields("compilation")
     payload: dict[str, Any] = {
         "video": manifest.source.render_video,
+        "nav_template": "v6-top-nav-bar" if nav_fields["nav_style"] in ("top_nav", "both") else "v6-title-card",
+        **nav_fields,
+        "channel_zh": manifest.metadata.channel_zh or manifest.metadata.channel,
+        "guest_zh": manifest.metadata.guest_zh,
+        "published_date": manifest.metadata.published_date,
         "title": comp.title,
         "cover_title": comp.cover_title,
         "card_duration_s": comp.card_duration_s,
@@ -354,7 +1101,8 @@ def _extract_verify_preview(video_path: Path, start_s: float, end_s: float, out_
         "64k",
         str(out_path),
     ]
-    res = run_cancellable_subprocess(cmd, capture_output=True, text=True, timeout=60)
+    # 4K sources can take over a minute to decode even when the preview is tiny.
+    res = run_cancellable_subprocess(cmd, capture_output=True, text=True, timeout=240)
     return res.returncode == 0 and out_path.exists() and out_path.stat().st_size > 1024
 
 
@@ -916,11 +1664,30 @@ def _build_remix_macro_prompt(
                 + "\n".join(lines)
             )
 
-    source_note = (
-        f"【策展切片来源】：用户已勾选以下 {len(enabled_clips)} 支切片；严格只从这几支已勾选切片（及其同章前情铺垫）中选择高光片段，并严格按下方切片从上到下的先后顺序编排主题板块顺序。"
-        if user_filtered
-        else "【策展切片来源】：用户当前未手动限定切片，请以首席总编视角，自主从以下全部候选切片中遴选最反映全片主旨、最具争议反直觉或最精彩的片段组合，总时长严格精选控制在目标区间内。"
-    )
+    eff_mode = resolve_remix_source_mode(manifest)
+    custom_prompt = (manifest.remix.custom_prompt or "").strip()
+    if eff_mode == "prompt" and custom_prompt:
+        source_note = (
+            f"【策展切片来源：按用户 Prompt 定向提取】用户的混剪需求如下：\n"
+            f">>> {custom_prompt}\n"
+            f"请严格围绕上述 Prompt 指定的主题、观点或关注点，从下方全部候选切片与短高光中精准提取最相关的高光片段；"
+            f"与 Prompt 无关的片段一律舍弃并写入 dropped_clips，按叙事逻辑组织主题板块。"
+        )
+    elif eff_mode == "compilation" and user_filtered:
+        source_note = (
+            f"【策展切片来源：基于精选集锦】严格只从以下精选集锦包含的 {len(enabled_clips)} 支切片"
+            f"（及其同章前情铺垫）中提炼高光速览片段，并严格按下方切片从上到下的顺序编排主题板块顺序。"
+        )
+    elif user_filtered:
+        source_note = (
+            f"【策展切片来源：手动勾选片段】用户已手动勾选以下 {len(enabled_clips)} 支切片；"
+            f"严格只从这几支已勾选切片（及其同章前情铺垫）中选择高光片段，并严格按下方切片从上到下的先后顺序编排主题板块顺序。"
+        )
+    else:
+        source_note = (
+            "【策展切片来源：全片 AI 自主精选】请以首席总编视角，自主从以下全部候选切片与短高光中遴选最反映全片主旨、"
+            "最具争议反直觉或最精彩的片段组合，总时长严格精选控制在目标区间内。"
+        )
 
     prompt = f"""请以首席总编视角，基于全片宏观背景与以下候选切片，策划一支总时长约 {target_min}~{target_max} 秒（硬上限 ≤{target_max} 秒，即原片 1/10）、分为 {est_min_themes}~{est_max_themes} 个主题板块、共 {est_min_excerpts}~{est_max_excerpts} 个弹性完整小段的 Remix 高光集锦。
 {source_note}
@@ -957,6 +1724,7 @@ def _build_remix_macro_prompt(
 【输出 JSON Schema】
 {{
   "remix_title": "整支高光集锦中文标题（≤22字）",
+  "compilation_title": "切片精选集中文标题（≤22字，概括多支精选切片核心主题与看点，不出现‘切片精选集’字样）",
   "editorial_thesis": "2~3句总编策展思路（说明重点突出哪几大看点、为何舍弃其余平淡或背景段）",
   "dropped_clips": [
     {{
@@ -1264,7 +2032,19 @@ def plan_remix_from_clips(
             it.order = idx
             it.remix_id = f"rmx_{idx:02d}"
 
-    manifest.remix.title = str(data.get("remix_title") or f"{manifest.metadata.original_theme_zh or '全片'} · 高光混剪")
+    unified_base = resolve_unified_base_title(
+        manifest,
+        str(data.get("remix_title") or data.get("compilation_title") or ""),
+    )
+    manifest.remix.title = build_default_remix_title(manifest, unified_base)
+    manifest.remix.cover_title = ""
+    if (manifest.compilation.title or "").strip() in GENERIC_COMPILATION_TITLES:
+        manifest.compilation.title = build_default_compilation_title(manifest, unified_base)
+        manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
+    if (manifest.cut_segments or manifest.clean_cut.scanned_at) and is_untranslated_clean_cut_title(
+        manifest, manifest.clean_cut.title
+    ):
+        manifest.clean_cut.title = build_default_clean_cut_title(manifest, unified_base)
     manifest.remix.editorial_thesis = str(data.get("editorial_thesis") or "").strip()
     manifest.remix.card_mode = r_cfg.get("card_mode", manifest.remix.card_mode)
     manifest.remix.card_duration_s = float(r_cfg.get("card_duration_s", manifest.remix.card_duration_s))
@@ -1274,6 +2054,7 @@ def plan_remix_from_clips(
     manifest.remix.bgm_volume = float(r_cfg.get("bgm_volume", manifest.remix.bgm_volume))
     manifest.remix.sfx_volume = float(r_cfg.get("sfx_volume", manifest.remix.sfx_volume))
     manifest.remix.items = items
+    manifest.remix.publish_desc = ""
     manifest.remix.manual_script_locked = False
     manifest.remix.planned_source_signature = compute_remix_source_signature(manifest)
     manifest.remix.render_hash = compute_remix_render_hash(manifest)
@@ -1493,6 +2274,9 @@ def run_verify_and_plan_stage(
             clip.curation_tag = ""
 
     manifest.compilation.clip_ids = [c.clip_id for c in clips if c.enabled]
+    manifest.compilation.publish_desc = ""
+    if (manifest.compilation.title or "").strip() in GENERIC_COMPILATION_TITLES:
+        manifest.compilation.title = build_default_compilation_title(manifest)
     manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
 
     check_cancelled()

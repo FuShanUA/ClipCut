@@ -136,26 +136,43 @@ cover:
   style: natural
   prefer_two_shot: true
   remix_card_pip: true
+navigation:
+  style: top_nav
+  remix_style: both
+  compilation_style: both
+  screen_layout: portrait
+  color_scheme: tiffany
+  custom_accent: '#0ABAB5'
 content_filter:
   cut_ads: true
   cut_political_sensitive: true
   sensitivity: balanced
-  political_action: auto
+  political_action: precise_mask
   apply_to_clips: true
   cut_mode: auto
   political_profiles:
     strict:
       label: 严格从严（推荐视频号/B站）
-      description: 适配中国大陆主流平台强审核：覆盖涉华及中国友好国家（俄/朝/伊朗与伊斯兰世界等）的硬红线、明确指责对抗及边缘涉政表述。
+      description: 适配中国大陆主流平台强审核：完整覆盖国家法律法规（中国特色社会主义制度与核心地位、分裂国家与规范称谓/版图、损害国家荣誉与英烈军警形象）及涉华/友好国家实质红线与对抗表述。
       trigger_severities:
       - high
       - medium
       - low
       rules:
       - id: hard_redline
-        name: 硬性政治红线
+        name: 危害中国特色社会主义制度与领导人红线
         severity: high
-        description: 直接涉及中国领导人、执政党、政治体制、政权评论或影射；台湾/香港/新疆/西藏/南海主权挑战或台海军事冲突；对中/俄/朝/伊朗等中国友好国家的政权攻击、极端军事打击渲染或直接意识形态攻击。
+        description: 攻击、否定、损害、违背中国特色社会主义指导思想、行动指南及马克思主义中国化最新理论成果；攻击、否定、弱化党中央的核心与全党核心地位，以及任何涉及中国最高领导人个人言行、执政或外交礼遇姿态的评论、影射与可还原指代（含连续代词“他/他们”延续句）；历史虚无主义（以一个阶段党和国家发展历史否定另一个阶段）、违背党的百年奋斗重大成就决议、调侃否定新中国成立以来重大方针政策举措、曲解/攻击/调侃宪法及国家重大法律法规；以娱乐化方式篡改解读根本/基本/重要制度、特定政治名词及敏感历史事件；对中/俄/朝/伊朗等中国友好国家的政权攻击、极端军事打击渲染或直接意识形态攻击。
+      - id: sovereignty_and_normative_terms
+        name: 分裂国家、国家主权与规范称谓/版图
+        severity: high
+        description: 危害国家统一与主权领土完整，反对、攻击、曲解“一个中国”“一国两制”，反映分裂国家言行、活动、标识、旗帜、标语口号或涉分裂立场艺人/团体节目，以及对领土和历史事件描写不符合国家定论；错用/滥用特定标识、呼号、称谓与用语：杜绝将“中国大陆”英译为
+          mainland China/Mainland China（应为 Chinese mainland/China's mainland/the mainland
+          of China）、杜绝将“侵华日军南京大屠杀遇难同胞纪念馆”简称为“南京大屠杀纪念馆”、杜绝将“新疆维吾尔自治区”错写为“新疆维吾尔族自治区”、杜绝“台湾总统/中华民国/两个中国/一中一台/一边一国”；涉及中国地图残缺、地名不完整或篡改等国家版图缺失展示。
+      - id: national_honor_and_public_service
+        name: 损害国家荣誉利益、英烈及公务人员形象
+        severity: high
+        description: 贬损、玷污、恶搞国家和民族形象、精神气质，焚烧/毁损/涂划/玷污/践踏/恶搞或不适宜娱乐商业场合使用国歌、国旗、国徽、人民币；贬损、恶搞、损害革命领袖、英雄烈士及中国共产党党员形象名誉；贬损、恶搞、损害人民军队（解放军）、武警、国安（国安部/MSS）、公安、行政、司法人员等国家公务人员形象名誉（含恶意截取执法营造暴力执法效果、泛娱乐化夸张展现解放军、传播未证实军装冲突或冒充公务人员）；美化反面人物、对已定性负面人物歌功颂德、曲解国史党史军史。
       - id: geopolitics_confrontation
         name: 涉华及友好国家对抗站队
         severity: medium
@@ -170,15 +187,24 @@ content_filter:
         description: 确涉及中国或俄/朝/伊朗等中国友好国家的敏感地缘摩擦、制度隐喻或争议政治人物评价，但措辞温和间接的边缘涉政表述（纯商业/科技访谈中中性提及去中国参观企业、对比技术进度、称赞美国领先、批评欧美政府或公司严禁标为低危，应直接忽略不输出）。
     balanced:
       label: 平衡
-      description: 聚焦硬红线及针对中国或友好国家（俄/朝/伊朗等）的明确指责与对抗；放行一般技术对比、商业讨论及欧美内政。
+      description: 严守法律法规红线（制度与核心地位、分裂主权与规范称谓/版图、国家荣誉与英烈军警形象），并覆盖对华及友好国家的明确指责与对抗；放行一般技术对比、商业讨论及欧美内政。
       trigger_severities:
       - high
       - medium
       rules:
       - id: hard_redline
-        name: 硬性政治红线
+        name: 危害中国特色社会主义制度与领导人红线
         severity: high
-        description: 直接涉及中国领导人、执政党、政治体制或政权评价/影射；台湾/香港/新疆/西藏/南海主权议题；对中/俄/朝/伊朗等中国友好国家的政权攻击或直接意识形态攻击。
+        description: 攻击、否定、违背中国特色社会主义制度、指导思想、党中央权威与核心地位，及涉中国最高领导人言行/外交姿态的评论、影射与连续代词指代；历史虚无主义、否定重大方针政策或曲解宪法法律；敏感历史政治事件；对中/俄/朝/伊朗等中国友好国家的政权攻击或直接意识形态攻击。
+      - id: sovereignty_and_normative_terms
+        name: 分裂国家、国家主权与规范称谓/版图
+        severity: high
+        description: 反对“一个中国”“一国两制”、分裂言行标识及不符合定论的领土历史描写；杜绝 mainland China/Mainland
+          China、南京大屠杀纪念馆（应含“侵华日军…遇难同胞”）、新疆维吾尔族自治区（应无“族”字）、台湾总统/中华民国/一边一国等不规范称谓；杜绝中国版图缺失或地名篡改。
+      - id: national_honor_and_public_service
+        name: 损害国家荣誉利益、英烈及公务人员形象
+        severity: high
+        description: 侮辱或不当使用国歌、国旗、国徽、人民币；贬损革命领袖、英雄烈士、中国共产党党员；贬损恶搞人民军队、武警、国安（国安部/MSS）、公安、行政、司法人员等公务人员或恶意截取执法画面；美化反面人物或曲解国史党史军史。
       - id: geopolitics_confrontation
         name: 明确涉华及友好国家军事制裁对抗
         severity: medium
@@ -189,14 +215,23 @@ content_filter:
         description: 明确指向中国或俄罗斯、朝鲜、伊朗/伊斯兰世界等中国友好国家的审查、监控或人权体制指责；泛指“政府”、批评欧美政府/NSA或商业垄断不标。
     loose:
       label: 仅硬红线
-      description: 仅识别直接触及国内法律法规与平台红线的高危内容；一般地缘竞争、产业讨论、历史类比与欧美内政均放行。
+      description: 仅识别直接触及国家法律法规与平台法定红线的高危内容；一般地缘竞争、产业讨论、历史类比与欧美内政均放行。
       trigger_severities:
       - high
       rules:
       - id: hard_redline
-        name: 硬性政治红线
+        name: 危害中国特色社会主义制度与领导人红线
         severity: high
-        description: 直接涉及中国领导人、执政党、政治体制或政权评论与影射；台湾/香港/新疆/西藏/南海主权挑战；敏感政治历史事件、违禁人物与直接意识形态攻击。
+        description: 直接危害中国特色社会主义制度、指导思想、党中央权威与核心地位，及涉中国最高领导人言行/外交姿态的评论、影射与连续代词指代；历史虚无主义、曲解宪法法律与敏感政治历史事件；直接意识形态攻击。
+      - id: sovereignty_and_normative_terms
+        name: 分裂国家、国家主权与规范称谓/版图
+        severity: high
+        description: 危害国家统一与领土完整、反对“一个中国”“一国两制”、分裂标识言行；错用 mainland China/Mainland
+          China、南京大屠杀纪念馆、新疆维吾尔族自治区、台湾总统/中华民国等不规范称谓；中国地图残缺或地名篡改。
+      - id: national_honor_and_public_service
+        name: 损害国家荣誉利益、英烈及公务人员形象
+        severity: high
+        description: 侮辱或不当使用国歌/国旗/国徽/人民币；贬损革命领袖、英雄烈士、中国共产党党员；贬损恶搞人民军队、武警、国安（国安部/MSS）、公安、司法等国家公务人员；美化反面人物或曲解国史党史军史。
       - id: exclude_general_geopolitics
         name: 非红线政治/产业评论豁免（指导界定）
         severity: low

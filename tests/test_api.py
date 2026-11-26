@@ -975,6 +975,600 @@ def test_remix_manual_lock_source_clip_ids_and_standalone_render(tmp_path: Path,
     assert planned.remix.manual_script_locked is False
 
 
+def test_compilation_title_distillation_and_cover_plus_clean_cut_crimson_theme(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+    import numpy as np
+    from PIL import Image
+    from clipcut.api import server as srv
+    from clipcut.models import ClipItem, CompilationConfig, MediaSource, ProjectManifest, RemixConfig, Utterance, VideoMetadata
+    from clipcut.pipeline import verify_and_plan as vp
+    from clipcut.receipts import ProjectStore
+    from clipcut.render import renderer
+    SelectedFrame = renderer.SelectedFrame
+
+    vid = tmp_path / "src.mp4"
+    vid.write_bytes(b"dummy")
+    hero_jpg = tmp_path / "hero.jpg"
+    Image.new("RGB", (1920, 1080), (42, 48, 56)).save(hero_jpg, format="JPEG")
+    hero_sf = SelectedFrame(image_path=hero_jpg, timestamp_s=5.0, faces=[], is_two_shot=False, score=5.0, from_fallback=False)
+
+    store = ProjectStore(tmp_path / "work")
+    m = ProjectManifest(
+        project_id="test-comp-cover-crimson",
+        source=MediaSource(
+            analysis_video=str(vid),
+            render_video=str(vid),
+            duration_s=120.0,
+            width=1920,
+            height=1080,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        metadata=VideoMetadata(
+            original_title="War 2.0",
+            original_theme_zh="未来战争与自主武器系统深度对话",
+            guest_zh="帕尔默·拉奇",
+            channel_zh="纽约时报",
+            published_date="2026-11-20",
+        ),
+        utterances=[Utterance(id=0, start_s=0.0, end_s=12.0, zh="自主武器改变威慑规则")],
+        clips=[
+            ClipItem(clip_id="c1", index=1, enabled=True, title="自主武器与威慑逻辑", start_utt=0, end_utt=0, start_s=0.0, end_s=12.0),
+        ],
+        remix=RemixConfig(enabled=True, title="战争2.0：威慑与AI · 高光混剪"),
+        compilation=CompilationConfig(enabled=True, title="切片精选集", clip_ids=["c1"]),
+    )
+    store.save(m)
+
+    # 1. Deterministic fallback strips suffix cleanly
+    derived = vp.build_default_compilation_title(m)
+    assert derived == "战争2.0：威慑与AI（中长集锦）"
+
+    monkeypatch.setattr(srv, "_get_store", lambda _pid: store)
+    monkeypatch.setattr(srv, "load_editorial_config", lambda: {"cover": {"style": "natural", "prefer_two_shot": True}})
+    monkeypatch.setattr(renderer, "_build_hero_pool_for_manifest", lambda *a, **k: [hero_sf])
+    monkeypatch.setattr(renderer, "_resolve_remix_selected_frame", lambda *a, **k: hero_sf)
+
+    # 2. GET /api/projects/{pid} auto-backfills generic '切片精选集' title
+    r_get = client.get("/api/projects/test-comp-cover-crimson")
+    assert r_get.status_code == 200
+    assert r_get.json()["manifest"]["compilation"]["title"] == "战争2.0：威慑与AI（中长集锦）"
+
+    # 3. Compilation cover generation succeeds & produces Tiffany cyan card + valid 1920x1080 JPEG
+    r_cov_comp = client.post("/api/projects/test-comp-cover-crimson/covers/refresh", json={"target": "compilation"})
+    assert r_cov_comp.status_code == 200
+    comp_manifest = r_cov_comp.json()["manifest"]
+    comp_cover_path = Path(comp_manifest["compilation"]["cover_file"])
+    assert comp_cover_path.exists()
+    with Image.open(comp_cover_path) as comp_im:
+        assert comp_im.size == (1920, 1080)
+        comp_card = np.asarray(comp_im.crop((680, 820, 1240, 1020)), dtype=np.float32)
+        c_r, c_g, c_b = comp_card[:, :, 0].mean(), comp_card[:, :, 1].mean(), comp_card[:, :, 2].mean()
+        assert c_g > c_r + 40 and c_b > c_r + 40
+
+    # 4. POST /compilation/suggest-title invokes LLM & updates cover when cover_title is blank
+    monkeypatch.setattr(
+        vp.ClipCutLLM,
+        "generate_json",
+        lambda self, *a, **k: SimpleNamespace(
+            parsed={"compilation_title": "未来战争与AI武器重构"},
+            provider="dashscope",
+            model="qwen3.8-max",
+            elapsed_ms=5,
+        ),
+    )
+    r_sug = client.post("/api/projects/test-comp-cover-crimson/compilation/suggest-title")
+    assert r_sug.status_code == 200
+    assert r_sug.json()["title"] == "未来战争与AI武器重构（中长集锦）"
+    assert r_sug.json()["manifest"]["compilation"]["title"] == "未来战争与AI武器重构（中长集锦）"
+
+    # 5. Clean Cut cover generation produces Crimson red card & distinct theme hash
+    h_tif = renderer.compute_cover_hash(
+        key="clean_cut",
+        title="净版标题",
+        categories=["clean_cut"],
+        start_s=0.0,
+        end_s=120.0,
+        manifest=store.load(),
+        cfg={},
+        published_date="2026-11-20",
+        theme="tiffany",
+    )
+    h_crm = renderer.compute_cover_hash(
+        key="clean_cut",
+        title="净版标题",
+        categories=["clean_cut"],
+        start_s=0.0,
+        end_s=120.0,
+        manifest=store.load(),
+        cfg={},
+        published_date="2026-11-20",
+        theme="crimson",
+    )
+    assert h_tif != h_crm
+
+    r_cov_cc = client.post("/api/projects/test-comp-cover-crimson/covers/refresh", json={"target": "clean_cut"})
+    assert r_cov_cc.status_code == 200
+    cc_cover_path = Path(r_cov_cc.json()["manifest"]["clean_cut"]["cover_file"])
+    assert cc_cover_path.exists()
+    with Image.open(cc_cover_path) as cc_im:
+        assert cc_im.size == (1920, 1080)
+        cc_card = np.asarray(cc_im.crop((680, 820, 1240, 1020)), dtype=np.float32)
+        r_m, g_m, b_m = cc_card[:, :, 0].mean(), cc_card[:, :, 1].mean(), cc_card[:, :, 2].mean()
+        assert r_m > g_m + 60 and r_m > b_m + 60
+
+
+def test_inspect_rendered_assets_ignores_signals_only_and_errored_scan_cuts(tmp_path: Path):
+    from clipcut.models import ClipItem, MediaSource, ProjectManifest, StageStatus
+    from clipcut.pipeline.orchestrator import inspect_rendered_assets
+
+    m = ProjectManifest(
+        project_id="test-empty-strategy",
+        source=MediaSource(
+            work_dir=str(tmp_path),
+            render_video="demo.mp4",
+            analysis_video="demo.mp4",
+            output_dir=str(tmp_path / "clips"),
+            duration_s=120.0,
+        ),
+        stages={
+            "ingest": StageStatus(status="completed", message="ok"),
+            "signals": StageStatus(status="completed", finished_at="2026-11-24T03:00:46Z", message="ok"),
+            "scan_cuts": StageStatus(status="error", finished_at="2026-11-24T03:10:45Z", message="failed"),
+            "analyze": StageStatus(),
+            "verify_and_plan": StageStatus(),
+            "render": StageStatus(),
+        },
+    )
+    assets_empty = inspect_rendered_assets(m)
+    assert assets_empty["has_prior_analysis"] is False
+    assert assets_empty["has_rendered"] is False
+    assert assets_empty["has_strategy"] is False
+
+    # Completing scan_cuts or recording scanned_at / clips marks strategy present
+    m_scanned = m.model_copy(deep=True)
+    m_scanned.stages["scan_cuts"] = StageStatus(status="completed", message="done")
+    assert inspect_rendered_assets(m_scanned)["has_strategy"] is True
+
+    m_cc = m.model_copy(deep=True)
+    m_cc.clean_cut.scanned_at = "2026-11-24T03:15:00Z"
+    assert inspect_rendered_assets(m_cc)["has_strategy"] is True
+
+    m_clip = m.model_copy(deep=True)
+    m_clip.clips = [ClipItem(clip_id="c1", index=1, title="clip 1", start_utt=0, end_utt=1, start_s=0.0, end_s=10.0)]
+    assert inspect_rendered_assets(m_clip)["has_strategy"] is True
+
+
+def test_publish_reset_endpoint_and_cancellable_publish_job(tmp_path: Path, monkeypatch):
+    from clipcut.models import MediaSource, ProjectManifest, PublishRecord, VideoMetadata
+    from clipcut.receipts import ProjectStore
+    import clipcut.api.server as srv
+
+    store = ProjectStore(tmp_path)
+    m = ProjectManifest(
+        project_id="test-pub-reset-01",
+        source=MediaSource(
+            work_dir=str(tmp_path),
+            render_video="fake.mp4",
+            analysis_video="fake.mp4",
+            output_dir=str(tmp_path / "out"),
+            duration_s=60.0,
+        ),
+        metadata=VideoMetadata(original_title="reset test", metadata_source="manual"),
+    )
+    m.remix.publish_records = [
+        PublishRecord(
+            platform="wechat",
+            status="error",
+            mode="draft",
+            title="t1",
+            message="微信视频号发布页加载失败",
+            error="找不到视频上传入口",
+            error_code="page_load_failed",
+            solution="请重扫码并点击复位状态",
+        ),
+        PublishRecord(
+            platform="bilibili",
+            status="published",
+            mode="public",
+            title="t1",
+            url_or_id="https://www.bilibili.com/video/BV1234567890",
+            message="B站已发布 (BV1234567890)",
+        ),
+    ]
+    store.save(m)
+    monkeypatch.setattr(srv, "_get_store", lambda pid: store)
+
+    # Check publish status exposes login tracking keys
+    r_stat = client.get("/api/publish/status")
+    assert r_stat.status_code == 200
+    for plat in ("wechat", "bilibili", "xiaohongshu"):
+        pinfo = r_stat.json()["platforms"][plat]
+        assert "login_running" in pinfo
+        assert "login_updated_at" in pinfo
+
+    # Default reset on target (platform=None) keeps published record and removes only failed/running ones
+    r_reset = client.post(
+        "/api/projects/test-pub-reset-01/publish/reset",
+        json={"target": "remix"},
+    )
+    assert r_reset.status_code == 200
+    assert r_reset.json()["removed"] == ["wechat"]
+    remaining = r_reset.json()["manifest"]["remix"]["publish_records"]
+    assert len(remaining) == 1
+    assert remaining[0]["platform"] == "bilibili"
+    assert remaining[0]["status"] == "published"
+
+    # Explicit platform reset clears that platform record even if published/error
+    def _add_bili_err(pm: ProjectManifest) -> None:
+        pm.remix.publish_records = [
+            PublishRecord(platform="bilibili", status="error", mode="draft", title="t1", message="B站上传超时")
+        ]
+
+    store.update_manifest(_add_bili_err)
+    r_reset_bili = client.post(
+        "/api/projects/test-pub-reset-01/publish/reset",
+        json={"target": "remix", "platform": "bilibili"},
+    )
+    assert r_reset_bili.status_code == 200
+    assert r_reset_bili.json()["removed"] == ["bilibili"]
+    assert r_reset_bili.json()["manifest"]["remix"]["publish_records"] == []
+
+
+def test_independent_publish_jobs_and_targeted_cancel(tmp_path: Path, monkeypatch):
+    import threading
+    from clipcut.models import CleanCutConfig, CompilationConfig, MediaSource, ProjectManifest, VideoMetadata
+    from clipcut.receipts import ProjectStore
+    import clipcut.api.server as srv
+
+    comp_mp4 = tmp_path / "comp.mp4"
+    cc_mp4 = tmp_path / "cc.mp4"
+    comp_mp4.write_bytes(b"comp")
+    cc_mp4.write_bytes(b"cc")
+
+    store = ProjectStore(tmp_path)
+    m = ProjectManifest(
+        project_id="test-indep-pub-01",
+        source=MediaSource(
+            work_dir=str(tmp_path),
+            render_video="fake.mp4",
+            analysis_video="fake.mp4",
+            output_dir=str(tmp_path / "out"),
+            duration_s=120.0,
+        ),
+        metadata=VideoMetadata(original_title="Indep Test", original_theme_zh="独立发布测试", metadata_source="manual"),
+        compilation=CompilationConfig(enabled=True, title="精选集", output_file=str(comp_mp4)),
+        clean_cut=CleanCutConfig(enabled=True, title="全片（净版）", output_file=str(cc_mp4)),
+    )
+    store.save(m)
+    monkeypatch.setattr(srv, "_get_store", lambda pid: store)
+
+    started_events = {"compilation": threading.Event(), "clean_cut": threading.Event()}
+    release_events = {"compilation": threading.Event(), "clean_cut": threading.Event()}
+    tokens_seen: dict[str, object] = {}
+
+    def fake_publish_to_platforms(*, target, cancel_token=None, **kwargs):
+        tokens_seen[target] = cancel_token
+        started_events[target].set()
+        while not release_events[target].is_set():
+            if cancel_token is not None and cancel_token.is_cancelled:
+                from clipcut.cancel import JobCancelledError
+                raise JobCancelledError("cancelled")
+            release_events[target].wait(timeout=0.05)
+        return store.load()
+
+    monkeypatch.setattr(srv, "publish_to_platforms", fake_publish_to_platforms)
+
+    r_comp = client.post(
+        "/api/projects/test-indep-pub-01/publish",
+        json={"target": "compilation", "platforms": ["wechat"]},
+    )
+    assert r_comp.status_code == 200
+    assert started_events["compilation"].wait(timeout=2.0)
+
+    # Another target (clean_cut) must start independently without 409 conflict
+    r_cc = client.post(
+        "/api/projects/test-indep-pub-01/publish",
+        json={"target": "clean_cut", "platforms": ["bilibili"]},
+    )
+    assert r_cc.status_code == 200
+    assert started_events["clean_cut"].wait(timeout=2.0)
+
+    # Same target duplicate publish must still reject with 409
+    r_dup = client.post(
+        "/api/projects/test-indep-pub-01/publish",
+        json={"target": "compilation", "platforms": ["bilibili"]},
+    )
+    assert r_dup.status_code == 409
+
+    # GET project reports both independent running publish_jobs, pipeline job remains idle
+    r_get = client.get("/api/projects/test-indep-pub-01")
+    assert r_get.status_code == 200
+    data = r_get.json()
+    assert data["job"]["running"] is False
+    pub_jobs = data["publish_jobs"]
+    assert len(pub_jobs) == 2
+    assert {tuple(j["targets"]) for j in pub_jobs} == {("compilation",), ("clean_cut",)}
+
+    # Cancel only compilation; clean_cut token stays uncancelled
+    r_cancel = client.post("/api/projects/test-indep-pub-01/cancel", json={"target": "compilation"})
+    assert r_cancel.status_code == 200
+    assert r_cancel.json()["cancelled"] is True
+    assert tokens_seen["compilation"].is_cancelled is True
+    assert tokens_seen["clean_cut"].is_cancelled is False
+
+    release_events["clean_cut"].set()
+    # Wait briefly for worker threads to clean up
+    import time
+    for _ in range(40):
+        if not client.get("/api/projects/test-indep-pub-01").json()["publish_jobs"]:
+            break
+        time.sleep(0.05)
+    assert client.get("/api/projects/test-indep-pub-01").json()["publish_jobs"] == []
+
+
+def test_clean_cut_untranslated_title_auto_repair_and_suggest_title(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+    from PIL import Image
+    from clipcut.models import (
+        CleanCutConfig,
+        ClipItem,
+        CutSegment,
+        MediaSource,
+        ProjectManifest,
+        TopicMapItem,
+        Utterance,
+        VideoMetadata,
+    )
+    from clipcut.pipeline import analyze as analyze_mod
+    from clipcut.pipeline import verify_and_plan as vp
+    from clipcut.pipeline.content_filter import compute_clean_cut_render_hash
+    from clipcut.receipts import ProjectStore
+    from clipcut.render import renderer
+    import clipcut.api.server as srv
+
+    vid = tmp_path / "src.mp4"
+    vid.write_bytes(b"dummy")
+    cc_mp4 = tmp_path / "clips" / "00_CleanCut_demo.mp4"
+    cc_mp4.parent.mkdir(parents=True, exist_ok=True)
+    cc_mp4.write_bytes(b"clean_cut_mp4")
+    cc_jpg = cc_mp4.with_suffix(".jpg")
+    Image.new("RGB", (1920, 1080), (20, 30, 40)).save(cc_jpg, format="JPEG")
+    hero_jpg = tmp_path / "hero.jpg"
+    Image.new("RGB", (1920, 1080), (42, 48, 56)).save(hero_jpg, format="JPEG")
+    hero_sf = renderer.SelectedFrame(image_path=hero_jpg, timestamp_s=3.0, faces=[], is_two_shot=False, score=5.0, from_fallback=False)
+
+    store = ProjectStore(tmp_path / "work")
+    m = ProjectManifest(
+        project_id="test-cc-title-fix",
+        source=MediaSource(
+            analysis_video=str(vid),
+            render_video=str(vid),
+            duration_s=120.0,
+            width=1920,
+            height=1080,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        metadata=VideoMetadata(
+            original_title="Watch CNBC's full interview with President Trump",
+            original_theme_zh="特朗普谈黄仁勋复职英伟达CEO：国家安全、AI芯片出口、关税与政府介入",
+            guest_zh="唐纳德·特朗普",
+            channel_zh="CNBC电视台",
+            published_date="2026-11-23",
+        ),
+        utterances=[Utterance(id=0, start_s=0.0, end_s=12.0, zh="特朗普谈芯片与关税")],
+        topic_map=[TopicMapItem(topic_id="T01", start_utt=0, end_utt=0, title="黄仁勋复职与芯片出口", summary="讨论芯片国安")],
+        clips=[ClipItem(clip_id="c1", index=1, enabled=True, title="特朗普回应黄仁勋调查", start_utt=0, end_utt=0, start_s=0.0, end_s=12.0)],
+        cut_segments=[CutSegment(cut_id="cut_01", kind="political_sensitive", enabled=True, start_s=1.0, end_s=5.0)],
+        clean_cut=CleanCutConfig(
+            enabled=True,
+            title="Watch CNBC's full interview with President Trump（净版）",
+            cut_political_sensitive=True,
+            output_file=str(cc_mp4),
+            cover_file=str(cc_jpg),
+        ),
+    )
+    m.clean_cut.render_hash = compute_clean_cut_render_hash(m, {})
+    m.clean_cut.last_rendered_hash = m.clean_cut.render_hash
+    store.save(m)
+
+    monkeypatch.setattr(srv, "_get_store", lambda _pid: store)
+    monkeypatch.setattr(srv, "load_editorial_config", lambda: {"cover": {"style": "natural", "prefer_two_shot": True}})
+    monkeypatch.setattr(renderer, "_build_hero_pool_for_manifest", lambda *a, **k: [hero_sf])
+    monkeypatch.setattr(renderer, "_resolve_remix_selected_frame", lambda *a, **k: hero_sf)
+
+    # 1. GET project auto-fixes untranslated English clean_cut.title to Chinese & preserves render cache
+    r_get = client.get("/api/projects/test-cc-title-fix")
+    assert r_get.status_code == 200
+    cc1 = r_get.json()["manifest"]["clean_cut"]
+    assert "Watch CNBC" not in cc1["title"]
+    assert "特朗普" in cc1["title"]
+    assert cc1["title"].endswith("（完整版）")
+    assert cc1["render_hash"] == cc1["last_rendered_hash"]
+
+    # 2. Manual PATCH of clean_cut.title only also preserves render cache
+    r_patch = client.patch("/api/projects/test-cc-title-fix/clean-cut", json={"title": "人工定制中文净版标题"})
+    assert r_patch.status_code == 200
+    cc2 = r_patch.json()["manifest"]["clean_cut"]
+    assert cc2["title"] == "人工定制中文净版标题"
+    assert cc2["render_hash"] == cc2["last_rendered_hash"]
+
+    # 3. POST /clean-cut/suggest-title invokes LLM & preserves render cache
+    monkeypatch.setattr(
+        vp.ClipCutLLM,
+        "generate_json",
+        lambda self, *a, **k: SimpleNamespace(
+            parsed={"clean_cut_title": "特朗普专访：黄仁勋、芯片关税与国家安全"},
+            provider="dashscope",
+            model="qwen3.8-max",
+            elapsed_ms=5,
+        ),
+    )
+    r_sug = client.post("/api/projects/test-cc-title-fix/clean-cut/suggest-title")
+    assert r_sug.status_code == 200
+    assert r_sug.json()["title"] == "特朗普专访：黄仁勋、芯片关税与国家安全（完整版）"
+    cc3 = r_sug.json()["manifest"]["clean_cut"]
+    assert cc3["title"] == "特朗普专访：黄仁勋、芯片关税与国家安全（完整版）"
+    assert cc3["render_hash"] == cc3["last_rendered_hash"]
+
+    # 4. analyze stage backfills untranslated clean_cut.title created by prior scan_cuts
+    m_scan_first = store.load()
+    m_scan_first.clean_cut.title = "Watch CNBC's full interview with President Trump（净版）"
+    m_scan_first.metadata.original_theme_zh = ""
+    store.save(m_scan_first)
+
+    calls = {"n": 0}
+
+    def fake_analyze_llm(self, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return SimpleNamespace(
+                parsed={
+                    "primary_topics": ["AI芯片"],
+                    "meta": {
+                        "guest_zh": "唐纳德·特朗普",
+                        "channel_zh": "CNBC电视台",
+                        "original_theme_zh": "特朗普专访聚焦英伟达CEO复职与芯片出口",
+                    },
+                    "chapter_audits": [],
+                    "topic_map": [{"topic_id": "T01", "start_utt": 0, "end_utt": 0, "title": "芯片出口", "summary": "概要"}],
+                },
+                provider="dashscope",
+                model="qwen3.8-max",
+                prompt_tokens=1,
+                output_tokens=1,
+                elapsed_ms=1,
+            )
+        return SimpleNamespace(
+            parsed={"candidates": [], "suppressed_hot_topics": [], "dropped_topics": []},
+            provider="dashscope",
+            model="qwen3.8-max",
+            prompt_tokens=1,
+            output_tokens=1,
+            elapsed_ms=1,
+        )
+
+    monkeypatch.setattr(analyze_mod.ClipCutLLM, "generate_json", fake_analyze_llm)
+    out_an = analyze_mod.run_analyze_stage(store.load(), store, {}, "run_an_cc")
+    assert out_an.clean_cut.title == "特朗普专访聚焦英伟达CEO复职与芯片出口（完整版）"
+
+
+def test_batch_publish_endpoint_and_collection_forwarding(tmp_path: Path, monkeypatch):
+    import sys
+    from clipcut.models import ClipItem, MediaSource, ProjectManifest, PublishRecord, VideoMetadata
+    from clipcut.receipts import ProjectStore
+    import clipcut.api.server as srv
+
+    c1_mp4 = tmp_path / "clips" / "c1.mp4"
+    c2_mp4 = tmp_path / "clips" / "c2.mp4"
+    c1_mp4.parent.mkdir(parents=True, exist_ok=True)
+    c1_mp4.write_bytes(b"v1")
+    c2_mp4.write_bytes(b"v2")
+
+    wx_script = tmp_path / "wx.py"
+    bili_script = tmp_path / "bili.py"
+    xhs_script = tmp_path / "xhs.py"
+    for p in (wx_script, bili_script, xhs_script):
+        p.write_text("#!/usr/bin/env python3")
+
+    store = ProjectStore(tmp_path / "work")
+    m = ProjectManifest(
+        project_id="test-batch-pub-01",
+        source=MediaSource(
+            analysis_video=str(c1_mp4),
+            render_video=str(c1_mp4),
+            duration_s=120.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        metadata=VideoMetadata(original_title="Trump CNBC", original_theme_zh="特朗普芯片访谈"),
+        clips=[
+            ClipItem(clip_id="c1", index=1, enabled=True, title="切片一", start_utt=0, end_utt=1, start_s=0.0, end_s=10.0, output_file=str(c1_mp4)),
+            ClipItem(
+                clip_id="c2",
+                index=2,
+                enabled=True,
+                title="切片二已传",
+                start_utt=2,
+                end_utt=3,
+                start_s=12.0,
+                end_s=22.0,
+                output_file=str(c2_mp4),
+                publish_records=[
+                    PublishRecord(platform="wechat", status="draft", mode="draft", title="切片二已传"),
+                    PublishRecord(platform="bilibili", status="published", mode="public", title="切片二已传"),
+                    PublishRecord(platform="xiaohongshu", status="draft", mode="draft", title="切片二已传"),
+                ],
+            ),
+            ClipItem(clip_id="c3", index=3, enabled=True, title="切片三未渲染", start_utt=4, end_utt=5, start_s=25.0, end_s=35.0, output_file=None),
+            ClipItem(clip_id="c4", index=4, enabled=False, title="切片四未勾选", start_utt=6, end_utt=7, start_s=36.0, end_s=45.0, output_file=str(c1_mp4)),
+        ],
+    )
+    store.save(m)
+    monkeypatch.setattr(srv, "_get_store", lambda _pid: store)
+
+    captured: list[list[str]] = []
+
+    def mock_run_proc(cmd, env, timeout_s, on_line):
+        captured.append(list(cmd))
+        return 0, ["上传完成！BV1xx411c7mD"]
+
+    monkeypatch.setattr("clipcut.publish.publishers._run_publish_process", mock_run_proc)
+    monkeypatch.setattr("clipcut.publish.publishers.sync_platform_covers_for_target", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "clipcut.publish.publishers._get_paths",
+        lambda: {
+            "wechat": {"label": "微信视频号", "python": sys.executable, "script": wx_script},
+            "bilibili": {"label": "B站", "python": sys.executable, "script": bili_script},
+            "xiaohongshu": {"label": "小红书", "python": sys.executable, "script": xhs_script},
+        },
+    )
+
+    orig_thread = srv.threading.Thread
+
+    class FakeThread:
+        def __init__(self, *args, target=None, daemon=None, **kwargs):
+            self._real = None if (args == () and not kwargs and callable(target)) else orig_thread(*args, target=target, daemon=daemon, **kwargs)
+            self._target = target
+
+        def start(self):
+            if self._real is not None:
+                return self._real.start()
+            if self._target:
+                self._target()
+
+    monkeypatch.setattr(srv.threading, "Thread", FakeThread)
+
+    r_batch = client.post(
+        "/api/projects/test-batch-pub-01/publish/batch",
+        json={
+            "platforms": ["wechat", "bilibili", "xiaohongshu"],
+            "collection": "特朗普芯片访谈",
+            "skip_already_published": True,
+            "is_public": False,
+        },
+    )
+    assert r_batch.status_code == 200
+    body = r_batch.json()
+    assert body["targets"] == ["c1"]
+    assert body["collection"] == "特朗普芯片访谈"
+    assert body["skipped_already_published"] == ["c2"]
+    assert body["skipped_unrendered"] == ["c3"]
+
+    assert len(captured) == 3
+    wx_cmd = next(c for c in captured if str(wx_script) in c)
+    bili_cmd = next(c for c in captured if str(bili_script) in c)
+    xhs_cmd = next(c for c in captured if str(xhs_script) in c)
+
+    assert wx_cmd[wx_cmd.index("--collection") + 1] == "特朗普芯片访谈"
+    assert bili_cmd[bili_cmd.index("--season_name") + 1] == "特朗普芯片访谈"
+    assert xhs_cmd[-2:] == ["0", "特朗普芯片访谈"]
+
+
+
+
+
 
 
 

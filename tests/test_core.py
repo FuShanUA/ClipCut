@@ -1044,6 +1044,36 @@ def test_parse_publish_progress_all_platforms():
     assert _parse_publish_progress("wechat", ">>> 转码中: 50% (dom)", 75.0, "上传中")[:2] == (81.0, "转码中")
     assert _parse_publish_progress("wechat", ">>> 横竖双封面均已回读确认", 88.0, "设封面")[:2] == (94.0, "封面完成")
 
+    # WeChat share-first sequential cover intermediate save must not advance to 96%/98%
+    assert _parse_publish_progress("wechat", ">>> 正在设置分享封面 (1/2)...", 88.0, "设封面")[:2] == (
+        88.0,
+        "设分享封面",
+    )
+    assert _parse_publish_progress("wechat", ">>> 保存中转草稿以继续设置第二张封面...", 88.0, "设分享封面")[:2] == (
+        90.0,
+        "中转存草稿",
+    )
+    assert _parse_publish_progress("wechat", ">>> 点击存草稿按钮...", 90.0, "中转存草稿")[:2] == (
+        90.0,
+        "中转存草稿",
+    )
+    assert _parse_publish_progress("wechat", ">>> 正在到草稿箱核验保存结果...", 90.0, "中转存草稿")[:2] == (
+        91.0,
+        "中转核验",
+    )
+    assert _parse_publish_progress("wechat", ">>> 正在设置个人主页封面 (2/2)...", 91.0, "中转核验")[:2] == (
+        92.0,
+        "设主页封面",
+    )
+    assert _parse_publish_progress("wechat", ">>> 点击存草稿按钮...", 92.0, "设封面")[:2] == (
+        96.0,
+        "提交中",
+    )
+    assert _parse_publish_progress("wechat", ">>> 正在到草稿箱核验保存结果...", 96.0, "提交中")[:2] == (
+        98.0,
+        "核验中",
+    )
+
     # Xiaohongshu
     assert _parse_publish_progress("xiaohongshu", "   ... 已等待 20 秒，持续检测中 ...", 50.0, "上传分析")[:2] == (
         58.0,
@@ -1245,7 +1275,7 @@ def test_plan_remix_fallback_when_no_clips_enabled(tmp_path, monkeypatch):
     # Must NOT be emptied! AI autonomously curated it!
     assert len(planned.remix.items) == 1
     assert planned.remix.items[0].card_title == "AI自主遴选观点"
-    assert planned.remix.title == "AI自主遴选高光"
+    assert planned.remix.title == "AI自主遴选高光（速览混剪）"
 
 
 def test_wechat_publish_passes_collection_argument(tmp_path, monkeypatch):
@@ -1970,6 +2000,422 @@ def test_orchestrator_cancel_resets_stage_to_idle_and_writes_receipt(tmp_path, m
     assert any(r.action == "stage_cancelled" and r.stage == "analyze" for r in receipts)
 
 
+def test_publish_timeout_formats_actionable_diagnostics_without_raw_command(tmp_path, monkeypatch):
+    from clipcut.publish import publishers as pub_mod
+    from clipcut.publish.publishers import _PublishTimeoutError, publish_to_platforms
+    from clipcut.receipts import ProjectStore
+
+    store = ProjectStore(tmp_path / "work")
+    vid = tmp_path / "clips" / "c1.mp4"
+    vid.parent.mkdir(parents=True, exist_ok=True)
+    vid.write_bytes(b"dummy")
+    bili_script = tmp_path / "bili_upload.py"
+    bili_script.write_text("#!/usr/bin/env python3")
+    wx_script = tmp_path / "wechat_upload.py"
+    wx_script.write_text("#!/usr/bin/env python3")
+
+    m = ProjectManifest(
+        project_id="test-pub-timeout",
+        source=MediaSource(
+            analysis_video=str(vid),
+            render_video=str(vid),
+            duration_s=60.0,
+            work_dir=str(tmp_path / "work"),
+            metadata_source="manual",
+            output_dir=str(tmp_path / "clips"),
+        ),
+        clips=[
+            ClipItem(
+                clip_id="c1",
+                index=1,
+                enabled=True,
+                title="切片1",
+                start_utt=0,
+                end_utt=1,
+                output_file=str(vid),
+                start_s=0.0,
+                end_s=10.0,
+            ),
+        ],
+    )
+    store.save(m)
+
+    def mock_run_timeout(cmd, env, timeout_s, on_line):
+        if "bili_upload.py" in " ".join(cmd):
+            on_line("Progress: 0.0%")
+            raise _PublishTimeoutError(1800.0, [">>> ⚠️ B站分块上传失败 (chunk 0/9): timeout"])
+        on_line(">>> 打开发布页面 (尝试 1/3)...")
+        raise _PublishTimeoutError(1800.0, [">>> 等待页面加载..."])
+
+    monkeypatch.setattr(pub_mod, "_run_publish_process", mock_run_timeout)
+    monkeypatch.setattr(pub_mod, "sync_platform_covers_for_target", lambda **kwargs: [])
+    monkeypatch.setattr(
+        pub_mod,
+        "_get_paths",
+        lambda: {
+            "bilibili": {"label": "B站", "python": sys.executable, "script": bili_script},
+            "wechat": {"label": "微信视频号", "python": sys.executable, "script": wx_script},
+        },
+    )
+
+    out_m = publish_to_platforms(
+        store=store,
+        target="c1",
+        platforms=["bilibili", "wechat"],
+        is_public=False,
+        ui_schema=2,
+    )
+    recs = {r.platform: r for r in out_m.clips[0].publish_records}
+
+    assert recs["bilibili"].status == "error"
+    assert recs["bilibili"].error_code == "timeout"
+    assert recs["bilibili"].error is not None
+    assert "Command '[" not in recs["bilibili"].error
+    assert "B站分块上传失败" in recs["bilibili"].error
+    assert "代理" in recs["bilibili"].solution
+    assert "复位状态" in recs["bilibili"].solution
+
+    assert recs["wechat"].status == "error"
+    assert recs["wechat"].error_code == "timeout"
+    assert recs["wechat"].error is not None
+    assert "Command '[" not in recs["wechat"].error
+    assert "草稿箱" in recs["wechat"].solution
+    assert "复位状态" in recs["wechat"].solution
+
+
+def test_publish_wechat_auth_and_page_load_diagnostics_and_reset(tmp_path, monkeypatch):
+    from clipcut.publish import publishers as pub_mod
+    from clipcut.publish.publishers import publish_to_platforms, reset_publish_records
+    from clipcut.receipts import ProjectStore
+
+    store = ProjectStore(tmp_path / "work")
+    vid = tmp_path / "clips" / "c1.mp4"
+    vid.parent.mkdir(parents=True, exist_ok=True)
+    vid.write_bytes(b"dummy")
+    wx_script = tmp_path / "wechat_upload.py"
+    wx_script.write_text("#!/usr/bin/env python3")
+
+    m = ProjectManifest(
+        project_id="test-wx-diag-reset",
+        source=MediaSource(
+            analysis_video=str(vid),
+            render_video=str(vid),
+            duration_s=60.0,
+            work_dir=str(tmp_path / "work"),
+            metadata_source="manual",
+            output_dir=str(tmp_path / "clips"),
+        ),
+        clips=[
+            ClipItem(
+                clip_id="clip_01",
+                index=1,
+                enabled=True,
+                title="切片1",
+                start_utt=0,
+                end_utt=1,
+                output_file=str(vid),
+                start_s=0.0,
+                end_s=10.0,
+            ),
+        ],
+    )
+    store.save(m)
+
+    wx_logs = [
+        ">>> 微信发布页加载失败或上传入口未出现；登录态可能仍有效。",
+        ">>> 请检查网络后重试；若连续失败，再执行可见登录命令：",
+        f">>> {sys.executable} -u {wx_script} --login",
+    ]
+    monkeypatch.setattr(pub_mod, "_run_publish_process", lambda cmd, env, ts, on_line: (1, wx_logs))
+    monkeypatch.setattr(pub_mod, "sync_platform_covers_for_target", lambda **kwargs: [])
+    monkeypatch.setattr(
+        pub_mod,
+        "_get_paths",
+        lambda: {"wechat": {"label": "微信视频号", "python": sys.executable, "script": wx_script}},
+    )
+
+    out_m = publish_to_platforms(
+        store=store,
+        target="clip_01",
+        platforms=["wechat"],
+        is_public=False,
+        ui_schema=2,
+    )
+    rec = out_m.clips[0].publish_records[0]
+    assert rec.status == "error"
+    assert rec.error_code == "page_load_failed"
+    assert "--login" not in (rec.error or "")
+    assert "重扫码" in rec.solution
+    assert "复位状态" in rec.solution
+
+    reset_m, removed = reset_publish_records(store, "clip_01", platform="wechat")
+    assert removed == ["wechat"]
+    assert reset_m.clips[0].publish_records == []
+    receipts = store.list_receipts(stage="publish", limit=20)
+    assert any(r.action == "reset_publish_records" for r in receipts)
+
+
+def test_publish_cancelled_marks_cancelled_with_solution(tmp_path, monkeypatch):
+    from clipcut.cancel import JobCancelToken, JobCancelledError
+    from clipcut.publish import publishers as pub_mod
+    from clipcut.publish.publishers import publish_to_platforms
+    from clipcut.receipts import ProjectStore
+
+    store = ProjectStore(tmp_path / "work")
+    vid = tmp_path / "clips" / "c1.mp4"
+    vid.parent.mkdir(parents=True, exist_ok=True)
+    vid.write_bytes(b"dummy")
+    bili_script = tmp_path / "bili_upload.py"
+    bili_script.write_text("#!/usr/bin/env python3")
+
+    m = ProjectManifest(
+        project_id="test-pub-cancel",
+        source=MediaSource(
+            analysis_video=str(vid),
+            render_video=str(vid),
+            duration_s=60.0,
+            work_dir=str(tmp_path / "work"),
+            metadata_source="manual",
+            output_dir=str(tmp_path / "clips"),
+        ),
+        clips=[
+            ClipItem(
+                clip_id="c1",
+                index=1,
+                enabled=True,
+                title="切片1",
+                start_utt=0,
+                end_utt=1,
+                output_file=str(vid),
+                start_s=0.0,
+                end_s=10.0,
+            ),
+        ],
+    )
+    store.save(m)
+
+    monkeypatch.setattr(pub_mod, "sync_platform_covers_for_target", lambda **kwargs: [])
+    monkeypatch.setattr(
+        pub_mod,
+        "_get_paths",
+        lambda: {"bilibili": {"label": "B站", "python": sys.executable, "script": bili_script}},
+    )
+
+    token = JobCancelToken()
+    token.cancel()
+
+    try:
+        publish_to_platforms(
+            store=store,
+            target="c1",
+            platforms=["bilibili"],
+            is_public=False,
+            ui_schema=2,
+            cancel_token=token,
+        )
+        raise AssertionError("expected JobCancelledError")
+    except JobCancelledError:
+        pass
+
+    loaded = store.load()
+    rec = loaded.clips[0].publish_records[0]
+    assert rec.status == "error"
+    assert rec.error_code == "cancelled"
+    assert "复位状态" in rec.solution
+
+
+def test_default_target_descriptions_are_editorial_and_parameter_free(tmp_path: Path):
+    from clipcut.models import CleanCutConfig, CompilationConfig, CutSegment
+    from clipcut.publish.publishers import _default_target_metadata
+
+    m = ProjectManifest(
+        project_id="test-editorial-desc",
+        source=MediaSource(
+            analysis_video=str(tmp_path / "src.mp4"),
+            render_video=str(tmp_path / "src.mp4"),
+            duration_s=1800.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        metadata=VideoMetadata(
+            original_title="Full Interview",
+            guest_zh="张三",
+            channel_zh="科技财经台",
+            original_theme_zh="AI基础设施与芯片供应链演进",
+        ),
+        topic_map=[
+            TopicMapItem(topic_id="T01", start_utt=0, end_utt=2, is_filler=True, title="开场寒暄", summary="寒暄"),
+            TopicMapItem(topic_id="T02", start_utt=3, end_utt=5, is_filler=False, title="话题一：算力瓶颈", summary="讨论数据中心电力限制"),
+            TopicMapItem(topic_id="T03", start_utt=6, end_utt=8, is_filler=False, title="话题二：芯片架构", summary="拆解新一代封装工艺"),
+            TopicMapItem(topic_id="T04", start_utt=9, end_utt=11, is_filler=False, title="话题三：开源生态", summary="比较软硬件协同壁垒"),
+            TopicMapItem(topic_id="T05", start_utt=12, end_utt=14, is_filler=False, title="话题四：企业落地", summary="分析企业部署投资回报"),
+            TopicMapItem(topic_id="T06", start_utt=15, end_utt=17, is_filler=False, title="话题五：供应链回流", summary="评估区域制造协同变化"),
+            TopicMapItem(topic_id="T07", start_utt=18, end_utt=20, is_filler=False, title="话题六：安全治理", summary="探讨合规与访问控制边界"),
+            TopicMapItem(topic_id="T08", start_utt=21, end_utt=23, is_filler=False, title="话题七：长期预测", summary="展望未来五年行业格局"),
+        ],
+        clips=[
+            ClipItem(clip_id=f"clip_0{i}", index=i, enabled=False, title=f"精选主题{i}", summary=f"第{i}段摘要", start_utt=i * 2, end_utt=i * 2 + 1, start_s=float(i * 10), end_s=float(i * 10 + 8))
+            for i in range(1, 6)
+        ],
+        remix=RemixConfig(
+            enabled=True,
+            title="AI基建高光混剪",
+            editorial_thesis="聚焦硬核主题，舍弃旁支寒暄，避免流水账。",
+            items=[
+                RemixItem(remix_id="rmx_01", order=1, enabled=True, group_label="算力", card_title="主题A：算力真实瓶颈", start_utt=0, end_utt=1, start_s=0.0, end_s=5.0),
+                RemixItem(remix_id="rmx_02", order=2, enabled=True, group_label="算力", card_title="主题A：算力真实瓶颈", start_utt=1, end_utt=2, start_s=5.0, end_s=10.0),
+                RemixItem(remix_id="rmx_03", order=3, enabled=True, group_label="生态", card_title="主题B：软硬协同壁垒", start_utt=2, end_utt=3, start_s=10.0, end_s=15.0),
+                RemixItem(remix_id="rmx_04", order=4, enabled=True, group_label="生态", card_title="主题B：软硬协同壁垒", start_utt=3, end_utt=4, start_s=15.0, end_s=20.0),
+                RemixItem(remix_id="rmx_05", order=5, enabled=True, group_label="落地", card_title="主题C：企业部署回报", start_utt=4, end_utt=5, start_s=20.0, end_s=25.0),
+                RemixItem(remix_id="rmx_06", order=6, enabled=True, group_label="落地", card_title="主题C：企业部署回报", start_utt=5, end_utt=6, start_s=25.0, end_s=30.0),
+            ],
+        ),
+        compilation=CompilationConfig(
+            enabled=True,
+            title="精选五讲合辑",
+            clip_ids=[f"clip_0{i}" for i in range(1, 6)],
+        ),
+        cut_segments=[
+            CutSegment(cut_id="cut_1", kind="ad", enabled=True, start_s=1.0, end_s=2.0),
+            CutSegment(cut_id="cut_2", kind="political_sensitive", enabled=True, start_s=3.0, end_s=4.0),
+        ],
+        clean_cut=CleanCutConfig(
+            enabled=True,
+            title="AI基建访谈（净版）",
+            cut_ads=True,
+            cut_political_sensitive=True,
+        ),
+    )
+
+    _, _, _, cc_desc, _, _ = _default_target_metadata(m, "clean_cut")
+    assert "张三" in cc_desc
+    assert "科技财经台" in cc_desc
+    assert "AI基础设施与芯片供应链演进" in cc_desc
+    assert "话题一：算力瓶颈" in cc_desc
+    for banned in ("广告", "删敏", "遮蔽", "已智能剪除", "完整合规净版"):
+        assert banned not in cc_desc
+
+    _, _, _, rmx_desc, _, _ = _default_target_metadata(m, "remix")
+    assert "混剪" in rmx_desc
+    assert "舍弃旁支" not in rmx_desc
+    for label in ("主题A：算力真实瓶颈", "主题B：软硬协同壁垒", "主题C：企业部署回报"):
+        assert rmx_desc.count(label) == 1
+
+    _, _, _, cmp_desc, _, _ = _default_target_metadata(m, "compilation")
+    assert "精选片段" in cmp_desc
+    assert "独立切片" not in cmp_desc
+    for i in range(1, 6):
+        assert f"精选主题{i}" in cmp_desc
+
+    # Precedence: metadata.full_summary_zh overrides deterministic full-video composition; clean_cut.publish_desc overrides metadata.full_summary_zh
+    m.metadata.full_summary_zh = "这是一段 Pass 1 生成的全片精炼介绍。"
+    assert _default_target_metadata(m, "clean_cut")[3] == "这是一段 Pass 1 生成的全片精炼介绍。"
+    m.clean_cut.publish_desc = "这是一段用户定制的净版发布简介。"
+    assert _default_target_metadata(m, "clean_cut")[3] == "这是一段用户定制的净版发布简介。"
+
+
+def test_suggest_publish_desc_endpoint_and_stale_invalidation(tmp_path: Path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import clipcut.api.server as srv
+    from clipcut.api.server import app
+    from clipcut.llm import ClipCutLLM
+    from clipcut.models import CleanCutConfig, CompilationConfig
+
+    store = ProjectStore(tmp_path / "work")
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"mp4")
+    m = ProjectManifest(
+        project_id="test-suggest-desc",
+        source=MediaSource(
+            analysis_video=str(src),
+            render_video=str(src),
+            duration_s=120.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        metadata=VideoMetadata(
+            original_title="Demo",
+            guest_zh="李四",
+            channel_zh="前沿频道",
+            original_theme_zh="企业智能体落地",
+        ),
+        topic_map=[
+            TopicMapItem(topic_id="T01", start_utt=0, end_utt=1, is_filler=False, title="核心议题", summary="拆解落地方法"),
+        ],
+        clips=[
+            ClipItem(clip_id="clip_01", index=1, enabled=True, title="第一支亮点", summary="亮点摘要1", start_utt=0, end_utt=1, start_s=0.0, end_s=10.0),
+            ClipItem(clip_id="clip_02", index=2, enabled=True, title="第二支亮点", summary="亮点摘要2", start_utt=1, end_utt=2, start_s=10.0, end_s=20.0),
+        ],
+        remix=RemixConfig(
+            enabled=True,
+            title="智能体高光混剪",
+            render_hash="rmx_hash_keep",
+            items=[
+                RemixItem(remix_id="rmx_01", order=1, enabled=True, source_clip_id="clip_01", card_title="亮点一", start_utt=0, end_utt=1, start_s=0.0, end_s=10.0),
+            ],
+        ),
+        compilation=CompilationConfig(
+            enabled=True,
+            title="智能体合辑",
+            clip_ids=["clip_01", "clip_02"],
+            render_hash="cmp_hash_keep",
+        ),
+        clean_cut=CleanCutConfig(
+            enabled=True,
+            title="企业智能体落地（净版）",
+            render_hash="cc_hash_keep",
+        ),
+    )
+    store.save(m)
+    monkeypatch.setattr(srv, "_get_store", lambda pid: store)
+
+    calls: list[str] = []
+
+    def fake_generate_json(self, *, prompt: str, **_kwargs):
+        calls.append(prompt)
+        if "全片完整版" in prompt:
+            txt = "本期李四做客前沿频道，围绕企业智能体落地的方法论与组织适配展开完整探讨。"
+        elif "高光混剪" in prompt:
+            txt = "本视频为李四访谈的高光混剪，串联核心亮点一等高能判断。"
+        else:
+            txt = "本视频为李四访谈的精选片段合辑，收录第一支亮点与第二支亮点等精彩内容。"
+        return type("Resp", (), {"parsed": {"description": txt}, "provider": "mock", "model": "mock-1", "elapsed_ms": 12})()
+
+    monkeypatch.setattr(ClipCutLLM, "generate_json", fake_generate_json)
+    client = TestClient(app)
+
+    r_cc = client.post("/api/projects/test-suggest-desc/publish/suggest-desc", json={"target": "clean_cut"})
+    assert r_cc.status_code == 200
+    assert "企业智能体落地" in r_cc.json()["desc"]
+    m_after = store.load()
+    assert m_after.clean_cut.publish_desc == r_cc.json()["desc"]
+    assert m_after.metadata.full_summary_zh == r_cc.json()["desc"]
+    assert m_after.clean_cut.render_hash == "cc_hash_keep"
+
+    r_rmx = client.post("/api/projects/test-suggest-desc/publish/suggest-desc", json={"target": "remix"})
+    assert r_rmx.status_code == 200
+    assert "高光混剪" in r_rmx.json()["desc"]
+    assert store.load().remix.publish_desc == r_rmx.json()["desc"]
+    assert store.load().remix.render_hash == "rmx_hash_keep"
+
+    r_cmp = client.post("/api/projects/test-suggest-desc/publish/suggest-desc", json={"target": "compilation"})
+    assert r_cmp.status_code == 200
+    assert "精选片段合辑" in r_cmp.json()["desc"]
+    assert store.load().compilation.publish_desc == r_cmp.json()["desc"]
+    assert store.load().compilation.render_hash == "cmp_hash_keep"
+
+    # Editing compilation clips or remix items clears stale publish_desc
+    r_patch_cmp = client.patch("/api/projects/test-suggest-desc/compilation", json={"clip_ids": ["clip_01"]})
+    assert r_patch_cmp.status_code == 200
+    assert r_patch_cmp.json()["manifest"]["compilation"]["publish_desc"] == ""
+
+    r_patch_rmx = client.patch(
+        "/api/projects/test-suggest-desc/remix",
+        json={"items": [{"remix_id": "rmx_01", "enabled": False}]},
+    )
+    assert r_patch_rmx.status_code == 200
+    assert r_patch_rmx.json()["manifest"]["remix"]["publish_desc"] == ""
+    assert len(calls) == 3
 
 
 
@@ -1981,3 +2427,222 @@ def test_orchestrator_cancel_resets_stage_to_idle_and_writes_receipt(tmp_path, m
 
 
 
+
+
+
+
+
+def test_compose_nav_bar_overlay_image_highlights_active_segment():
+    from clipcut.render.renderer import compose_nav_bar_overlay_image
+
+    labels = ["黄仁勋为何不可替代", "创始人没有继任", "AI是乐器而非加速器", "软件近乎零bug", "创业改善生活"]
+    img0 = compose_nav_bar_overlay_image(width=1920, height=1080, labels=labels, active_index=0)
+    img2 = compose_nav_bar_overlay_image(width=1920, height=1080, labels=labels, active_index=2)
+    assert img0.mode == "RGBA"
+    assert img0.size[0] == 1920
+    assert 68 <= img0.size[1] <= 100
+    assert img0.tobytes() != img2.tobytes()
+
+    # Check active slot has bright Tiffany-cyan highlight vs dark inactive slot
+    import numpy as np
+
+    arr = np.asarray(img0)
+    slot_w = 1920 // len(labels)
+    active_mean_g = float(arr[:, 30 : slot_w - 30, 1].mean())
+    inactive_mean_g = float(arr[:, slot_w * 3 + 30 : slot_w * 4 - 30, 1].mean())
+    assert active_mean_g > inactive_mean_g + 60
+    assert arr[img0.size[1] // 2, slot_w * 3 + 20, 3] >= 200  # dark frosted bar stays opaque, not overwritten by low alpha
+
+    # Verify custom color schemes work for both top_nav and title_card
+    from clipcut.render.renderer import compose_pip_card_image, resolve_nav_palette
+
+    pal_custom = resolve_nav_palette("custom", "#ef4444")
+    assert pal_custom["accent_rgb"] == (239, 68, 68)
+    img_red = compose_nav_bar_overlay_image(
+        width=1280,
+        height=720,
+        labels=["分段一", "分段二"],
+        active_index=0,
+        color_scheme="custom",
+        custom_accent="#EF4444",
+    )
+    arr_red = np.asarray(img_red)
+    assert float(arr_red[:, 30:600, 0].mean()) > float(arr_red[:, 30:600, 2].mean()) + 60
+
+    card_cobalt = compose_pip_card_image(
+        width=1280,
+        height=720,
+        index_text="",
+        group_label="重点对话",
+        card_title="测试卡片自定义色系",
+        meta_parts=["2026-11-25"],
+        left_meta_lines=["论断"],
+        portrait_frame=None,
+        enable_pip=False,
+        color_scheme="cobalt",
+    )
+    assert card_cobalt.size == (1280, 720)
+
+    # Verify natural cover image also follows customized color_scheme
+    from PIL import Image
+    from clipcut.render.renderer import render_natural_cover_image
+
+    blank = Image.new("RGB", (1280, 720), (40, 40, 40))
+    cov_tiffany = render_natural_cover_image(
+        frame_img=blank,
+        faces=[],
+        width=1280,
+        height=720,
+        badge_text="#01 重点对话",
+        dur_text="02:30",
+        title="封面色系联动测试",
+        meta_parts=["2026-11-25"],
+        color_scheme="tiffany",
+    )
+    cov_violet = render_natural_cover_image(
+        frame_img=blank,
+        faces=[],
+        width=1280,
+        height=720,
+        badge_text="#01 重点对话",
+        dur_text="02:30",
+        title="封面色系联动测试",
+        meta_parts=["2026-11-25"],
+        color_scheme="violet",
+    )
+    assert cov_tiffany.tobytes() != cov_violet.tobytes()
+
+    # Verify 9:16 portrait layout overlay puts title in top black bar, transparent window in center, nav in bottom bar
+    from clipcut.render.renderer import compose_portrait_frame_overlay_image
+
+    ov, vy, vh = compose_portrait_frame_overlay_image(
+        width=1080,
+        height=1920,
+        title="黄仁勋不可替代与AI重写软件工程",
+        subtitle="Tobi Lütke · David Senra",
+        badge_text="精选合辑",
+        labels=labels,
+        active_index=1,
+        show_nav=True,
+        color_scheme="tiffany",
+    )
+    assert ov.size == (1080, 1920)
+    ov_arr = np.asarray(ov)
+    assert int(ov_arr[vy + vh // 2, 540, 3]) == 0  # center video window must be transparent
+    assert int(ov_arr[100, 540, 3]) == 255  # top black bar opaque
+    assert int(ov_arr[1800, 540, 3]) == 255  # bottom black bar opaque
+
+    # Verify portrait PiP title card renders cleanly at 1080x1920
+    p_card = compose_pip_card_image(
+        width=1080,
+        height=1920,
+        index_text="",
+        group_label="重点对话",
+        card_title="竖版段前卡片测试",
+        meta_parts=["2026-11-25"],
+        left_meta_lines=["论断"],
+        portrait_frame=None,
+        enable_pip=False,
+        color_scheme="amber",
+    )
+    assert p_card.size == (1080, 1920)
+
+    # Verify many segments (12) still render cleanly without error
+    many = compose_nav_bar_overlay_image(
+        width=1280,
+        height=720,
+        labels=[f"测试分段标题很长{i}" for i in range(12)],
+        active_index=11,
+    )
+    assert many.size[0] == 1280
+
+
+def test_remix_four_source_modes_and_cancellable_ffmpeg(tmp_path):
+    import threading
+    import time
+    from clipcut.cancel import JobCancelToken, JobCancelledError, use_cancel_token
+    from clipcut.models import CompilationConfig, RemixConfig
+    from clipcut.pipeline.verify_and_plan import get_remix_source_clips, resolve_remix_source_mode
+    from clipcut.render.renderer import _run_ffmpeg_encode
+
+    # 1. Verify all 4 Remix source modes
+    m = ProjectManifest(
+        project_id="test-remix-4modes",
+        source=MediaSource(
+            analysis_video=str(tmp_path / "v.mp4"),
+            render_video=str(tmp_path / "v.mp4"),
+            duration_s=600.0,
+            work_dir=str(tmp_path / "work"),
+            output_dir=str(tmp_path / "clips"),
+        ),
+        clips=[
+            ClipItem(clip_id="c1", index=1, enabled=True, title="C1", start_utt=0, end_utt=1, start_s=0.0, end_s=10.0),
+            ClipItem(clip_id="c2", index=2, enabled=True, title="C2", start_utt=2, end_utt=3, start_s=10.0, end_s=20.0),
+            ClipItem(clip_id="c3", index=3, enabled=False, title="C3", start_utt=4, end_utt=5, start_s=20.0, end_s=30.0),
+        ],
+        compilation=CompilationConfig(enabled=True, clip_ids=["c2", "c3"]),
+        remix=RemixConfig(enabled=True, source_mode="compilation"),
+    )
+
+    assert resolve_remix_source_mode(m) == "compilation"
+    c_clips, c_filt = get_remix_source_clips(m)
+    assert [c.clip_id for c in c_clips] == ["c2", "c3"] and c_filt is True
+
+    m.remix.source_mode = "manual_clips"
+    m.remix.source_clip_ids = ["c1"]
+    m_clips, m_filt = get_remix_source_clips(m)
+    assert [c.clip_id for c in m_clips] == ["c1"] and m_filt is True
+
+    m.remix.source_mode = "prompt"
+    m.remix.custom_prompt = "只提取关于AI替代程序员的观点"
+    p_clips, p_filt = get_remix_source_clips(m)
+    assert [c.clip_id for c in p_clips] == ["c1", "c2", "c3"] and p_filt is False
+
+    m.remix.source_mode = "ai_auto"
+    a_clips, a_filt = get_remix_source_clips(m)
+    assert [c.clip_id for c in a_clips] == ["c1", "c2", "c3"] and a_filt is False
+
+    # 2. Verify _run_ffmpeg_encode aborts immediately (<1.5s) when cancel token fires
+    token = JobCancelToken()
+    t0 = time.monotonic()
+
+    def _trigger_cancel():
+        time.sleep(0.15)
+        token.cancel()
+
+    threading.Thread(target=_trigger_cancel, daemon=True).start()
+    raised = False
+    try:
+        with use_cancel_token(token):
+            _run_ffmpeg_encode(["sleep", "30"], ["sleep", "30"], use_vt=True)
+    except JobCancelledError:
+        raised = True
+    elapsed = time.monotonic() - t0
+    assert raised is True
+    assert elapsed < 1.5
+
+
+def test_wrap_title_smart_avoids_dangling_and_breaks_before_brackets():
+    from PIL import Image, ImageDraw
+    from clipcut.render.renderer import _load_cjk_font, _wrap_title_smart
+
+    img = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font = _load_cjk_font(72, weight="heavy")
+
+    # 1. Bracketed suffix must break right before '（', never leaving '（中' at end of line 1
+    t1 = "黄仁勋不可替代与AI重塑软件（中长集锦）"
+    # Width wide enough for ~16 chars (would greedily put "（中" on line 1)
+    max_w = int(draw.textbbox((0, 0), "黄仁勋不可替代与AI重塑软件（中", font=font)[2]) + 4
+    lines1 = _wrap_title_smart(draw, t1, font, max_w, max_lines=2)
+    assert len(lines1) == 2
+    assert lines1[0] == "黄仁勋不可替代与AI重塑软件"
+    assert lines1[1] == "（中长集锦）"
+
+    # 2. Avoid 1-2 char dangling orphan on line 2
+    t2 = "AI将彻底重塑软件工程与生产力鸿沟"
+    max_w2 = int(draw.textbbox((0, 0), "AI将彻底重塑软件工程与生产力鸿", font=font)[2]) + 4
+    lines2 = _wrap_title_smart(draw, t2, font, max_w2, max_lines=2)
+    assert len(lines2) == 2
+    assert len(lines2[1]) >= 4
+    assert len(lines2[0]) >= 4
