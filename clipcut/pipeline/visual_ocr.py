@@ -6,6 +6,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import subprocess
 import tempfile
 from typing import Any
 
@@ -333,38 +334,97 @@ def _run_ocr_on_frames(
     return {}, "none"
 
 
-def _probe_keyframe_pts(video_path: Path) -> list[float]:
-    res = run_cancellable_subprocess(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-skip_frame",
-            "nokey",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "frame=pts_time",
-            "-of",
-            "csv=p=0",
-            str(video_path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=45,
-    )
-    if res.returncode != 0 or not res.stdout.strip():
-        return []
+def _parse_packet_keyframe_csv(stdout: str) -> list[float]:
     pts: list[float] = []
-    for line in res.stdout.splitlines():
+    for line in (stdout or "").splitlines():
         raw = line.strip()
-        if not raw or raw == "N/A":
+        if not raw:
+            continue
+        parts = raw.split(",")
+        if len(parts) < 2:
+            continue
+        if "K" not in parts[1]:
+            continue
+        ts_str = parts[0].strip()
+        if not ts_str or ts_str == "N/A":
             continue
         try:
-            pts.append(float(raw))
+            pts.append(float(ts_str))
         except ValueError:
             continue
     return pts
+
+
+def _parse_frame_pts_csv(stdout: str) -> list[float]:
+    pts: list[float] = []
+    for line in (stdout or "").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        # FFmpeg 7/8 csv=p=0 may append trailing commas (e.g. "0.040000,") when side_data exists.
+        ts_str = raw.split(",", 1)[0].strip()
+        if not ts_str or ts_str == "N/A":
+            continue
+        try:
+            pts.append(float(ts_str))
+        except ValueError:
+            continue
+    return pts
+
+
+def _probe_keyframe_pts(video_path: Path) -> list[float]:
+    # Fast path: packet-level header scan (no frame decoding, ~10x faster on long videos).
+    try:
+        pkt_res = run_cancellable_subprocess(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts_time,flags",
+                "-of",
+                "csv=p=0",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        if pkt_res.returncode == 0 and pkt_res.stdout.strip():
+            pts = _parse_packet_keyframe_csv(pkt_res.stdout)
+            if pts:
+                return pts
+    except subprocess.TimeoutExpired:
+        pass
+
+    # Fallback: frame-level keyframe scan
+    try:
+        res = run_cancellable_subprocess(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-skip_frame",
+                "nokey",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "frame=pts_time",
+                "-of",
+                "csv=p=0",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except subprocess.TimeoutExpired:
+        return []
+    if res.returncode != 0 or not res.stdout.strip():
+        return []
+    return _parse_frame_pts_csv(res.stdout)
 
 
 def _extract_matched_boxes(
@@ -564,7 +624,20 @@ def detect_visual_ocr_redline_segments(
                 str(coarse_dir / "c_%05d.jpg"),
             ]
 
-        ext_res = run_cancellable_subprocess(cmd, capture_output=True, text=True, timeout=180)
+        extract_timeout = max(180, int(eff_dur * 0.15) + 120)
+        try:
+            ext_res = run_cancellable_subprocess(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=extract_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            if log_fn:
+                log_fn(
+                    f"[clean_cut] 画面文字 OCR 抽帧超时（>{extract_timeout}s，mode={'nokey' if use_nokey else 'fps'}），已跳过画面文字扫描"
+                )
+            return []
         if ext_res.returncode != 0:
             return []
         coarse_imgs = sorted(coarse_dir.glob("c_*.jpg"))

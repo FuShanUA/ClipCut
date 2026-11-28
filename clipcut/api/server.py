@@ -20,8 +20,17 @@ from pydantic import BaseModel, Field
 from ..adapters.ingest import ingest_source, resolve_work_dir, scan_input_path
 from ..cancel import JobCancelToken, JobCancelledError, use_cancel_token
 from ..config import PROJECT_ROOT, load_editorial_config, load_editorial_raw, save_editorial_config, save_editorial_raw
+from ..crop import is_full_frame, resolve_effective_crop, sanitize_crop_rect
 from ..llm import MODEL_CATALOG, parse_provider_model
-from ..models import CutSegment, ProjectManifest, PublishRecord, RemixItem, SubtitleRepairItem, utc_now_iso
+from ..models import (
+    ClipCropOverride,
+    CutSegment,
+    ProjectManifest,
+    PublishRecord,
+    RemixItem,
+    SubtitleRepairItem,
+    utc_now_iso,
+)
 from ..pipeline.content_filter import (
     DEFAULT_POLITICAL_PROFILES,
     VALID_POLITICAL_ACTIONS,
@@ -410,6 +419,15 @@ class PatchClipRequest(BaseModel):
     title_en: str | None = None
     start_utt: int | None = None
     end_utt: int | None = None
+    crop_override: ClipCropOverride | None = None
+
+
+class PatchCropRequest(BaseModel):
+    enabled: bool | None = None
+    x: float | None = None
+    y: float | None = None
+    w: float | None = None
+    h: float | None = None
 
 
 class PatchRemixItem(BaseModel):
@@ -680,7 +698,11 @@ def open_project(req: OpenProjectRequest):
                 run_id=f"open_{uuid.uuid4().hex[:6]}",
             )
             manifest.stages["ingest"].status = "completed"
-            manifest.stages["ingest"].message = f"字幕 {len(manifest.utterances)} 句 / 章节 {len(manifest.metadata.chapters)} 个"
+            manifest.stages["ingest"].message = (
+                f"字幕 {len(manifest.utterances)} 句 / 章节 {len(manifest.metadata.chapters)} 个"
+                if manifest.utterances
+                else "无字幕模式（支持画面裁剪与全片导出）"
+            )
             store.save(manifest)
 
         _register_project(
@@ -706,7 +728,7 @@ def get_project(project_id: str):
     )
     if not bool(job.get("running")) and manifest.clean_cut.enabled:
         cfg = load_editorial_config()
-        if not get_active_cut_segments(manifest, cfg):
+        if not get_active_cut_segments(manifest, cfg) and resolve_effective_crop(manifest) is None:
             manifest.clean_cut.enabled = False
             sync_all_render_hashes(manifest, cfg=cfg)
             store.save(manifest)
@@ -1052,6 +1074,7 @@ def patch_clip(project_id: str, clip_id: str, req: PatchClipRequest):
         "end_utt": target.end_utt,
         "start_s": target.start_s,
         "end_s": target.end_s,
+        "crop_override": target.crop_override.model_dump() if target.crop_override else None,
     }
     store.save_undo_snapshot(manifest, f"修改切片 {clip_id}")
 
@@ -1072,6 +1095,18 @@ def patch_clip(project_id: str, clip_id: str, req: PatchClipRequest):
             cover_title_changed = True
     if req.title_en is not None:
         target.title_en = req.title_en.strip()
+    if req.crop_override is not None:
+        ov = req.crop_override
+        if ov.mode == "inherit":
+            target.crop_override = None
+        elif ov.mode == "none":
+            target.crop_override = ClipCropOverride(mode="none")
+        else:
+            sx, sy, sw, sh = sanitize_crop_rect(ov.x, ov.y, ov.w, ov.h)
+            if is_full_frame(sx, sy, sw, sh):
+                target.crop_override = ClipCropOverride(mode="none")
+            else:
+                target.crop_override = ClipCropOverride(mode="custom", x=sx, y=sy, w=sw, h=sh)
 
     bounds_changed = False
     if req.start_utt is not None:
@@ -1108,6 +1143,7 @@ def patch_clip(project_id: str, clip_id: str, req: PatchClipRequest):
         active_cuts,
         manifest.source.subtitle_sha256,
         mask_payload=clip_masks,
+        crop_rect=resolve_effective_crop(manifest, target),
     )
     enabled_changed = req.enabled is not None and target.enabled != before["enabled"]
     _sync_derived_hashes_after_clip_change(manifest, mark_remix_stale=(enabled_changed or bounds_changed))
@@ -1125,6 +1161,7 @@ def patch_clip(project_id: str, clip_id: str, req: PatchClipRequest):
         "end_utt": target.end_utt,
         "start_s": target.start_s,
         "end_s": target.end_s,
+        "crop_override": target.crop_override.model_dump() if target.crop_override else None,
     }
     store.append_receipt(
         run_id=f"human_{uuid.uuid4().hex[:6]}",
@@ -1564,6 +1601,52 @@ def patch_metadata(project_id: str, req: PatchMetadataRequest):
     return {"manifest": manifest.model_dump()}
 
 
+@app.patch("/api/projects/{project_id}/crop")
+def patch_project_crop(project_id: str, req: PatchCropRequest):
+    store = _get_store(project_id)
+    manifest = store.load()
+    cfg = load_editorial_config()
+    store.save_undo_snapshot(manifest, "调整全局画面裁剪")
+
+    cur = manifest.crop
+    nx = cur.x if req.x is None else float(req.x)
+    ny = cur.y if req.y is None else float(req.y)
+    nw = cur.w if req.w is None else float(req.w)
+    nh = cur.h if req.h is None else float(req.h)
+    sx, sy, sw, sh = sanitize_crop_rect(nx, ny, nw, nh)
+    next_enabled = cur.enabled if req.enabled is None else bool(req.enabled)
+    if next_enabled and is_full_frame(sx, sy, sw, sh):
+        next_enabled = False
+        sx, sy, sw, sh = 0.0, 0.0, 1.0, 1.0
+
+    manifest.crop.enabled = next_enabled
+    manifest.crop.x = sx
+    manifest.crop.y = sy
+    manifest.crop.w = sw
+    manifest.crop.h = sh
+
+    has_active_cuts = bool(get_active_cut_segments(manifest, cfg))
+    has_crop = resolve_effective_crop(manifest) is not None
+    if has_crop and not manifest.clips:
+        manifest.clean_cut.enabled = True
+    elif not has_active_cuts and not has_crop:
+        manifest.clean_cut.enabled = False
+
+    sync_all_render_hashes(manifest, cfg=cfg)
+    store.save(manifest)
+    store.append_receipt(
+        run_id=f"human_{uuid.uuid4().hex[:6]}",
+        stage="human_edit",
+        actor="human",
+        action="edit_project_crop",
+        summary=(
+            f"全局画面裁剪{'已启用' if manifest.crop.enabled else '已关闭'}"
+            + (f" ({sx:.2f}, {sy:.2f}, {sw:.2f}x{sh:.2f})" if manifest.crop.enabled else "")
+        ),
+    )
+    return {"manifest": manifest.model_dump()}
+
+
 @app.patch("/api/projects/{project_id}/clean-cut")
 def patch_clean_cut(project_id: str, req: PatchCleanCutRequest):
     store = _get_store(project_id)
@@ -1734,7 +1817,7 @@ def patch_clean_cut(project_id: str, req: PatchCleanCutRequest):
         cc.cut_ads = False
     if not has_pol:
         cc.cut_political_sensitive = False
-    if not get_active_cut_segments(manifest, cfg):
+    if not get_active_cut_segments(manifest, cfg) and resolve_effective_crop(manifest) is None:
         cc.enabled = False
 
     sync_all_render_hashes(manifest, cfg=cfg)
@@ -1777,12 +1860,12 @@ def render_clean_cut_endpoint(project_id: str, force: bool = False):
     store = _get_store(project_id)
     cfg = load_editorial_config()
     manifest_chk = store.load()
-    if not get_active_cut_segments(manifest_chk, cfg):
+    if not get_active_cut_segments(manifest_chk, cfg) and resolve_effective_crop(manifest_chk) is None:
         if manifest_chk.clean_cut.enabled:
             manifest_chk.clean_cut.enabled = False
             sync_all_render_hashes(manifest_chk, cfg=cfg)
             store.save(manifest_chk)
-        raise HTTPException(status_code=400, detail="当前没有任何需要剪切或脱敏的内容，无需输出全片净版")
+        raise HTTPException(status_code=400, detail="当前没有任何需要剪切、脱敏或画面裁剪的内容，无需输出全片净版")
     return _launch_target_render_job(
         project_id,
         store,

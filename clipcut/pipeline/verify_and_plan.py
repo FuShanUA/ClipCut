@@ -11,11 +11,13 @@ from typing import Any
 import numpy as np
 
 from ..cancel import JobCancelledError, check_cancelled, run_cancellable_subprocess
+from ..crop import crop_hash_payload, resolve_effective_crop
 from ..llm import ClipCutLLM, DEFAULT_MULTIMODAL_FALLBACK_MODELS, DEFAULT_TEXT_FALLBACK_MODELS
 from ..models import (
     Candidate,
     Chapter,
     ClipItem,
+    CropRect,
     MultimodalVerdict,
     ProjectManifest,
     RemixItem,
@@ -168,6 +170,7 @@ def compute_clip_render_hash(
     cut_spans: list[tuple[float, float]] | None = None,
     subtitle_sha256: str = "",
     mask_payload: list[dict[str, Any]] | None = None,
+    crop_rect: CropRect | None = None,
 ) -> str:
     payload: dict[str, Any] = {
         "video": render_video,
@@ -184,6 +187,8 @@ def compute_clip_render_hash(
         payload["cut_spans"] = [[s, e] for s, e in ov]
     if mask_payload:
         payload["masks"] = mask_payload
+    if (cp := crop_hash_payload(crop_rect)) is not None:
+        payload["crop"] = cp
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
@@ -989,6 +994,24 @@ def compute_remix_render_hash(manifest: ProjectManifest) -> str:
     r = manifest.remix
     enabled_items = [it for it in sorted(r.items, key=lambda x: x.order) if it.enabled]
     nav_fields = _resolve_nav_hash_fields("remix")
+    clip_by_id = {c.clip_id: c for c in manifest.clips}
+    proj_cp = crop_hash_payload(resolve_effective_crop(manifest))
+    item_entries: list[dict[str, Any]] = []
+    for it in enabled_items:
+        entry: dict[str, Any] = {
+            "id": it.remix_id,
+            "order": it.order,
+            "theme_id": it.theme_id,
+            "group": it.group_label,
+            "card": it.card_title,
+            "start_s": round(it.start_s, 3),
+            "end_s": round(it.end_s, 3),
+        }
+        src_clip = clip_by_id.get(it.source_clip_id) if it.source_clip_id else None
+        item_cp = crop_hash_payload(resolve_effective_crop(manifest, src_clip))
+        if item_cp != proj_cp:
+            entry["crop"] = item_cp
+        item_entries.append(entry)
     payload: dict[str, Any] = {
         "video": manifest.source.render_video,
         "card_template": "v6-top-nav-bar" if nav_fields["nav_style"] in ("top_nav", "both") else "v6-title-card",
@@ -1005,19 +1028,10 @@ def compute_remix_render_hash(manifest: ProjectManifest) -> str:
         "sfx_volume": r.sfx_volume,
         "bgm_path": r.bgm_path,
         "sfx_path": r.sfx_path,
-        "items": [
-            {
-                "id": it.remix_id,
-                "order": it.order,
-                "theme_id": it.theme_id,
-                "group": it.group_label,
-                "card": it.card_title,
-                "start_s": round(it.start_s, 3),
-                "end_s": round(it.end_s, 3),
-            }
-            for it in enabled_items
-        ],
+        "items": item_entries,
     }
+    if proj_cp is not None:
+        payload["crop"] = proj_cp
     if manifest.clean_cut.apply_to_clips:
         intervals = [(it.start_s, it.end_s) for it in enabled_items]
         hit_del, hit_masks = _collect_interval_filters(intervals, manifest)
@@ -1036,6 +1050,20 @@ def compute_compilation_render_hash(manifest: ProjectManifest) -> str:
     comp = manifest.compilation
     enabled_clips = get_compilation_clips(manifest)
     nav_fields = _resolve_nav_hash_fields("compilation")
+    proj_cp = crop_hash_payload(resolve_effective_crop(manifest))
+    clip_entries: list[dict[str, Any]] = []
+    for c in enabled_clips:
+        entry: dict[str, Any] = {
+            "id": c.clip_id,
+            "title": c.title,
+            "cover_title": c.cover_title,
+            "start_s": round(c.start_s, 3),
+            "end_s": round(c.end_s, 3),
+        }
+        clip_cp = crop_hash_payload(resolve_effective_crop(manifest, c))
+        if clip_cp != proj_cp:
+            entry["crop"] = clip_cp
+        clip_entries.append(entry)
     payload: dict[str, Any] = {
         "video": manifest.source.render_video,
         "nav_template": "v6-top-nav-bar" if nav_fields["nav_style"] in ("top_nav", "both") else "v6-title-card",
@@ -1047,17 +1075,10 @@ def compute_compilation_render_hash(manifest: ProjectManifest) -> str:
         "cover_title": comp.cover_title,
         "card_duration_s": comp.card_duration_s,
         "card_fade_s": comp.card_fade_s,
-        "clips": [
-            {
-                "id": c.clip_id,
-                "title": c.title,
-                "cover_title": c.cover_title,
-                "start_s": round(c.start_s, 3),
-                "end_s": round(c.end_s, 3),
-            }
-            for c in enabled_clips
-        ],
+        "clips": clip_entries,
     }
+    if proj_cp is not None:
+        payload["crop"] = proj_cp
     if manifest.clean_cut.apply_to_clips:
         intervals = [(c.start_s, c.end_s) for c in enabled_clips]
         hit_del, hit_masks = _collect_interval_filters(intervals, manifest)
@@ -2230,6 +2251,7 @@ def run_verify_and_plan_stage(
             active_cuts,
             manifest.source.subtitle_sha256,
             mask_payload=clip_masks,
+            crop_rect=resolve_effective_crop(manifest, clip),
         )
         clips.append(clip)
         cand.disposition = "selected"

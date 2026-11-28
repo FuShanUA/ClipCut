@@ -134,6 +134,22 @@ export interface PlatformStatus {
   login_message?: string;
 }
 
+export interface CropConfig {
+  enabled: boolean;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface ClipCropOverride {
+  mode: "inherit" | "custom" | "none";
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface ClipItem {
   clip_id: string;
   index: number;
@@ -165,6 +181,7 @@ export interface ClipItem {
   cover_file: string | null;
   cover_hash?: string;
   rendered_filter_tag?: string;
+  crop_override?: ClipCropOverride | null;
   publish_records?: PublishRecord[];
 }
 
@@ -326,6 +343,7 @@ export interface ProjectManifest {
   compilation?: CompilationConfig;
   cut_segments?: CutSegment[];
   clean_cut?: CleanCutConfig;
+  crop?: CropConfig;
 }
 
 export interface Receipt {

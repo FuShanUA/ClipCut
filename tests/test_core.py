@@ -704,8 +704,10 @@ def test_updated_model_catalog_and_fallback_chain():
     cfg = load_editorial_config()
     m_cfg = cfg["models"]
     fb = m_cfg["text_fallback_models"]
-    for required in ("qwen4-max", "glm-5.3", "kimi-k3.1-pro", "deepseek-v4-pro", "glm-5.2", "gemini:gemini-2.5-flash"):
+    for required in ("qwen4-max", "glm-5.3", "kimi-k3.1-pro", "deepseek-v4-pro", "glm-5.2"):
         assert required in fb
+    assert not any("gemini" in str(item).lower() for item in fb)
+    assert not any("gemini" in str(item).lower() for item in m_cfg["multimodal_fallback_models"])
     assert "qwen-max" not in fb
     assert "qwen3.7-max" not in fb
 

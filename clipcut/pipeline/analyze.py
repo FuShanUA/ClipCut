@@ -310,6 +310,10 @@ def run_analyze_stage(
     fallback_models = list(models_cfg.get("text_fallback_models") or DEFAULT_TEXT_FALLBACK_MODELS)
 
     utts = manifest.utterances
+    if not utts:
+        raise ValueError(
+            "未找到字幕文件，无法执行 AI 内容分析与选片；若只需剪切画幅，请直接使用「裁剪画面」功能导出。"
+        )
     n_utts = len(utts)
     transcript_text = format_transcript_for_llm(utts)
 

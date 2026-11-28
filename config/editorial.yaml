@@ -26,7 +26,6 @@ models:
   - deepseek-v4-pro
   - glm-5.2
   - qwen3.8-flash
-  - gemini:gemini-2.5-flash
   remix_model: ''
   multimodal_provider: dashscope
   multimodal_model: qwen3-vl-plus
@@ -34,7 +33,6 @@ models:
   - qwen3.8-omni-flash
   - qwen3.5-omni-plus
   - qwen3-vl-plus
-  - gemini:gemini-2.5-flash
   max_multimodal_checks: 8
   vertex_project: ''
   vertex_location: global

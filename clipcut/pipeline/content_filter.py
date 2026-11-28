@@ -14,6 +14,7 @@ import numpy as np
 
 from ..cancel import JobCancelledError, check_cancelled, run_cancellable_subprocess
 from ..config import load_editorial_config
+from ..crop import crop_hash_payload, resolve_effective_crop
 from ..llm import ClipCutLLM, DEFAULT_TEXT_FALLBACK_MODELS, parse_provider_model
 from ..models import CutSegment, ProjectManifest, Utterance, VisualMaskBox, utc_now_iso
 from ..receipts import ProjectStore
@@ -1169,17 +1170,20 @@ def compute_clean_cut_render_hash(
 ) -> str:
     cc = manifest.clean_cut
     dur = float(manifest.source.duration_s or (manifest.utterances[-1].end_s if manifest.utterances else 0.0))
-    payload = {
+    proj_crop = resolve_effective_crop(manifest)
+    payload: dict[str, Any] = {
         "video": manifest.source.render_video,
         "title": cc.title,
         "cover_title": cc.cover_title,
         "sensitivity": cc.sensitivity,
         "political_action": cc.political_action,
         "cut_mode": cc.cut_mode,
-        "precise_copy": should_use_precise_copy(manifest, cfg),
+        "precise_copy": should_use_precise_copy(manifest, cfg) and (proj_crop is None),
         "cut_spans": [[round(s, 3), round(e, 3)] for s, e in get_active_delete_spans(manifest, cfg)],
         "masks": get_overlapping_mask_payload(0.0, max(1.0, dur), manifest, cfg),
     }
+    if (cp := crop_hash_payload(proj_crop)) is not None:
+        payload["crop"] = cp
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
@@ -1205,6 +1209,7 @@ def sync_all_render_hashes(
             delete_spans,
             manifest.source.subtitle_sha256,
             mask_payload=clip_masks,
+            crop_rect=resolve_effective_crop(manifest, clip),
         )
     manifest.compilation.render_hash = compute_compilation_render_hash(manifest)
     manifest.remix.render_hash = compute_remix_render_hash(manifest)
@@ -1767,8 +1772,9 @@ def _is_valid_political_hit(
 def _select_compliance_llm(
     cfg: dict[str, Any] | None,
     *,
-    prefer_gemini: bool = True,
+    prefer_gemini: bool = False,
 ) -> tuple[ClipCutLLM, str, str, list[str]]:
+    del prefer_gemini  # Auto-switching to Gemini is disabled; follow configured models strictly.
     models_cfg = (cfg or {}).get("models", {})
     text_provider = str(models_cfg.get("text_provider") or "dashscope")
     text_model = str(models_cfg.get("text_model") or "qwen3.8-max")
@@ -1786,29 +1792,7 @@ def _select_compliance_llm(
             normalized_text_fallbacks.append(spec)
 
     llm = ClipCutLLM(models_cfg)
-    has_gemini = bool(getattr(llm, "gemini_key", None))
-    if prefer_gemini and has_gemini:
-        scan_provider = "gemini"
-        scan_model = "gemini-2.5-flash"
-        ordered = [
-            "gemini:gemini-2.5-flash-lite",
-            "vertex:gemini-2.5-flash",
-            "vertex:gemini-2.5-pro",
-            primary_spec,
-            *normalized_text_fallbacks,
-        ]
-        scan_fallbacks: list[str] = []
-        for spec in ordered:
-            if spec != "gemini:gemini-2.5-flash" and spec not in scan_fallbacks:
-                scan_fallbacks.append(spec)
-        return llm, scan_provider, scan_model, scan_fallbacks
-
-    scan_fallbacks = list(normalized_text_fallbacks)
-    if has_gemini:
-        for gem_spec in ("gemini:gemini-2.5-flash", "gemini:gemini-2.5-flash-lite"):
-            if gem_spec != primary_spec and gem_spec not in scan_fallbacks:
-                scan_fallbacks.append(gem_spec)
-    return llm, p_main, m_main, scan_fallbacks
+    return llm, p_main, m_main, normalized_text_fallbacks
 
 
 def _clean_term_list(raw: Any) -> list[str]:
@@ -1928,7 +1912,7 @@ def scan_cut_segments(
             x.kind == "political_sensitive" and segment_matches_sensitivity(x, eff_sens, cfg)
             for x in manifest.cut_segments
         )
-        if not get_active_cut_segments(manifest, cfg):
+        if not get_active_cut_segments(manifest, cfg) and resolve_effective_crop(manifest) is None:
             manifest.clean_cut.enabled = False
         manifest.clean_cut.scanned_at = utc_now_iso()
         sync_all_render_hashes(manifest, cfg)
@@ -1937,7 +1921,7 @@ def scan_cut_segments(
 
     manual_segments = [seg.model_copy(deep=True) for seg in manifest.cut_segments if seg.detector == "manual"]
 
-    llm, scan_provider, scan_model, scan_fallbacks = _select_compliance_llm(cfg, prefer_gemini=bool(eff_pol))
+    llm, scan_provider, scan_model, scan_fallbacks = _select_compliance_llm(cfg, prefer_gemini=False)
 
     used_model_label = f"{scan_provider}:{scan_model}"
     raw_ai_hits: list[dict[str, Any]] = []
@@ -2245,7 +2229,9 @@ def scan_cut_segments(
     )
     manifest.clean_cut.cut_ads = has_ads
     manifest.clean_cut.cut_political_sensitive = has_pol
-    manifest.clean_cut.enabled = bool(get_active_cut_segments(manifest, cfg))
+    manifest.clean_cut.enabled = bool(get_active_cut_segments(manifest, cfg)) or (
+        resolve_effective_crop(manifest) is not None and manifest.clean_cut.enabled
+    )
     if all_segments:
         from .verify_and_plan import (
             build_default_clean_cut_title,
@@ -2384,7 +2370,7 @@ def extract_precise_terms_for_segments(
   ]
 }}"""
 
-    llm, provider, model, fallbacks = _select_compliance_llm(resolved_cfg, prefer_gemini=True)
+    llm, provider, model, fallbacks = _select_compliance_llm(resolved_cfg, prefer_gemini=False)
     res = llm.generate_json(
         prompt=prompt,
         model=model,

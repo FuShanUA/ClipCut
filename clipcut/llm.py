@@ -27,14 +27,11 @@ DEFAULT_TEXT_FALLBACK_MODELS = [
     "dashscope:deepseek-v4-pro",
     "dashscope:glm-5.2",
     "dashscope:qwen3.8-flash",
-    "gemini:gemini-2.5-flash",
-    "gemini:gemini-2.5-flash-lite",
 ]
 DEFAULT_MULTIMODAL_FALLBACK_MODELS = [
     "dashscope:qwen3.8-omni-flash",
     "dashscope:qwen3.5-omni-plus",
     "dashscope:qwen3-vl-plus",
-    "gemini:gemini-2.5-flash",
 ]
 
 # Curated verified model catalog shown in Web UI & CLI
@@ -515,15 +512,12 @@ class ClipCutLLM:
                 attempts.append(pair)
 
         errors: list[str] = []
-        skip_dashscope = False
         skip_vertex = False
         idx = 0
         while idx < len(attempts):
             prov, mod = attempts[idx]
             idx += 1
             check_cancelled()
-            if skip_dashscope and prov == "dashscope":
-                continue
             if skip_vertex and prov == "vertex":
                 continue
             try:
@@ -569,16 +563,7 @@ class ClipCutLLM:
             except Exception as exc:
                 msg = str(exc)
                 low_msg = msg.lower()
-                if prov == "dashscope" and (
-                    "data_inspection_failed" in msg
-                    or "inappropriate content" in low_msg
-                ):
-                    skip_dashscope = True
-                    if self.gemini_key:
-                        for gem_pair in (("gemini", "gemini-2.5-flash"), ("gemini", "gemini-2.5-flash-lite")):
-                            if gem_pair not in attempts:
-                                attempts.append(gem_pair)
-                elif prov == "vertex" and any(
+                if prov == "vertex" and any(
                     tok in low_msg for tok in ("permission_denied", "billing", "403", "unauthenticated", "401")
                 ):
                     skip_vertex = True

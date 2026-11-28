@@ -9,8 +9,14 @@ import {
   useState,
 } from "react";
 import { api } from "./api";
+import VideoCropOverlay, {
+  computeEvenOutputDims,
+  sanitizeRect,
+  type NormalizedCropRect,
+} from "./components/VideoCropOverlay";
 import type {
   CleanCutConfig,
+  ClipCropOverride,
   ClipItem,
   ContentFilterConfig,
   CutSegment,
@@ -40,6 +46,29 @@ const SENS_SHORT_LABELS: Record<"strict" | "balanced" | "loose", string> = {
   balanced: "平衡",
   loose: "仅硬红线",
 };
+
+function isFullFrameRect(r: NormalizedCropRect): boolean {
+  return r.x <= 0.001 && r.y <= 0.001 && r.w >= 0.999 && r.h >= 0.999;
+}
+
+function resolveEffectiveCropFrontend(
+  manifest: ProjectManifest | null,
+  clip: ClipItem | null
+): NormalizedCropRect | null {
+  if (!manifest) return null;
+  if (clip?.crop_override) {
+    if (clip.crop_override.mode === "none") return null;
+    if (clip.crop_override.mode === "custom") {
+      const s = sanitizeRect(clip.crop_override);
+      return isFullFrameRect(s) ? null : s;
+    }
+  }
+  if (manifest.crop?.enabled) {
+    const s = sanitizeRect(manifest.crop);
+    return isFullFrameRect(s) ? null : s;
+  }
+  return null;
+}
 
 interface ComplianceSegmentHit {
   seg: CutSegment;
@@ -695,7 +724,9 @@ function hasCompilationCardFor(m: ProjectManifest | null): boolean {
 }
 
 function hasCleanCutCardFor(m: ProjectManifest | null): boolean {
-  return Boolean(m && ((m.cut_segments || []).length > 0 || Boolean(m.clean_cut?.output_file)));
+  return Boolean(
+    m && ((m.cut_segments || []).length > 0 || Boolean(m.clean_cut?.output_file) || Boolean(m.crop?.enabled))
+  );
 }
 
 function pickDefaultSelectedId(m: ProjectManifest): string | null {
@@ -757,6 +788,13 @@ export default function App() {
   const [loopClip, setLoopClip] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  // Interactive frame crop state
+  const [cropEditing, setCropEditing] = useState(false);
+  const [cropEditScope, setCropEditScope] = useState<"project" | "clip">("project");
+  const [cropDraft, setCropDraft] = useState<NormalizedCropRect>({ x: 0, y: 0, w: 1, h: 0.85 });
+  const [cropPreviewOnly, setCropPreviewOnly] = useState(true);
+  const [cropSaving, setCropSaving] = useState(false);
 
   // Right pane logs state (loaded only when opened / job running)
   const [rightTab, setRightTab] = useState<"receipts" | "topics" | "logs">("receipts");
@@ -981,6 +1019,7 @@ export default function App() {
     manifest?.compilation?.output_file,
     manifest?.cut_segments?.length,
     manifest?.clean_cut?.output_file,
+    manifest?.crop?.enabled,
     selectedId,
   ]);
 
@@ -1039,10 +1078,127 @@ export default function App() {
   }, [manifest?.utterances, activeClip?.clip_id, activeClip?.start_utt, activeClip?.end_utt]);
 
   useEffect(() => {
+    setCropEditing(false);
+  }, [manifest?.project_id, selectedId]);
+
+  useEffect(() => {
     if (activeClip && playMode === "source" && videoRef.current) {
       videoRef.current.currentTime = activeClip.start_s;
     }
   }, [selectedId, activeClip?.clip_id]);
+
+  const effectiveCrop = useMemo(
+    () => resolveEffectiveCropFrontend(manifest, activeClip),
+    [manifest?.crop, activeClip]
+  );
+
+  const effectiveCropDims = useMemo(() => {
+    if (!effectiveCrop || !manifest) return null;
+    return computeEvenOutputDims(
+      effectiveCrop,
+      manifest.source.width || 1920,
+      manifest.source.height || 1080
+    );
+  }, [effectiveCrop, manifest?.source.width, manifest?.source.height]);
+
+  function openCropEditor(scopeOverride?: "project" | "clip") {
+    if (!manifest) return;
+    setPlayMode("source");
+    const nextScope: "project" | "clip" =
+      scopeOverride ||
+      (activeClip?.crop_override?.mode === "custom" ? "clip" : "project");
+    let initRect: NormalizedCropRect = { x: 0, y: 0, w: 1, h: 0.85 };
+    if (nextScope === "clip" && activeClip?.crop_override?.mode === "custom") {
+      initRect = sanitizeRect(activeClip.crop_override);
+    } else if (manifest.crop?.enabled) {
+      initRect = sanitizeRect(manifest.crop);
+    }
+    setCropEditScope(nextScope);
+    setCropDraft(initRect);
+    setCropEditing(true);
+  }
+
+  function handleCropScopeChange(nextScope: "project" | "clip") {
+    setCropEditScope(nextScope);
+    if (nextScope === "clip" && activeClip?.crop_override?.mode === "custom") {
+      setCropDraft(sanitizeRect(activeClip.crop_override));
+    } else if (manifest?.crop?.enabled) {
+      setCropDraft(sanitizeRect(manifest.crop));
+    }
+  }
+
+  async function handleApplyCrop() {
+    if (!manifest) return;
+    setCropSaving(true);
+    setErrorMsg(null);
+    const rect = sanitizeRect(cropDraft);
+    try {
+      if (cropEditScope === "clip" && activeClip) {
+        const override: ClipCropOverride = isFullFrameRect(rect)
+          ? { mode: "none", x: 0, y: 0, w: 1, h: 1 }
+          : { mode: "custom", ...rect };
+        const res = await api.patchClip(manifest.project_id, activeClip.clip_id, {
+          crop_override: override,
+        });
+        setManifest(res.manifest);
+      } else {
+        const res = await api.patchCrop(manifest.project_id, {
+          enabled: !isFullFrameRect(rect),
+          ...rect,
+        });
+        setManifest(res.manifest);
+        if (!isFullFrameRect(rect) && res.manifest.clips.length === 0) {
+          setSelectedId("CLEAN_CUT");
+        }
+      }
+      setCropEditing(false);
+      setCropPreviewOnly(true);
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    } finally {
+      setCropSaving(false);
+    }
+  }
+
+  async function handleDisableCropForScope() {
+    if (!manifest) return;
+    setCropSaving(true);
+    setErrorMsg(null);
+    try {
+      if (cropEditScope === "clip" && activeClip) {
+        const res = await api.patchClip(manifest.project_id, activeClip.clip_id, {
+          crop_override: { mode: "none", x: 0, y: 0, w: 1, h: 1 },
+        });
+        setManifest(res.manifest);
+      } else {
+        const res = await api.patchCrop(manifest.project_id, { enabled: false });
+        setManifest(res.manifest);
+      }
+      setCropEditing(false);
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    } finally {
+      setCropSaving(false);
+    }
+  }
+
+  async function handleInheritClipCrop() {
+    if (!manifest || !activeClip) return;
+    setCropSaving(true);
+    setErrorMsg(null);
+    try {
+      const res = await api.patchClip(manifest.project_id, activeClip.clip_id, {
+        crop_override: { mode: "inherit", x: 0, y: 0, w: 1, h: 1 },
+      });
+      setManifest(res.manifest);
+      setCropEditing(false);
+      setCropPreviewOnly(true);
+    } catch (err) {
+      setErrorMsg((err as Error).message);
+    } finally {
+      setCropSaving(false);
+    }
+  }
 
   function handleTimeUpdate() {
     const v = videoRef.current;
@@ -1256,16 +1412,7 @@ export default function App() {
       });
       setManifest(res.manifest);
       setProjectAssets(null);
-      setSelectedId(
-        res.manifest.remix.items.length > 0
-          ? "REMIX"
-          : res.manifest.clips[0]?.clip_id ||
-              (res.manifest.remix.output_file
-                ? "REMIX"
-                : res.manifest.compilation?.output_file
-                  ? "COMPILATION"
-                  : null)
-      );
+      setSelectedId(pickDefaultSelectedId(res.manifest));
       setPlayMode("source");
       api.listProjects().then((r) => setProjects(r.projects)).catch(() => {});
     } catch (err) {
@@ -2388,14 +2535,19 @@ export default function App() {
     const totalS = manifest?.source.duration_s || 0;
     const keptS = Math.max(0, totalS - cutS);
     const politicalAction = (cc?.political_action || contentFilterCfg?.default_political_action || "auto") as PoliticalAction;
+    const hasGlobalCrop = Boolean(manifest?.crop?.enabled);
     const summaryLabel =
-      !isScanned && segs.length === 0
-        ? "待分析"
-        : active.length > 0
-          ? `广告${adCount}/${adTotal} · 删敏${delPolCount} · ${preciseMaskActive.length > 0 && normalMaskActive.length === 0 ? "精准" : "遮蔽"}${maskActive.length}`
+      active.length > 0
+        ? `广告${adCount}/${adTotal} · 删敏${delPolCount} · ${preciseMaskActive.length > 0 && normalMaskActive.length === 0 ? "精准" : "遮蔽"}${maskActive.length}`
+        : !isScanned && segs.length === 0
+          ? hasGlobalCrop
+            ? "仅画面裁剪"
+            : "待分析"
           : polAllTotal > 0
             ? `广告${adCount}/${adTotal} · 当前标准放行${polAllTotal}段`
-            : "无广告/敏感";
+            : hasGlobalCrop
+              ? "画面裁剪"
+              : "无广告/敏感";
     return {
       total: segs.length,
       adTotal,
@@ -2502,6 +2654,8 @@ export default function App() {
     return manifest ? manifest.remix.items.filter((x) => x.enabled).length : 0;
   }, [manifest]);
 
+  const hasSubtitles = Boolean(manifest && manifest.utterances.length > 0);
+  const hasGlobalCrop = Boolean(manifest?.crop?.enabled);
   const showRemixCard = hasRemixCardFor(manifest);
   const showCompilationCard = hasCompilationCardFor(manifest);
   const hasActiveRemixTarget = Boolean(
@@ -2509,7 +2663,7 @@ export default function App() {
       (enabledRemixItemCount > 0 || (manifest.remix.items.length === 0 && (manifest.clips.length > 0 || (manifest.remix_only_pool?.length || 0) > 0)))
   );
   const hasActiveCompilationTarget = Boolean(manifest?.compilation?.enabled && compilationClips.length > 0);
-  const hasActiveCleanCutTarget = Boolean(manifest?.clean_cut?.enabled && cleanCutStats.activeCount > 0);
+  const hasActiveCleanCutTarget = Boolean(manifest?.clean_cut?.enabled && (cleanCutStats.activeCount > 0 || hasGlobalCrop));
 
   const renderTargetSummary = useMemo(() => {
     if (!manifest) return "0 项";
@@ -2517,9 +2671,9 @@ export default function App() {
     if (enabledClipCount > 0) parts.push(`${enabledClipCount}切片`);
     if (hasActiveRemixTarget) parts.push("AI混剪");
     if (hasActiveCompilationTarget) parts.push("精选集");
-    if (hasActiveCleanCutTarget) parts.push("全片净版");
+    if (hasActiveCleanCutTarget) parts.push(cleanCutStats.activeCount === 0 && hasGlobalCrop ? "画面裁剪" : "全片净版");
     return parts.join(" + ") || "0 项";
-  }, [manifest, enabledClipCount, hasActiveRemixTarget, hasActiveCompilationTarget, hasActiveCleanCutTarget]);
+  }, [manifest, enabledClipCount, hasActiveRemixTarget, hasActiveCompilationTarget, hasActiveCleanCutTarget, cleanCutStats.activeCount, hasGlobalCrop]);
 
   const isRendering = Boolean(jobRunning && (jobStages.includes("render") || manifest?.stages?.render?.status === "running"));
   const isPlanningRunning = Boolean(manifest && jobRunning && !isRendering);
@@ -2643,7 +2797,7 @@ export default function App() {
           <button
             type="button"
             className={isPlanningRunning ? "danger" : "primary"}
-            disabled={isPlanningRunning ? jobCancelling : (!manifest || jobRunning)}
+            disabled={isPlanningRunning ? jobCancelling : (!manifest || jobRunning || !hasSubtitles)}
             onClick={() =>
               isPlanningRunning
                 ? handleCancelJob()
@@ -2654,6 +2808,8 @@ export default function App() {
             title={
               isPlanningRunning
                 ? "点击立即中止当前规划任务"
+                : manifest && !hasSubtitles
+                  ? "当前视频未载入字幕文件，无法执行 AI 切片分析；请直接点击播放器下方「裁剪画面」框选并导出成片"
                 : hasStrategy
                   ? "重新执行广告/敏感分析、AI 选片与 Remix 规划，并检查是否删除已有成片彻底重做"
                   : "第一步：AI声画测绘、广告/敏感分析、三类选片与Remix规划（不消耗重型算力渲染）"
@@ -2677,9 +2833,13 @@ export default function App() {
           <button
             type="button"
             className="sm"
-            disabled={!manifest || jobRunning}
+            disabled={!manifest || jobRunning || !hasSubtitles}
             onClick={() => handleRun(["signals", "scan_cuts", "analyze", "verify_and_plan", "render"])}
-            title="全自动无人值守：全流程跑完包含全量渲染"
+            title={
+              manifest && !hasSubtitles
+                ? "当前视频未载入字幕文件，仅支持手动「裁剪画面」并导出"
+                : "全自动无人值守：全流程跑完包含全量渲染"
+            }
           >
             全自动跑完
           </button>
@@ -3076,8 +3236,8 @@ export default function App() {
                 );
               })()}
 
-              {/* 3. Clean Cut Card (Ad & Political-Sensitive Removal; Hidden when nothing active) */}
-              {cleanCutStats.activeCount > 0 && (
+              {/* 3. Clean Cut Card (Ad & Political-Sensitive Removal or Global Crop; Hidden when nothing active) */}
+              {(cleanCutStats.activeCount > 0 || hasGlobalCrop || Boolean(manifest.clean_cut?.output_file)) && (
               <div
                 className={`clip-card ${selectedId === "CLEAN_CUT" ? "active" : ""} ${!manifest.clean_cut?.enabled ? "disabled" : ""}`}
                 onClick={() => {
@@ -3101,11 +3261,13 @@ export default function App() {
                       borderColor: "rgba(239, 68, 68, 0.55)",
                     }}
                   >
-                    全片净版
+                    {cleanCutStats.activeCount === 0 && hasGlobalCrop ? "画面裁剪" : "全片净版"}
                   </span>
                   <div className="clip-title" style={{ color: "#fecaca" }}>
                     {manifest.clean_cut?.title ||
-                      `${manifest.metadata.original_theme_zh || manifest.metadata.original_title || "全片"}（净版）`}
+                      (cleanCutStats.activeCount === 0 && hasGlobalCrop
+                        ? `${manifest.metadata.original_theme_zh || manifest.metadata.original_title || "全片"}（裁剪版）`
+                        : `${manifest.metadata.original_theme_zh || manifest.metadata.original_title || "全片"}（净版）`)}
                   </div>
                 </div>
                 <div className="clip-meta">
@@ -3143,7 +3305,11 @@ export default function App() {
               {/* Standalone Clips */}
               {manifest.clips.length === 0 ? (
                 <div className="empty-state" style={{ padding: 20 }}>
-                  {hasStrategy
+                  {!hasSubtitles
+                    ? hasGlobalCrop
+                      ? "当前为无字幕裁剪模式：已启用全局画面裁剪，点击右侧「渲染裁剪成片」或上方「渲染选中」即可导出裁剪视频。"
+                      : "当前视频未附带 .srt/.vtt 字幕，已自动进入纯画面裁剪模式：请点击播放器下方「裁剪画面」框选保留区域并「应用裁剪」后直接导出。"
+                    : hasStrategy
                     ? "当前暂无独立切片。点击上方「重新制定切片策略」从头重新规划，或点击「全自动跑完」一次完成规划与渲染。"
                     : "点击上方「生成切片策略」完成广告/敏感分析与选片，再点「渲染选中」输出成片与封面（或直接点「全自动跑完」）。"}
                 </div>
@@ -3237,6 +3403,16 @@ export default function App() {
                         <span className={`tag ${rb.cls}`} title={rb.title}>
                           {rb.label}
                         </span>
+                        {c.crop_override?.mode === "custom" && (
+                          <span className="tag" style={{ color: "#22d3ee", borderColor: "rgba(34,211,238,0.45)" }}>
+                            单独裁剪
+                          </span>
+                        )}
+                        {c.crop_override?.mode === "none" && (
+                          <span className="tag" style={{ color: "#94a3b8" }}>
+                            不裁剪
+                          </span>
+                        )}
                         {renderPubBadges(c.publish_records)}
                       </div>
                     </div>
@@ -3269,18 +3445,26 @@ export default function App() {
             style={{ "--bottom-pane-h": `${bottomPaneHeight}px` } as CSSProperties}
           >
             <div className="player-wrap">
-              <div className="video-stage">
-                <video
-                  ref={videoRef}
-                  key={mediaSrc}
-                  className="video-el"
-                  src={mediaSrc}
-                  controls
-                  onTimeUpdate={handleTimeUpdate}
-                />
-              </div>
+              <VideoCropOverlay
+                videoRef={videoRef}
+                mediaSrc={mediaSrc}
+                playMode={playMode}
+                sourceWidth={manifest.source.width || 1920}
+                sourceHeight={manifest.source.height || 1080}
+                effectiveCrop={effectiveCrop}
+                editing={cropEditing}
+                draftRect={cropDraft}
+                previewCroppedOnly={cropPreviewOnly}
+                onDraftChange={setCropDraft}
+                onTimeUpdate={handleTimeUpdate}
+                onLoadedMetadata={(e) => {
+                  if (activeClip && playMode === "source" && e.currentTarget.currentTime < 0.2) {
+                    e.currentTarget.currentTime = activeClip.start_s;
+                  }
+                }}
+              />
               <div className="player-controls">
-                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                   <span className="mono">{fmtTime(currentTime)}</span>
                   <button
                     type="button"
@@ -3301,10 +3485,39 @@ export default function App() {
                         ? !manifest.clean_cut?.output_file
                         : !activeClip?.output_file
                     }
-                    onClick={() => setPlayMode("rendered")}
+                    onClick={() => {
+                      setCropEditing(false);
+                      setPlayMode("rendered");
+                    }}
                   >
                     播成品
                   </button>
+                  <button
+                    type="button"
+                    className={`sm ${cropEditing ? "primary" : ""}`}
+                    disabled={jobRunning}
+                    onClick={() => (cropEditing ? setCropEditing(false) : openCropEditor())}
+                    title="用鼠标在画面上框选保留区域，去除原视频硬字幕"
+                  >
+                    {cropEditing ? "退出框选" : effectiveCrop ? "调整裁剪框" : "裁剪画面"}
+                  </button>
+                  {effectiveCrop && !cropEditing && playMode === "source" && (
+                    <>
+                      <button
+                        type="button"
+                        className="sm"
+                        onClick={() => setCropPreviewOnly((v) => !v)}
+                        title="切换仅看框选区域画面或查看原画裁剪框位置"
+                      >
+                        {cropPreviewOnly ? "仅看框内" : "原画对照"}
+                      </button>
+                      {effectiveCropDims && (
+                        <span className="mono" style={{ color: "#22d3ee", fontSize: 11 }}>
+                          {effectiveCropDims.pw}×{effectiveCropDims.ph}
+                        </span>
+                      )}
+                    </>
+                  )}
                 </div>
                 {activeClip && (
                   <label style={{ display: "inline-flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
@@ -3313,6 +3526,88 @@ export default function App() {
                   </label>
                 )}
               </div>
+              {cropEditing && playMode === "source" && (
+                <div className="crop-toolbar">
+                  <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                    <span style={{ color: "#22d3ee", fontWeight: 600 }}>拖拽画框/调整边缘</span>
+                    {activeClip && (
+                      <>
+                        <select
+                          value={cropEditScope}
+                          onChange={(e) => handleCropScopeChange(e.target.value as "project" | "clip")}
+                          disabled={cropSaving}
+                          style={{ fontSize: 12, padding: "2px 6px" }}
+                        >
+                          <option value="project">全局裁剪（全片/切片默认）</option>
+                          <option value="clip">当前切片单独框选</option>
+                        </select>
+                        {activeClip.crop_override && (
+                          <button
+                            type="button"
+                            className="sm"
+                            disabled={cropSaving}
+                            onClick={handleInheritClipCrop}
+                            title="清除此切片的单独设置，恢复跟随全局裁剪"
+                          >
+                            跟随全局
+                          </button>
+                        )}
+                      </>
+                    )}
+                    <button
+                      type="button"
+                      className="sm"
+                      onClick={() => setCropDraft({ x: 0, y: 0, w: 1, h: 0.85 })}
+                      title="快速裁掉底部 15% 硬字幕区"
+                    >
+                      去底15%
+                    </button>
+                    <button
+                      type="button"
+                      className="sm"
+                      onClick={() => setCropDraft({ x: 0, y: 0, w: 1, h: 0.8 })}
+                      title="快速裁掉底部 20% 硬字幕区"
+                    >
+                      去底20%
+                    </button>
+                    <button
+                      type="button"
+                      className="sm"
+                      onClick={() => setCropDraft({ x: 0, y: 0, w: 1, h: 1 })}
+                    >
+                      全画幅
+                    </button>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <button
+                      type="button"
+                      className="sm primary"
+                      disabled={cropSaving}
+                      onClick={handleApplyCrop}
+                    >
+                      {cropSaving ? "保存中..." : "应用裁剪"}
+                    </button>
+                    {(cropEditScope === "clip" ? activeClip?.crop_override?.mode !== "none" : manifest.crop?.enabled) && (
+                      <button
+                        type="button"
+                        className="sm danger"
+                        disabled={cropSaving}
+                        onClick={handleDisableCropForScope}
+                      >
+                        {cropEditScope === "clip" ? "此切片不裁剪" : "关闭全局裁剪"}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="sm"
+                      disabled={cropSaving}
+                      onClick={() => setCropEditing(false)}
+                    >
+                      取消
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div
@@ -3383,24 +3678,30 @@ export default function App() {
                       <button
                         type="button"
                         className="sm primary"
-                        disabled={jobRunning}
+                        disabled={jobRunning || !hasSubtitles}
                         onClick={handleScanCleanCut}
-                        title="AI 结合视频关键帧与全片字幕扫描广告与政治敏感内容"
+                        title={
+                          hasSubtitles
+                            ? "AI 结合视频关键帧与全片字幕扫描广告与政治敏感内容"
+                            : "无字幕文件时不可执行基于字幕的广敏扫描，仍可直接渲染画面裁剪成片"
+                        }
                       >
                         {jobRunning ? "处理中..." : "AI 扫描广告与敏感段"}
                       </button>
                       <button
                         type="button"
                         className="sm"
-                        disabled={jobRunning || cleanCutStats.activeCount === 0}
+                        disabled={jobRunning || (cleanCutStats.activeCount === 0 && !manifest.crop?.enabled)}
                         onClick={() => handleRenderCleanCut(true)}
                         title={
-                          cleanCutStats.activeCount === 0
-                            ? "当前标准/开关下无生效剪切或脱敏项，无需输出全片净版"
-                            : "对勾选的广告/政治敏感片段执行删段或词级遮蔽，输出全片净版 MP4 与封面"
+                          cleanCutStats.activeCount === 0 && !manifest.crop?.enabled
+                            ? "当前标准/开关下无生效剪切、脱敏或裁剪项，无需输出全片净版"
+                            : "对勾选的广告/政治敏感片段执行删段或词级遮蔽（及全局裁剪），输出全片净版 MP4 与封面"
                         }
                       >
-                        {manifest.clean_cut?.output_file ? "重渲全片净版" : "渲染全片净版"}
+                        {cleanCutStats.activeCount === 0 && hasGlobalCrop
+                          ? (manifest.clean_cut?.output_file ? "重渲裁剪成片" : "渲染裁剪成片")
+                          : (manifest.clean_cut?.output_file ? "重渲全片净版" : "渲染全片净版")}
                       </button>
                       <button
                         type="button"
@@ -3499,7 +3800,11 @@ export default function App() {
                 <div className="subtitle-list scroller">
                   {(manifest.cut_segments || []).length === 0 ? (
                     <div className="empty-state" style={{ padding: 28 }}>
-                      尚未扫描广告与敏感片段。点击上方「AI 扫描广告与敏感段」自动标记，或点击「在当前指针添加屏蔽段」手动标记。
+                      {!hasSubtitles
+                        ? hasGlobalCrop
+                          ? "无字幕纯画幅裁剪模式：已设置全局裁剪区域，点击上方「渲染裁剪成片」即可导出（也可点击下方「+ 在当前指针添加屏蔽段」手动剪切不需要的时间段）。"
+                          : "无字幕模式：请点击播放器下方「裁剪画面」框选保留画幅区域并应用，即可直接渲染导出。"
+                        : "尚未扫描广告与敏感片段。点击上方「AI 扫描广告与敏感段」自动标记，或点击「在当前指针添加屏蔽段」手动标记。"}
                     </div>
                   ) : (
                     (manifest.cut_segments || []).map((seg: CutSegment) => {
@@ -5055,7 +5360,9 @@ export default function App() {
               </>
             ) : (
               <div className="empty-state">
-                {hasStrategy
+                {!hasSubtitles
+                  ? "无字幕模式：请点击上方播放器控制栏中的「裁剪画面」，拖拽框选保留画幅并点击「应用裁剪」即可直接导出。"
+                  : hasStrategy
                   ? "在左侧选择一个切片、精选集或 AI 混剪进行预览与发布。"
                   : "尚未生成切片策略。点击上方「生成切片策略」完成广告/敏感分析、独立切片与高光混剪规划。"}
               </div>

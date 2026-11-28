@@ -846,7 +846,7 @@ def test_real_ffmpeg_mask_render_preserves_duration_and_bleeps(tmp_path: Path):
     assert abs(f_bleep - 880.0) < 25.0, f"expected 880Hz bleep inside mask, got {f_bleep}"
 
 
-def test_llm_data_inspection_short_circuits_dashscope(monkeypatch):
+def test_llm_data_inspection_continues_dashscope_without_auto_gemini(monkeypatch):
     from clipcut.llm import ClipCutLLM, LLMCallResult
 
     llm = ClipCutLLM({})
@@ -854,30 +854,32 @@ def test_llm_data_inspection_short_circuits_dashscope(monkeypatch):
 
     def fake_ds(*, model, **kw):
         called.append(f"dashscope:{model}")
-        raise RuntimeError('HTTP 400: {"error":{"code":"data_inspection_failed","message":"inappropriate content"}}')
-
-    def fake_google(*, provider, model, **kw):
-        called.append(f"{provider}:{model}")
+        if model == "qwen3.8-max":
+            raise RuntimeError('HTTP 400: {"error":{"code":"data_inspection_failed","message":"inappropriate content"}}')
         return LLMCallResult(
             text='{"segments": []}',
             parsed={"segments": []},
             model=model,
-            provider=provider,
+            provider="dashscope",
             prompt_tokens=1,
             output_tokens=1,
             elapsed_ms=1,
         )
 
+    def fail_google(*, provider, model, **kw):
+        raise AssertionError(f"Gemini should never be auto-called: {provider}:{model}")
+
     monkeypatch.setattr(llm, "_call_dashscope", fake_ds)
-    monkeypatch.setattr(llm, "_call_google", fake_google)
+    monkeypatch.setattr(llm, "_call_google", fail_google)
     res = llm.generate_json(
         prompt="test",
         model="qwen3.8-max",
         provider="dashscope",
-        fallback_models=["qwen4-max", "glm-5.3", "kimi-k3.1-pro", "gemini:gemini-2.5-flash"],
+        fallback_models=["qwen4-max", "glm-5.3", "kimi-k3.1-pro"],
     )
-    assert res.provider == "gemini"
-    assert called == ["dashscope:qwen3.8-max", "gemini:gemini-2.5-flash"]
+    assert res.provider == "dashscope"
+    assert res.model == "qwen4-max"
+    assert called == ["dashscope:qwen3.8-max", "dashscope:qwen4-max"]
 
 
 def test_reanchor_drifted_utterance_ids():
@@ -1474,26 +1476,24 @@ def test_parse_provider_model_and_compliance_fallback_routing(monkeypatch):
     assert parse_provider_model("gemini-2.5-flash", "vertex") == ("vertex", "gemini-2.5-flash")
     assert parse_provider_model("bailian:qwen4-max", "gemini") == ("dashscope", "qwen4-max")
 
-    # 2. _select_compliance_llm normalizes bare DashScope fallbacks cleanly
+    # 2. _select_compliance_llm follows DashScope config strictly even if GEMINI_API_KEY exists
     monkeypatch.setenv("GEMINI_API_KEY", "test-gem-key")
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-ds-key")
     cfg = {
         "models": {
             "text_provider": "dashscope",
             "text_model": "qwen3.8-max",
-            "text_fallback_models": ["qwen4-max", "glm-5.3", "kimi-k3.1-pro", "gemini:gemini-2.5-flash"],
+            "text_fallback_models": ["qwen4-max", "glm-5.3", "kimi-k3.1-pro"],
         }
     }
     llm, scan_prov, scan_mod, scan_fbs = _select_compliance_llm(cfg, prefer_gemini=True)
-    assert scan_prov == "gemini"
-    assert scan_mod == "gemini-2.5-flash"
-    assert scan_fbs[0] == "gemini:gemini-2.5-flash-lite"
-    assert "dashscope:qwen3.8-max" in scan_fbs
-    assert "dashscope:glm-5.3" in scan_fbs
-    assert "dashscope:kimi-k3.1-pro" in scan_fbs
+    assert scan_prov == "dashscope"
+    assert scan_mod == "qwen3.8-max"
+    assert scan_fbs == ["dashscope:qwen4-max", "dashscope:glm-5.3", "dashscope:kimi-k3.1-pro"]
     assert all(":" in fb for fb in scan_fbs)
+    assert not any("gemini" in fb or "vertex" in fb for fb in scan_fbs)
 
-    # 3a. Transient Gemini timeout/503 retries once & succeeds without calling DashScope
+    # 3a. Transient explicit Google timeout/503 retries once & succeeds without calling DashScope
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(llm_mod, "_sleep_cancellable", lambda _s: None)
 
@@ -1512,11 +1512,11 @@ def test_parse_provider_model_and_compliance_fallback_routing(monkeypatch):
         )
 
     def fail_if_dashscope(**_kw):
-        raise AssertionError("DashScope should not be called after Gemini retry succeeds")
+        raise AssertionError("DashScope should not be called after explicit Gemini retry succeeds")
 
     monkeypatch.setattr(llm, "_call_google", fake_google_retry)
     monkeypatch.setattr(llm, "_call_dashscope", fail_if_dashscope)
-    res_ok = llm.generate_json(prompt="hi", model=scan_mod, provider=scan_prov, fallback_models=scan_fbs)
+    res_ok = llm.generate_json(prompt="hi", model="gemini-2.5-flash", provider="gemini", fallback_models=scan_fbs)
     assert res_ok.parsed == {"ok": True}
     assert calls == [("gemini", "gemini-2.5-flash"), ("gemini", "gemini-2.5-flash")]
 
@@ -1541,7 +1541,12 @@ def test_parse_provider_model_and_compliance_fallback_routing(monkeypatch):
         raise RuntimeError("403 PERMISSION_DENIED: billing required")
 
     monkeypatch.setattr(llm, "_call_google", fake_google_vertex_skip)
-    res_lite = llm.generate_json(prompt="hi", model=scan_mod, provider=scan_prov, fallback_models=scan_fbs)
+    res_lite = llm.generate_json(
+        prompt="hi",
+        model="gemini-2.5-flash",
+        provider="gemini",
+        fallback_models=["gemini:gemini-2.5-flash-lite", *scan_fbs],
+    )
     assert res_lite.model == "gemini-2.5-flash-lite"
 
     calls_vx: list[tuple[str, str]] = []
@@ -1579,7 +1584,8 @@ def test_parse_provider_model_and_compliance_fallback_routing(monkeypatch):
     assert ("vertex", "gemini-2.5-pro") not in calls_vx
     assert ds_calls == ["glm-5.3"]
 
-    # 3c. Total failure after data_inspection_failed preserves primary error rather than truncating it away
+    # 3c. Total failure after data_inspection_failed preserves primary error without auto-appending Gemini
+    google_called_in_3c: list[tuple[str, str]] = []
     monkeypatch.setattr(
         llm,
         "_call_dashscope",
@@ -1590,18 +1596,20 @@ def test_parse_provider_model_and_compliance_fallback_routing(monkeypatch):
     monkeypatch.setattr(
         llm,
         "_call_google",
-        lambda *, provider, model, **_kw: (_ for _ in ()).throw(RuntimeError(f"fail:{provider}:{model}")),
+        lambda *, provider, model, **_kw: google_called_in_3c.append((provider, model)),
     )
     with pytest.raises(RuntimeError) as exc_info:
         llm.generate_json(
             prompt="hi",
             model="qwen3.8-max",
             provider="dashscope",
-            fallback_models=["qwen4-max", "glm-5.3", "gemini:gemini-2.5-pro", "gemini:gemini-2.0-flash"],
+            fallback_models=["qwen4-max", "glm-5.3"],
         )
     err_txt = str(exc_info.value)
     assert "dashscope:qwen3.8-max -> HTTP 400: data_inspection_failed" in err_txt
-    assert "gemini:gemini-2.5-flash-lite" in err_txt
+    assert "dashscope:glm-5.3 -> HTTP 400: data_inspection_failed" in err_txt
+    assert "gemini:" not in err_txt
+    assert google_called_in_3c == []
 
 
 def test_deterministic_hard_redline_guard_catches_missed_mentions_without_false_positives(tmp_path: Path, monkeypatch):
@@ -1921,6 +1929,33 @@ def test_bilibili_policy_profiles_prompt_and_editorial_yaml_sync(tmp_path: Path)
         ),
     ):
         assert cf._is_valid_political_hit(seg_dict, norm_utts, 0, 0, quote, "法定规范与国家荣誉红线") is True
+
+
+def test_visual_ocr_keyframe_csv_parsing_and_timeout_handling(tmp_path: Path, monkeypatch):
+    from clipcut.pipeline import visual_ocr as vo
+
+    assert vo._parse_packet_keyframe_csv("0.040000,K__\n0.080000,___\n4.080000,K_D\nN/A,K__\n") == [0.04, 4.08]
+    assert vo._parse_frame_pts_csv("0.040000,\n2.920000,\nN/A,\n5.520000\n") == [0.04, 2.92, 5.52]
+
+    dummy_video = tmp_path / "long.mp4"
+    dummy_video.write_bytes(b"0")
+
+    monkeypatch.setattr(vo, "_ensure_vision_ocr_binary", lambda: tmp_path / "vision_bin")
+    monkeypatch.setattr(vo, "_probe_keyframe_pts", lambda _p: [0.0, 4.0, 8.0, 12.0])
+
+    captured_timeout: list[float] = []
+
+    def _raise_timeout(cmd, **kwargs):
+        captured_timeout.append(kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 180))
+
+    monkeypatch.setattr(vo, "run_cancellable_subprocess", _raise_timeout)
+    logs: list[str] = []
+    res = vo.detect_visual_ocr_redline_segments(dummy_video, 5845.0, log_fn=logs.append)
+    assert res == []
+    assert captured_timeout and captured_timeout[0] >= 900
+    assert any("超时" in line for line in logs)
+
 
 
 

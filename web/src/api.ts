@@ -1,5 +1,7 @@
 import type {
+  ClipCropOverride,
   ContentFilterConfig,
+  CropConfig,
   NavigationConfig,
   PlatformStatus,
   ProjectManifest,
@@ -106,9 +108,22 @@ export const api = {
   patchClip: (
     projectId: string,
     clipId: string,
-    patch: { enabled?: boolean; title?: string; cover_title?: string; start_utt?: number; end_utt?: number }
+    patch: {
+      enabled?: boolean;
+      title?: string;
+      cover_title?: string;
+      start_utt?: number;
+      end_utt?: number;
+      crop_override?: ClipCropOverride | null;
+    }
   ) =>
     req<{ manifest: ProjectManifest }>(`/api/projects/${projectId}/clips/${clipId}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+
+  patchCrop: (projectId: string, patch: Partial<CropConfig>) =>
+    req<{ manifest: ProjectManifest }>(`/api/projects/${projectId}/crop`, {
       method: "PATCH",
       body: JSON.stringify(patch),
     }),

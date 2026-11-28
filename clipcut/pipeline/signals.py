@@ -110,7 +110,9 @@ def run_signals_stage(
     analysis_video = Path(manifest.source.analysis_video)
     utts = manifest.utterances
     if not utts:
-        raise ValueError("没有可分析的字幕句")
+        raise ValueError(
+            "未找到字幕文件，无法执行声画信号与 AI 切片分析；若只需剪切画幅，请直接使用「裁剪画面」功能导出。"
+        )
 
     store.log(f"[signals] 开始提取声画信号: {analysis_video.name}")
     check_cancelled()

@@ -21,7 +21,14 @@ from ..adapters.ingest import _find_best_info_json, extract_published_date
 from ..assets_gen import ensure_default_assets
 from ..cancel import check_cancelled, run_cancellable_subprocess
 from ..config import load_editorial_config, load_local_config
-from ..models import ClipItem, ProjectManifest
+from ..crop import (
+    crop_hash_payload,
+    crop_output_size,
+    crop_rect_to_pixels,
+    crop_vf_expr,
+    resolve_effective_crop,
+)
+from ..models import ClipItem, CropRect, ProjectManifest
 from ..pipeline.content_filter import (
     build_masked_ass_file,
     compute_clean_cut_render_hash,
@@ -402,9 +409,10 @@ def compute_cover_hash(
     cfg: dict[str, Any],
     published_date: str,
     theme: str = "tiffany",
+    crop_rect: CropRect | None = None,
 ) -> str:
     c_cfg = cfg.get("cover", {})
-    payload = {
+    payload: dict[str, Any] = {
         "ver": COVER_TEMPLATE_VERSION,
         "key": key,
         "title": title,
@@ -418,6 +426,8 @@ def compute_cover_hash(
         "style": c_cfg.get("style", "natural"),
         "prefer_two_shot": bool(c_cfg.get("prefer_two_shot", True)),
     }
+    if (cp := crop_hash_payload(crop_rect)) is not None:
+        payload["crop"] = cp
     if theme != "tiffany":
         payload["theme"] = theme
     if theme != "crimson":
@@ -895,6 +905,7 @@ def _render_masked_span(
     visual_mask_regions: list[dict[str, Any]] | None = None,
     video_size: tuple[int, int] = (1920, 1080),
     overlay_png: Path | None = None,
+    crop_vf: str = "",
 ) -> tuple[bool, str, str]:
     """Apply local visual box blur and/or burn redacted ASS onto clean video + bleep masked words."""
     start_s = max(0.0, float(span_start))
@@ -934,6 +945,8 @@ def _render_masked_span(
 
     use_overlay = overlay_png is not None and overlay_png.is_file()
     v_parts: list[str] = []
+    if crop_vf:
+        v_parts.append(crop_vf.strip(", "))
     if use_ass and masked_ass_path is not None:
         escaped_ass = _escape_ass_filter_path(masked_ass_path)
         v_parts.append(f"subtitles=filename='{escaped_ass}'")
@@ -1030,6 +1043,7 @@ def _render_multi_span_video(
     mask_spans: list[tuple[float, float]] | None = None,
     visual_mask_regions: list[dict[str, Any]] | None = None,
     video_size: tuple[int, int] = (1920, 1080),
+    crop_vf: str = "",
 ) -> tuple[bool, str, str]:
     """Render kept time intervals into out_path (precise stream-copy or VT re-encode + concat)."""
     if not keep_spans:
@@ -1042,7 +1056,7 @@ def _render_multi_span_video(
         and any(_span_needs_mask(ks, ke, mask_spans) for ks, ke in keep_spans)
     )
     has_vis_masked_part = any(_span_needs_visual_mask(ks, ke, visual_mask_regions) for ks, ke in keep_spans)
-    if precise_copy and not has_text_masked_part and not has_vis_masked_part:
+    if precise_copy and not has_text_masked_part and not has_vis_masked_part and not crop_vf:
         try:
             _cut_media_precise_copy(source_video, keep_spans, out_path)
             return True, "precise_copy", ""
@@ -1076,6 +1090,7 @@ def _render_multi_span_video(
                 apply_edge_fade=True,
                 visual_mask_regions=visual_mask_regions,
                 video_size=video_size,
+                crop_vf=crop_vf,
             )
         else:
             dur = max(0.2, end_s - start_s)
@@ -1084,9 +1099,14 @@ def _render_multi_span_video(
             af = f"afade=t=in:st=0:d={fade_s:.3f},afade=t=out:st={fade_out_st:.3f}:d={fade_s:.3f}"
             base = [
                 "ffmpeg", "-y", "-v", "error", "-ss", f"{start_s:.3f}", "-i", str(source_video),
-                "-t", f"{dur:.3f}", "-af", af, "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart",
+                "-t", f"{dur:.3f}",
             ]
+            if crop_vf:
+                base.extend(["-vf", crop_vf])
+            base.extend([
+                "-af", af, "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart",
+            ])
             cmd_vt = base + ["-c:v", "h264_videotoolbox", "-q:v", "60", str(seg_mp4)]
             cmd_x264 = base + ["-c:v", "libx264", "-preset", "fast", "-crf", "18", str(seg_mp4)]
             ok, enc, err = _run_ffmpeg_encode(cmd_vt, cmd_x264, use_vt)
@@ -1142,6 +1162,7 @@ def _render_single_clip(
     mask_spans: list[tuple[float, float]] | None = None,
     visual_mask_regions: list[dict[str, Any]] | None = None,
     video_size: tuple[int, int] = (1920, 1080),
+    crop_vf: str = "",
 ) -> tuple[bool, str, str]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     start_s = max(0.0, clip.start_s)
@@ -1178,6 +1199,7 @@ def _render_single_clip(
             mask_spans=mask_spans,
             visual_mask_regions=visual_mask_regions,
             video_size=video_size,
+            crop_vf=crop_vf,
         )
 
     dur = max(0.5, end_s - start_s)
@@ -1196,6 +1218,10 @@ def _render_single_clip(
         str(source_video),
         "-t",
         f"{dur:.3f}",
+    ]
+    if crop_vf:
+        base.extend(["-vf", crop_vf])
+    base.extend([
         "-af",
         af,
         "-pix_fmt",
@@ -1210,7 +1236,7 @@ def _render_single_clip(
         "2",
         "-movflags",
         "+faststart",
-    ]
+    ])
     cmd_vt = base + ["-c:v", "h264_videotoolbox", "-q:v", "60", str(out_path)]
     cmd_x264 = base + ["-c:v", "libx264", "-preset", "fast", "-crf", "18", str(out_path)]
     return _run_ffmpeg_encode(cmd_vt, cmd_x264, use_vt)
@@ -1634,6 +1660,57 @@ def render_natural_cover_image(
     )
 
 
+def _crop_pil_image_and_faces(
+    frame_img: Image.Image,
+    faces: list[FaceBox] | None,
+    crop_rect: CropRect | None,
+) -> tuple[Image.Image, list[FaceBox]]:
+    """Crop PIL frame image to CropRect and remap normalized FaceBox coordinates."""
+    face_list = list(faces or [])
+    if crop_rect is None:
+        return frame_img, face_list
+    orig_w, orig_h = frame_img.size
+    if orig_w < 16 or orig_h < 16:
+        return frame_img, face_list
+    px_bounds = crop_rect_to_pixels(crop_rect, orig_w, orig_h)
+    if px_bounds is None:
+        return frame_img, face_list
+    px, py, pw, ph = px_bounds
+    if px >= orig_w or py >= orig_h or pw < 16 or ph < 16:
+        return frame_img, face_list
+    rx1 = min(orig_w, px + pw)
+    ry1 = min(orig_h, py + ph)
+    cropped = frame_img.crop((px, py, rx1, ry1))
+    cw, ch = cropped.size
+    if cw <= 0 or ch <= 0:
+        return frame_img, face_list
+    nx = px / orig_w
+    ny = py / orig_h
+    nw = cw / orig_w
+    nh = ch / orig_h
+    remapped: list[FaceBox] = []
+    for f in face_list:
+        fx0 = max(nx, f.x)
+        fy0 = max(ny, f.y)
+        fx1 = min(nx + nw, f.x + f.w)
+        fy1 = min(ny + nh, f.y + f.h)
+        if fx1 <= fx0 or fy1 <= fy0:
+            continue
+        remapped.append(
+            FaceBox(
+                x=(fx0 - nx) / nw,
+                y=(fy0 - ny) / nh,
+                w=(fx1 - fx0) / nw,
+                h=(fy1 - fy0) / nh,
+                quality=f.quality,
+                yaw=f.yaw,
+                embedding=f.embedding,
+                is_guest=f.is_guest,
+            )
+        )
+    return cropped, remapped
+
+
 def compose_pip_card_image(
     *,
     width: int,
@@ -1647,6 +1724,7 @@ def compose_pip_card_image(
     enable_pip: bool = True,
     color_scheme: str = "amber",
     custom_accent: str = "#0ABAB5",
+    crop_rect: CropRect | None = None,
 ) -> Image.Image:
     """
     Compose the dark charcoal editorial card with customizable color scheme,
@@ -1706,7 +1784,10 @@ def compose_pip_card_image(
             canvas = Image.alpha_composite(canvas, shadow)
 
             with Image.open(portrait_frame.image_path) as raw_im:
-                pip_img = crop_pip_portrait(raw_im.convert("RGBA"), pip_w, pip_h, portrait_frame.faces)
+                cropped_im, cropped_faces = _crop_pil_image_and_faces(
+                    raw_im.convert("RGBA"), portrait_frame.faces, crop_rect
+                )
+                pip_img = crop_pip_portrait(cropped_im, pip_w, pip_h, cropped_faces)
             pip_mask = Image.new("L", (pip_w, pip_h), 0)
             ImageDraw.Draw(pip_mask).rounded_rectangle([0, 0, pip_w, pip_h], radius=radius, fill=255)
             canvas.paste(pip_img, (pip_x0, pip_y0), pip_mask)
@@ -1754,7 +1835,10 @@ def compose_pip_card_image(
         canvas = Image.alpha_composite(canvas, shadow)
 
         with Image.open(portrait_frame.image_path) as raw_im:
-            pip_img = crop_pip_portrait(raw_im.convert("RGBA"), pip_w, pip_h, portrait_frame.faces)
+            cropped_im, cropped_faces = _crop_pil_image_and_faces(
+                raw_im.convert("RGBA"), portrait_frame.faces, crop_rect
+            )
+            pip_img = crop_pip_portrait(cropped_im, pip_w, pip_h, cropped_faces)
         pip_mask = Image.new("L", (pip_w, pip_h), 0)
         ImageDraw.Draw(pip_mask).rounded_rectangle([0, 0, pip_w, pip_h], radius=radius, fill=255)
         canvas.paste(pip_img, (pip_x0, pip_y0), pip_mask)
@@ -1971,6 +2055,7 @@ def _render_cover_image_at_size(
     theme: str = "tiffany",
     color_scheme: str = "tiffany",
     custom_accent: str = "#0ABAB5",
+    crop_rect: CropRect | None = None,
 ) -> Image.Image:
     if style == "editorial_pip" and width >= height:
         return compose_pip_card_image(
@@ -1985,11 +2070,13 @@ def _render_cover_image_at_size(
             enable_pip=True,
             color_scheme=color_scheme,
             custom_accent=custom_accent,
+            crop_rect=crop_rect,
         )
     with Image.open(selected.image_path) as raw_im:
+        cropped_im, cropped_faces = _crop_pil_image_and_faces(raw_im, selected.faces, crop_rect)
         return render_natural_cover_image(
-            frame_img=raw_im,
-            faces=selected.faces,
+            frame_img=cropped_im,
+            faces=cropped_faces,
             width=width,
             height=height,
             badge_text=badge_text,
@@ -2019,6 +2106,7 @@ def sync_existing_platform_covers(
     theme: str = "tiffany",
     color_scheme: str = "tiffany",
     custom_accent: str = "#0ABAB5",
+    crop_rect: CropRect | None = None,
 ) -> list[Path]:
     """Refresh any existing AutoSub platform cover siblings in place from clean raw portrait frames."""
     written: list[Path] = []
@@ -2043,6 +2131,7 @@ def sync_existing_platform_covers(
             theme=theme,
             color_scheme=color_scheme,
             custom_accent=custom_accent,
+            crop_rect=crop_rect,
         )
         _save_cover_jpeg(img, p, comment=build_autosub_cover_comment(title, orient, video_path, published_date))
         written.append(p)
@@ -2157,6 +2246,7 @@ def _compose_clip_cover_image(
     published_date: str,
     cover_path: Path,
     hero_pool: list[SelectedFrame] | None = None,
+    crop_rect: CropRect | None = None,
 ) -> bool:
     if not selected.image_path.exists():
         return False
@@ -2174,6 +2264,7 @@ def _compose_clip_cover_image(
     nav_s = resolve_navigation_settings(cfg)
     w = manifest.source.width or 1920
     h = manifest.source.height or 1080
+    eff_crop = crop_rect if crop_rect is not None else resolve_effective_crop(manifest, clip)
     out_img = _render_cover_image_at_size(
         selected=selected,
         width=w,
@@ -2188,6 +2279,7 @@ def _compose_clip_cover_image(
         left_meta_lines=left_meta,
         color_scheme=nav_s["color_scheme"],
         custom_accent=nav_s["custom_accent"],
+        crop_rect=eff_crop,
     )
     _save_cover_jpeg(out_img, cover_path)
     sync_existing_platform_covers(
@@ -2205,6 +2297,7 @@ def _compose_clip_cover_image(
         hero_pool=hero_pool,
         color_scheme=nav_s["color_scheme"],
         custom_accent=nav_s["custom_accent"],
+        crop_rect=eff_crop,
     )
     return True
 
@@ -2222,6 +2315,7 @@ def _generate_clip_cover(
     published_date: str,
     cover_path: Path,
     reuse_cached_frame: bool = False,
+    crop_rect: CropRect | None = None,
 ) -> bool:
     """Select an unsubtitled face-verified frame and render clip cover."""
     c_cfg = cfg.get("cover", {})
@@ -2246,6 +2340,7 @@ def _generate_clip_cover(
         published_date=published_date,
         cover_path=cover_path,
         hero_pool=hero_pool,
+        crop_rect=crop_rect,
     )
 
 
@@ -2258,6 +2353,7 @@ def _generate_remix_cover(
     published_date: str,
     cover_path: Path,
     total_duration_s: float | None = None,
+    crop_rect: CropRect | None = None,
 ) -> bool:
     """Render cover JPEG for Remix highlight video (supports natural & editorial_pip styles)."""
     c_cfg = cfg.get("cover", {})
@@ -2284,6 +2380,7 @@ def _generate_remix_cover(
     left_meta = [f"总长 {dur_text}", f"共 {len(enabled_items)} 段精华"]
 
     nav_s = resolve_navigation_settings(cfg)
+    eff_crop = crop_rect if crop_rect is not None else resolve_effective_crop(manifest)
     out_img = _render_cover_image_at_size(
         selected=picked,
         width=w,
@@ -2298,6 +2395,7 @@ def _generate_remix_cover(
         left_meta_lines=left_meta,
         color_scheme=nav_s["color_scheme"],
         custom_accent=nav_s["custom_accent"],
+        crop_rect=eff_crop,
     )
     _save_cover_jpeg(out_img, cover_path)
     sync_existing_platform_covers(
@@ -2315,6 +2413,7 @@ def _generate_remix_cover(
         hero_pool=hero_pool,
         color_scheme=nav_s["color_scheme"],
         custom_accent=nav_s["custom_accent"],
+        crop_rect=eff_crop,
     )
     return True
 
@@ -2328,6 +2427,7 @@ def _generate_compilation_cover(
     published_date: str,
     cover_path: Path,
     total_duration_s: float | None = None,
+    crop_rect: CropRect | None = None,
 ) -> bool:
     """Render cover JPEG for Compilation video."""
     c_cfg = cfg.get("cover", {})
@@ -2353,6 +2453,7 @@ def _generate_compilation_cover(
     left_meta = [f"总长 {dur_text}", f"精选 {len(enabled_clips)} 支切片"]
 
     nav_s = resolve_navigation_settings(cfg)
+    eff_crop = crop_rect if crop_rect is not None else resolve_effective_crop(manifest)
     out_img = _render_cover_image_at_size(
         selected=picked,
         width=w,
@@ -2367,6 +2468,7 @@ def _generate_compilation_cover(
         left_meta_lines=left_meta,
         color_scheme=nav_s["color_scheme"],
         custom_accent=nav_s["custom_accent"],
+        crop_rect=eff_crop,
     )
     _save_cover_jpeg(out_img, cover_path)
     sync_existing_platform_covers(
@@ -2384,6 +2486,7 @@ def _generate_compilation_cover(
         hero_pool=hero_pool,
         color_scheme=nav_s["color_scheme"],
         custom_accent=nav_s["custom_accent"],
+        crop_rect=eff_crop,
     )
     return True
 
@@ -2397,6 +2500,7 @@ def _generate_clean_cut_cover(
     published_date: str,
     cover_path: Path,
     total_duration_s: float | None = None,
+    crop_rect: CropRect | None = None,
 ) -> bool:
     """Render cover JPEG for Clean Cut full video."""
     c_cfg = cfg.get("cover", {})
@@ -2424,6 +2528,7 @@ def _generate_clean_cut_cover(
     badge_text = "CLEAN CUT  ·  净版全片"
     left_meta = [f"净版 {dur_text}", f"已剪除 {_fmt_dur(saved_s)}" if saved_s > 0.5 else "完整合规版"]
 
+    eff_crop = crop_rect if crop_rect is not None else resolve_effective_crop(manifest)
     out_img = _render_cover_image_at_size(
         selected=picked,
         width=w,
@@ -2437,6 +2542,7 @@ def _generate_clean_cut_cover(
         group_label="净版全片",
         left_meta_lines=left_meta,
         theme="crimson",
+        crop_rect=eff_crop,
     )
     _save_cover_jpeg(out_img, cover_path)
     sync_existing_platform_covers(
@@ -2453,6 +2559,7 @@ def _generate_clean_cut_cover(
         published_date=published_date,
         hero_pool=hero_pool,
         theme="crimson",
+        crop_rect=eff_crop,
     )
     return True
 
@@ -2602,6 +2709,14 @@ def sync_platform_covers_for_target(
         elif plat == "wechat":
             spec_keys.extend(["wechat", "wechat_share"])
 
+    eff_crop = (
+        resolve_effective_crop(
+            manifest,
+            next((c for c in manifest.clips if c.clip_id == target), None)
+            if target not in ("remix", "compilation", "clean_cut")
+            else None,
+        )
+    )
     nav_s = resolve_navigation_settings(cfg)
     for key in spec_keys:
         if key in seen_specs or key not in _PLATFORM_COVER_SPECS:
@@ -2625,6 +2740,7 @@ def sync_platform_covers_for_target(
             theme=cover_theme,
             color_scheme=nav_s["color_scheme"],
             custom_accent=nav_s["custom_accent"],
+            crop_rect=eff_crop,
         )
         _save_cover_jpeg(img, out_path, comment=build_autosub_cover_comment(effective_title, orient, target_mp4, published_date))
         written.append(out_path)
@@ -2645,6 +2761,7 @@ def sync_platform_covers_for_target(
             theme=cover_theme,
             color_scheme=nav_s["color_scheme"],
             custom_accent=nav_s["custom_accent"],
+            crop_rect=eff_crop,
         )
         _save_cover_jpeg(img, cover_jpg)
         written.append(cover_jpg)
@@ -2678,6 +2795,7 @@ def refresh_single_cover(
         )
         cover_jpg = target_mp4.with_suffix(".jpg")
         effective_title = (manifest.remix.cover_title or manifest.remix.title or "全片高光集锦").strip()
+        proj_crop = resolve_effective_crop(manifest)
         exp_hash = compute_cover_hash(
             key="remix",
             title=effective_title,
@@ -2687,6 +2805,7 @@ def refresh_single_cover(
             manifest=manifest,
             cfg=cfg,
             published_date=published_date,
+            crop_rect=proj_crop,
         )
         ok = _generate_remix_cover(
             manifest=manifest,
@@ -2695,6 +2814,7 @@ def refresh_single_cover(
             hero_pool=hero_pool,
             published_date=published_date,
             cover_path=cover_jpg,
+            crop_rect=proj_crop,
         )
         if ok:
             manifest.remix.cover_file = str(cover_jpg)
@@ -2717,6 +2837,7 @@ def refresh_single_cover(
         )
         cover_jpg = target_mp4.with_suffix(".jpg")
         _, effective_title = _resolve_compilation_effective_title(manifest, persist=True)
+        proj_crop = resolve_effective_crop(manifest)
         exp_hash = compute_cover_hash(
             key="compilation",
             title=effective_title,
@@ -2726,6 +2847,7 @@ def refresh_single_cover(
             manifest=manifest,
             cfg=cfg,
             published_date=published_date,
+            crop_rect=proj_crop,
         )
         ok = _generate_compilation_cover(
             manifest=manifest,
@@ -2735,6 +2857,7 @@ def refresh_single_cover(
             published_date=published_date,
             cover_path=cover_jpg,
             total_duration_s=est_dur_s,
+            crop_rect=proj_crop,
         )
         if ok:
             manifest.compilation.cover_file = str(cover_jpg)
@@ -2759,6 +2882,7 @@ def refresh_single_cover(
             or manifest.metadata.original_title
             or "全片净版"
         ).strip()
+        proj_crop = resolve_effective_crop(manifest)
         exp_hash = compute_cover_hash(
             key="clean_cut",
             title=effective_title,
@@ -2769,6 +2893,7 @@ def refresh_single_cover(
             cfg=cfg,
             published_date=published_date,
             theme="crimson",
+            crop_rect=proj_crop,
         )
         ok = _generate_clean_cut_cover(
             manifest=manifest,
@@ -2778,6 +2903,7 @@ def refresh_single_cover(
             published_date=published_date,
             cover_path=cover_jpg,
             total_duration_s=kept_dur,
+            crop_rect=proj_crop,
         )
         if ok:
             manifest.clean_cut.cover_file = str(cover_jpg)
@@ -2794,6 +2920,7 @@ def refresh_single_cover(
         )
         cover_jpg = target_mp4.with_suffix(".jpg")
         effective_title = (clip.cover_title or clip.title).strip()
+        clip_crop = resolve_effective_crop(manifest, clip)
         exp_hash = compute_cover_hash(
             key=clip.clip_id,
             title=effective_title,
@@ -2803,6 +2930,7 @@ def refresh_single_cover(
             manifest=manifest,
             cfg=cfg,
             published_date=published_date,
+            crop_rect=clip_crop,
         )
         ok = _generate_clip_cover(
             clean_video=frame_src,
@@ -2816,6 +2944,7 @@ def refresh_single_cover(
             published_date=published_date,
             cover_path=cover_jpg,
             reuse_cached_frame=True,
+            crop_rect=clip_crop,
         )
         if ok:
             clip.cover_file = str(cover_jpg)
@@ -3329,6 +3458,7 @@ def _create_title_card_video(
     index_text: str = "",
     color_scheme: str = "amber",
     custom_accent: str = "#0ABAB5",
+    crop_rect: CropRect | None = None,
 ) -> bool:
     """Render an editorial PiP title card PNG and encode to an MP4 segment matching main stream."""
     img = compose_pip_card_image(
@@ -3343,6 +3473,7 @@ def _create_title_card_video(
         enable_pip=enable_pip,
         color_scheme=color_scheme,
         custom_accent=custom_accent,
+        crop_rect=crop_rect,
     )
 
     png_path = out_mp4.with_suffix(".png")
@@ -3429,6 +3560,7 @@ def _render_remix(
 
     remix.render_hash = compute_remix_render_hash(manifest)
     effective_remix_title = (remix.cover_title or remix.title or "全片高光集锦").strip()
+    proj_crop = resolve_effective_crop(manifest)
     exp_remix_cover_hash = compute_cover_hash(
         key="remix",
         title=effective_remix_title,
@@ -3438,6 +3570,7 @@ def _render_remix(
         manifest=manifest,
         cfg=cfg,
         published_date=published_date,
+        crop_rect=proj_crop,
     )
 
     if remix.render_hash == remix.last_rendered_hash:
@@ -3453,6 +3586,7 @@ def _render_remix(
                     hero_pool=hero_pool,
                     published_date=published_date,
                     cover_path=cover_jpg,
+                    crop_rect=proj_crop,
                 ):
                     remix.cover_file = str(cover_jpg)
                     remix.cover_hash = exp_remix_cover_hash
@@ -3485,8 +3619,9 @@ def _render_remix(
     src_video = Path(manifest.source.render_video)
     clean_video = Path(manifest.source.analysis_video)
     frame_src = clean_video if clean_video.exists() else src_video
-    src_w, src_h = manifest.source.width or 1920, manifest.source.height or 1080
-    w, h = (1080, 1920) if is_portrait else (src_w, src_h)
+    src_w, src_h = _probe_video_wh(str(src_video), manifest.source.width or 1920, manifest.source.height or 1080)
+    w, h = (1080, 1920) if is_portrait else crop_output_size(proj_crop, src_w, src_h)
+    clip_by_id = {c.clip_id: c for c in manifest.clips}
     fps = manifest.source.fps if 15.0 <= manifest.source.fps <= 60.0 else 30.0
     defaults = ensure_default_assets()
     sfx_path = Path(remix.sfx_path) if (remix.sfx_path and Path(remix.sfx_path).exists()) else defaults["sfx"]
@@ -3672,6 +3807,10 @@ def _render_remix(
                     index_text="",
                     color_scheme=nav_color_scheme,
                     custom_accent=nav_custom_accent,
+                    crop_rect=resolve_effective_crop(
+                        manifest,
+                        clip_by_id.get(it.source_clip_id) if it.source_clip_id else None,
+                    ),
                 )
                 if ok_card:
                     concat_files.append(card_mp4)
@@ -3691,6 +3830,9 @@ def _render_remix(
             nav_png = None
 
         # Extract loudness-normalized excerpt(s) with layout & persistent navigation overlay
+        src_clip = clip_by_id.get(it.source_clip_id) if it.source_clip_id else None
+        item_crop = resolve_effective_crop(manifest, src_clip)
+        item_crop_vf = crop_vf_expr(item_crop, src_w, src_h)
         for part_i, (sub_s, sub_e) in enumerate(sub_spans):
             seg_mp4 = tmp_dir / f"seg_{idx + 1:02d}_{part_i + 1:02d}.mp4"
             dur = max(0.5, sub_e - sub_s)
@@ -3720,16 +3862,18 @@ def _render_remix(
                     af_prefix="loudnorm=I=-16:TP=-1.5:LRA=11",
                     apply_edge_fade=True,
                     visual_mask_regions=visual_mask_regions,
-                    video_size=(w, h),
+                    video_size=(src_w, src_h),
                     overlay_png=nav_png,
+                    crop_vf=item_crop_vf,
                 )
             else:
                 fade_s = min(0.03, dur * 0.15)
                 fade_out_st = max(0.0, dur - fade_s)
                 af = f"loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:st=0:d={fade_s:.3f},afade=t=out:st={fade_out_st:.3f}:d={fade_s:.3f}"
+                vf_rmx_full = f"{item_crop_vf},{vf_rmx}" if item_crop_vf else vf_rmx
 
                 if nav_png is not None and nav_png.is_file():
-                    fc_nav = f"[0:v]{vf_rmx}[vbase];[vbase][1:v]overlay=0:0:eof_action=repeat,format=yuv420p[vout]"
+                    fc_nav = f"[0:v]{vf_rmx_full}[vbase];[vbase][1:v]overlay=0:0:eof_action=repeat,format=yuv420p[vout]"
                     base = [
                         "ffmpeg",
                         "-y",
@@ -3761,7 +3905,7 @@ def _render_remix(
                         "2",
                     ]
                 else:
-                    vf = f"{vf_rmx},format=yuv420p"
+                    vf = f"{vf_rmx_full},format=yuv420p"
                     base = [
                         "ffmpeg",
                         "-y",
@@ -3964,6 +4108,7 @@ def _render_remix(
         published_date=published_date,
         cover_path=cover_jpg,
         total_duration_s=cursor_s,
+        crop_rect=proj_crop,
     ):
         remix.cover_file = str(cover_jpg)
         remix.cover_hash = exp_remix_cover_hash
@@ -4032,6 +4177,7 @@ def _render_compilation(
     comp.render_hash = compute_compilation_render_hash(manifest)
     _, effective_title = _resolve_compilation_effective_title(manifest, persist=True)
     comp.render_hash = compute_compilation_render_hash(manifest)
+    proj_crop = resolve_effective_crop(manifest)
     exp_cover_hash = compute_cover_hash(
         key="compilation",
         title=effective_title,
@@ -4041,6 +4187,7 @@ def _render_compilation(
         manifest=manifest,
         cfg=cfg,
         published_date=published_date,
+        crop_rect=proj_crop,
     )
 
     if comp.render_hash == comp.last_rendered_hash:
@@ -4057,6 +4204,7 @@ def _render_compilation(
                     published_date=published_date,
                     cover_path=cover_jpg,
                     total_duration_s=est_dur_s,
+                    crop_rect=proj_crop,
                 ):
                     comp.cover_file = str(cover_jpg)
                     comp.cover_hash = exp_cover_hash
@@ -4072,9 +4220,18 @@ def _render_compilation(
     frame_src = Path(manifest.source.analysis_video)
     if not frame_src.exists():
         frame_src = src_video
-    src_w = manifest.source.width or 1920
-    src_h = manifest.source.height or 1080
-    w, h = (1080, 1920) if is_portrait else (src_w, src_h)
+    src_w, src_h = _probe_video_wh(str(src_video), manifest.source.width or 1920, manifest.source.height or 1080)
+    eff_crops = [resolve_effective_crop(manifest, c) for c in enabled_clips]
+    if is_portrait:
+        w, h = (1080, 1920)
+    elif proj_crop is not None:
+        w, h = crop_output_size(proj_crop, src_w, src_h)
+    else:
+        first_cp = crop_hash_payload(eff_crops[0]) if eff_crops else None
+        if first_cp is not None and all(crop_hash_payload(ec) == first_cp for ec in eff_crops):
+            w, h = crop_output_size(eff_crops[0], src_w, src_h)
+        else:
+            w, h = (src_w, src_h)
     fps = manifest.source.fps or 30.0
 
     concat_files: list[Path] = []
@@ -4136,6 +4293,7 @@ def _render_compilation(
                 index_text="",
                 color_scheme=nav_color_scheme,
                 custom_accent=nav_custom_accent,
+                crop_rect=resolve_effective_crop(manifest, clip),
             )
             concat_files.append(card_mp4)
 
@@ -4176,6 +4334,8 @@ def _render_compilation(
             ).save(nav_png, format="PNG")
 
         # 2. Obtain clean base clip segment (reuse cached standalone clip if up-to-date)
+        clip_crop = resolve_effective_crop(manifest, clip)
+        clip_crop_vf = crop_vf_expr(clip_crop, src_w, src_h)
         clip_masks = (
             get_overlapping_mask_payload(clip.start_s, clip.end_s, manifest, cfg)
             if manifest.clean_cut.apply_to_clips
@@ -4187,6 +4347,7 @@ def _render_compilation(
             active_cuts,
             manifest.source.subtitle_sha256,
             mask_payload=clip_masks,
+            crop_rect=clip_crop,
         )
         base_mp4: Path | None = (
             Path(clip.output_file)
@@ -4215,6 +4376,7 @@ def _render_compilation(
                 mask_spans=mask_spans,
                 visual_mask_regions=visual_mask_regions,
                 video_size=(src_w, src_h),
+                crop_vf=clip_crop_vf,
             )
             if ok and raw_seg_mp4.exists():
                 base_mp4 = raw_seg_mp4
@@ -4242,7 +4404,23 @@ def _render_compilation(
                 store.log(f"[render] 精选集分段 {clip.clip_id} 叠加导航/布局失败，回退原分段: {err_nav}")
                 concat_files.append(base_mp4)
         else:
-            concat_files.append(base_mp4)
+            bw, bh = _probe_video_wh(str(base_mp4), w, h)
+            if (bw, bh) != (w, h):
+                norm_mp4 = tmp_dir / f"norm_{idx:02d}.mp4"
+                vf_norm = f"{_build_layout_vf(w, h, fps)},format=yuv420p"
+                base_norm = [
+                    "ffmpeg", "-y", "-v", "error", "-i", str(base_mp4),
+                    "-vf", vf_norm,
+                    "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart",
+                ]
+                ok_norm, _, _ = _run_ffmpeg_encode(
+                    base_norm + ["-c:v", "h264_videotoolbox", "-q:v", "60", str(norm_mp4)],
+                    base_norm + ["-c:v", "libx264", "-preset", "fast", "-crf", "18", str(norm_mp4)],
+                    use_vt,
+                )
+                concat_files.append(norm_mp4 if (ok_norm and norm_mp4.exists()) else base_mp4)
+            else:
+                concat_files.append(base_mp4)
 
     if not concat_files:
         store.log("[render] 精选集无有效拼接分段")
@@ -4326,6 +4504,7 @@ def _render_compilation(
             published_date=published_date,
             cover_path=cover_jpg,
             total_duration_s=est_dur_s,
+            crop_rect=proj_crop,
         ):
             comp.cover_file = str(cover_jpg)
             comp.cover_hash = exp_cover_hash
@@ -4364,9 +4543,10 @@ def _render_clean_cut(
     t0 = time.monotonic()
     cc = manifest.clean_cut
     active_segs = get_active_cut_segments(manifest, cfg)
-    if not active_segs:
+    proj_crop = resolve_effective_crop(manifest)
+    if not active_segs and proj_crop is None:
         cc.enabled = False
-        store.log("[render] 当前没有任何生效的去广或脱敏片段，自动跳过全片净版")
+        store.log("[render] 当前没有任何生效的去广、脱敏片段或画面裁剪，自动跳过全片净版")
         store.save(manifest)
         return None
     keep_spans = _clean_cut_keep_spans(manifest, cfg)
@@ -4408,6 +4588,7 @@ def _render_clean_cut(
         cfg=cfg,
         published_date=published_date,
         theme="crimson",
+        crop_rect=proj_crop,
     )
 
     if cc.render_hash == cc.last_rendered_hash:
@@ -4424,6 +4605,7 @@ def _render_clean_cut(
                     published_date=published_date,
                     cover_path=cover_jpg,
                     total_duration_s=kept_dur,
+                    crop_rect=proj_crop,
                 ):
                     cc.cover_file = str(cover_jpg)
                     cc.cover_hash = exp_cover_hash
@@ -4449,14 +4631,16 @@ def _render_clean_cut(
     ad_cnt = sum(1 for x in active_segs if x.kind == "ad")
     pol_del_cnt = sum(1 for x in active_segs if x.kind == "political_sensitive" and not is_visual_ocr_segment(x)) - len(mask_spans)
     pol_mask_cnt = len(mask_spans) + len(visual_mask_regions)
-    precise_copy = should_use_precise_copy(manifest, cfg) and not mask_spans and not visual_mask_regions
+    src_video = Path(manifest.source.render_video)
+    src_w, src_h = _probe_video_wh(str(src_video), manifest.source.width or 1920, manifest.source.height or 1080)
+    proj_crop_vf = crop_vf_expr(proj_crop, src_w, src_h)
+    precise_copy = should_use_precise_copy(manifest, cfg) and not mask_spans and not visual_mask_regions and not proj_crop_vf
     store.log(
         f"[render] 开始渲染全片净版: 生效 {len(active_segs)} 段（去广 {ad_cnt} / 删敏 {max(0, pol_del_cnt)} / 遮蔽 {pol_mask_cnt} [含画面模糊 {len(visual_mask_regions)}]，时长变化 -{saved_s:.1f}s），"
-        f"模式={'极速无损' if precise_copy else '帧精准硬件重编'}"
+        f"{'裁剪=' + proj_crop_vf + '，' if proj_crop_vf else ''}模式={'极速无损' if precise_copy else '帧精准硬件重编'}"
     )
 
     fade_ms = int(cfg.get("boundary", {}).get("audio_fade_ms", 25))
-    src_video = Path(manifest.source.render_video)
     tmp_dir = store.work_dir / "clean_cut_tmp"
     ok, encoder, err = _render_multi_span_video(
         src_video,
@@ -4472,7 +4656,8 @@ def _render_clean_cut(
         audio_mask_spans=audio_mask_spans,
         mask_spans=mask_spans,
         visual_mask_regions=visual_mask_regions,
-        video_size=(manifest.source.width or 1920, manifest.source.height or 1080),
+        video_size=(src_w, src_h),
+        crop_vf=proj_crop_vf,
     )
     if not ok or not out_mp4.exists():
         store.log(f"[render] 全片净版渲染失败: {err}")
@@ -4480,7 +4665,13 @@ def _render_clean_cut(
 
     cc.last_rendered_hash = cc.render_hash
     cc.output_file = str(out_mp4)
-    cc.rendered_filter_tag = describe_applied_filter(manifest, None, cfg)
+    base_tag = describe_applied_filter(manifest, None, cfg)
+    if not active_segs and proj_crop is not None:
+        cc.rendered_filter_tag = "画面裁剪"
+    elif proj_crop is not None:
+        cc.rendered_filter_tag = f"{base_tag} + 画面裁剪"
+    else:
+        cc.rendered_filter_tag = base_tag
     if _generate_clean_cut_cover(
         manifest=manifest,
         store=store,
@@ -4489,6 +4680,7 @@ def _render_clean_cut(
         published_date=published_date,
         cover_path=cover_jpg,
         total_duration_s=kept_dur,
+        crop_rect=proj_crop,
     ):
         cc.cover_file = str(cover_jpg)
         cc.cover_hash = exp_cover_hash
@@ -4528,10 +4720,10 @@ def render_clean_cut_and_cover(
     """On-demand render of Clean Cut full video and cover."""
     if cfg is None:
         cfg = load_editorial_config()
-    if not get_active_cut_segments(manifest, cfg):
+    if not get_active_cut_segments(manifest, cfg) and resolve_effective_crop(manifest) is None:
         manifest.clean_cut.enabled = False
         store.save(manifest)
-        return False, "当前没有任何需要剪切或脱敏的内容，无需输出全片净版"
+        return False, "当前没有任何需要剪切、脱敏或画面裁剪的内容，无需输出全片净版"
     manifest.clean_cut.enabled = True
     use_vt = _has_videotoolbox()
     published_date = _ensure_published_date(manifest, store)
@@ -4750,10 +4942,15 @@ def run_render_stage(
     )
 
     if "clips" in targets:
+        src_w, src_h = _probe_video_wh(
+            str(src_video), manifest.source.width or 1920, manifest.source.height or 1080
+        )
         for clip_pos, clip in enumerate(manifest.clips):
             check_cancelled()
             if not clip.enabled:
                 continue
+            eff_crop = resolve_effective_crop(manifest, clip)
+            clip_crop_vf = crop_vf_expr(eff_crop, src_w, src_h)
             clip_masks = get_overlapping_mask_payload(clip.start_s, clip.end_s, manifest, cfg) if apply_links else []
             clip.render_hash = compute_clip_render_hash(
                 clip,
@@ -4761,6 +4958,7 @@ def run_render_stage(
                 active_cuts,
                 manifest.source.subtitle_sha256,
                 mask_payload=clip_masks,
+                crop_rect=eff_crop,
             )
             fname = build_clip_filename(clip, manifest, published_date)
             out_mp4 = output_dir / fname
@@ -4775,6 +4973,7 @@ def run_render_stage(
                 manifest=manifest,
                 cfg=cfg,
                 published_date=published_date,
+                crop_rect=eff_crop,
             )
 
             if not force and clip.render_hash == clip.last_rendered_hash:
@@ -4795,6 +4994,7 @@ def run_render_stage(
                             published_date=published_date,
                             cover_path=cover_jpg,
                             reuse_cached_frame=True,
+                            crop_rect=eff_crop,
                         ):
                             clip.cover_file = str(cover_jpg)
                             clip.cover_hash = exp_cover_hash
@@ -4819,7 +5019,8 @@ def run_render_stage(
                 audio_mask_spans=audio_mask_spans,
                 mask_spans=mask_spans,
                 visual_mask_regions=visual_mask_regions,
-                video_size=(manifest.source.width or 1920, manifest.source.height or 1080),
+                video_size=(src_w, src_h),
+                crop_vf=clip_crop_vf,
             )
             celapsed = int((time.monotonic() - ct0) * 1000)
 
@@ -4842,6 +5043,7 @@ def run_render_stage(
                     fallback_index=clip_pos,
                     published_date=published_date,
                     cover_path=cover_jpg,
+                    crop_rect=eff_crop,
                 ):
                     clip.cover_file = str(cover_jpg)
                     clip.cover_hash = exp_cover_hash
@@ -4931,7 +5133,9 @@ def run_render_stage(
         comp_status = "，精选集已输出" if (res_comp and res_comp.exists()) else "，精选集失败"
 
     clean_status = ""
-    if "clean_cut" in targets and manifest.clean_cut.enabled and get_active_cut_segments(manifest, cfg):
+    if "clean_cut" in targets and manifest.clean_cut.enabled and (
+        get_active_cut_segments(manifest, cfg) or resolve_effective_crop(manifest) is not None
+    ):
         check_cancelled()
         if force:
             manifest.clean_cut.last_rendered_hash = ""
@@ -5011,6 +5215,11 @@ def render_single_clip_and_cover(
         else (None, None, [], [], [])
     )
 
+    src_w, src_h = _probe_video_wh(
+        str(src_video), manifest.source.width or 1920, manifest.source.height or 1080
+    )
+    eff_crop = resolve_effective_crop(manifest, clip)
+    clip_crop_vf = crop_vf_expr(eff_crop, src_w, src_h)
     clip_masks = get_overlapping_mask_payload(clip.start_s, clip.end_s, manifest, cfg) if apply_links else []
     clip.render_hash = compute_clip_render_hash(
         clip,
@@ -5018,6 +5227,7 @@ def render_single_clip_and_cover(
         active_cuts,
         manifest.source.subtitle_sha256,
         mask_payload=clip_masks,
+        crop_rect=eff_crop,
     )
     fname = build_clip_filename(clip, manifest, published_date)
     out_mp4 = output_dir / fname
@@ -5032,6 +5242,7 @@ def render_single_clip_and_cover(
         manifest=manifest,
         cfg=cfg,
         published_date=published_date,
+        crop_rect=eff_crop,
     )
 
     if not force and clip.render_hash == clip.last_rendered_hash and out_mp4.exists() and out_mp4.stat().st_size > 1024:
@@ -5049,6 +5260,7 @@ def render_single_clip_and_cover(
                 published_date=published_date,
                 cover_path=cover_jpg,
                 reuse_cached_frame=True,
+                crop_rect=eff_crop,
             )
             clip.cover_file = str(cover_jpg)
             clip.cover_hash = exp_cover_hash
@@ -5069,7 +5281,8 @@ def render_single_clip_and_cover(
         audio_mask_spans=audio_mask_spans,
         mask_spans=mask_spans,
         visual_mask_regions=visual_mask_regions,
-        video_size=(manifest.source.width or 1920, manifest.source.height or 1080),
+        video_size=(src_w, src_h),
+        crop_vf=clip_crop_vf,
     )
     if not ok:
         store.log(f"[render] 切片 {clip.clip_id} 渲染失败: {err}")
@@ -5093,6 +5306,7 @@ def render_single_clip_and_cover(
         fallback_index=target_pos,
         published_date=published_date,
         cover_path=cover_jpg,
+        crop_rect=eff_crop,
     )
     clip.cover_file = str(cover_jpg)
     clip.cover_hash = exp_cover_hash

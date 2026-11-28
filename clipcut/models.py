@@ -177,6 +177,29 @@ class SubtitleRepairItem(BaseModel):
     en: str | None = None
 
 
+class CropRect(BaseModel):
+    x: float = 0.0
+    y: float = 0.0
+    w: float = 1.0
+    h: float = 1.0
+
+
+class CropConfig(BaseModel):
+    enabled: bool = False
+    x: float = 0.0
+    y: float = 0.0
+    w: float = 1.0
+    h: float = 1.0
+
+
+class ClipCropOverride(BaseModel):
+    mode: Literal["inherit", "custom", "none"] = "inherit"
+    x: float = 0.0
+    y: float = 0.0
+    w: float = 1.0
+    h: float = 1.0
+
+
 class ClipItem(BaseModel):
     clip_id: str
     index: int
@@ -208,6 +231,7 @@ class ClipItem(BaseModel):
     cover_file: str | None = None
     cover_hash: str = ""
     rendered_filter_tag: str = ""
+    crop_override: ClipCropOverride | None = None
     publish_records: list[PublishRecord] = Field(default_factory=list)
 
 
@@ -257,6 +281,7 @@ class RemixConfig(BaseModel):
     cover_file: str | None = None
     cover_hash: str = ""
     rendered_filter_tag: str = ""
+    crop_override: ClipCropOverride | None = None
     publish_records: list[PublishRecord] = Field(default_factory=list)
 
 
@@ -274,6 +299,7 @@ class CompilationConfig(BaseModel):
     cover_file: str | None = None
     cover_hash: str = ""
     rendered_filter_tag: str = ""
+    crop_override: ClipCropOverride | None = None
     publish_records: list[PublishRecord] = Field(default_factory=list)
 
 
@@ -327,6 +353,7 @@ class CleanCutConfig(BaseModel):
     cover_file: str | None = None
     cover_hash: str = ""
     rendered_filter_tag: str = ""
+    crop_override: ClipCropOverride | None = None
     publish_records: list[PublishRecord] = Field(default_factory=list)
 
 
@@ -368,6 +395,7 @@ class ProjectManifest(BaseModel):
     compilation: CompilationConfig = Field(default_factory=CompilationConfig)
     cut_segments: list[CutSegment] = Field(default_factory=list)
     clean_cut: CleanCutConfig = Field(default_factory=CleanCutConfig)
+    crop: CropConfig = Field(default_factory=CropConfig)
 
 
 class Receipt(BaseModel):

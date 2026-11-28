@@ -66,7 +66,9 @@ def find_existing_plan(
     if not (manifest.clips or manifest.remix.items):
         return None
 
-    manifest_subtitle = Path(manifest.source.subtitle_path or "").expanduser().resolve()
+    if not manifest.source.subtitle_path:
+        return None
+    manifest_subtitle = Path(manifest.source.subtitle_path).expanduser().resolve()
     if not manifest_subtitle.exists():
         return None
 
@@ -161,7 +163,11 @@ def run_pipeline(
         store,
         "ingest",
         "completed",
-        f"字幕 {len(manifest.utterances)} 句 / 章节 {len(manifest.metadata.chapters)} 个",
+        (
+            f"字幕 {len(manifest.utterances)} 句 / 章节 {len(manifest.metadata.chapters)} 个"
+            if manifest.utterances
+            else "无字幕模式（支持画面裁剪与全片导出）"
+        ),
         int((time.monotonic() - t_ing) * 1000),
     )
 

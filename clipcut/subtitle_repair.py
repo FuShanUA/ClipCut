@@ -9,11 +9,12 @@ from typing import Literal
 import srt
 
 from .adapters.ingest import parse_subtitle_file, sha256_file
-from .models import ProjectManifest, SubtitleRepairItem
+from .crop import crop_vf_expr, resolve_effective_crop
+from .models import CropRect, ProjectManifest, SubtitleRepairItem
 from .pipeline.content_filter import get_active_cut_spans
 from .pipeline.verify_and_plan import compute_clip_render_hash
 from .receipts import ProjectStore
-from .render.renderer import _has_videotoolbox, _run_ffmpeg_encode
+from .render.renderer import _has_videotoolbox, _probe_video_wh, _run_ffmpeg_encode
 
 _AUTOSUB_SRT_TO_ASS = (
     Path.home() / "cc" / "Library" / "Tools" / "autosub" / "Library" / "Tools" / "hardsubber" / "srt_to_ass.py"
@@ -129,6 +130,8 @@ def _render_clip_with_subtitles(
     clip_end_s: float,
     ass_path: Path,
     output_path: Path,
+    *,
+    crop_rect: CropRect | None = None,
 ) -> None:
     source = Path(manifest.source.analysis_video)
     if not source.exists():
@@ -137,6 +140,19 @@ def _render_clip_with_subtitles(
     tmp_path = output_path.with_name(f".{output_path.stem}.repair.tmp.mp4")
     duration = max(0.5, clip_end_s - clip_start_s)
     use_vt = _has_videotoolbox()
+    if crop_rect is None:
+        matched_clip = next(
+            (
+                c
+                for c in manifest.clips
+                if abs(c.start_s - clip_start_s) < 0.01 and abs(c.end_s - clip_end_s) < 0.01
+            ),
+            None,
+        )
+        crop_rect = resolve_effective_crop(manifest, matched_clip)
+    src_w, src_h = _probe_video_wh(str(source), manifest.source.width or 1920, manifest.source.height or 1080)
+    crop_vf = crop_vf_expr(crop_rect, src_w, src_h)
+    vf_parts = ([crop_vf] if crop_vf else []) + [_subtitles_filter(ass_path), "setpts=PTS-STARTPTS"]
     base = [
         "ffmpeg",
         "-y",
@@ -150,7 +166,7 @@ def _render_clip_with_subtitles(
         "-t",
         f"{duration:.3f}",
         "-vf",
-        f"{_subtitles_filter(ass_path)},setpts=PTS-STARTPTS",
+        ",".join(vf_parts),
         "-af",
         "asetpts=PTS-STARTPTS",
         "-c:a",
@@ -258,6 +274,7 @@ def apply_subtitle_repairs(
             manifest.source.render_video,
             active_cuts,
             manifest.source.subtitle_sha256,
+            crop_rect=resolve_effective_crop(manifest, c),
         )
         if c.clip_id in affected or render_full_video:
             c.last_rendered_hash = ""
@@ -287,6 +304,7 @@ def apply_subtitle_repairs(
                 manifest.source.render_video,
                 active_cuts,
                 manifest.source.subtitle_sha256,
+                crop_rect=resolve_effective_crop(manifest, c),
             )
             c.last_rendered_hash = ""
         manifest.remix.last_rendered_hash = ""

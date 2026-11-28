@@ -1011,11 +1011,13 @@ def publish_to_platforms(
             elif plat == "wechat":
                 if pinfo.get("profile_dir") is not None:
                     env["WECHAT_BROWSER_DATA_DIR"] = str(pinfo["profile_dir"])
-                effective_col = (
+                raw_col = (
                     collection
                     if collection is not None
                     else (manifest.metadata.original_theme_zh or manifest.metadata.original_title or "")
-                ).strip()[:10]
+                ).strip()
+                # WeChat Channels collection titles forbid spaces and special symbols; max 10 chars.
+                effective_col = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9《》\"—【】]", "", raw_col)[:10]
                 cmd = [
                     *caff_prefix,
                     py,

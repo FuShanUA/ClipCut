@@ -392,6 +392,7 @@ def ingest_source(
     manual_title: str | None = None,
     manual_description: str | None = None,
     fetch_online: bool = True,
+    allow_missing_subtitle: bool = True,
     run_id: str = "init",
 ) -> tuple[ProjectManifest, ProjectStore]:
     vpath = Path(video_path).expanduser().resolve()
@@ -406,15 +407,29 @@ def ingest_source(
     probe = probe_video(vpath)
     analysis_video = _find_clean_analysis_video(vpath)
 
-    sub_p = Path(subtitle_path).expanduser().resolve() if subtitle_path else _find_best_subtitle(vpath, folder)
-    if sub_p is None or not sub_p.exists():
-        raise FileNotFoundError(
-            f"未找到字幕文件（目录: {folder}）。请先提供 .srt/.vtt 字幕文件路径，或先完成字幕转写。"
-        )
+    if subtitle_path:
+        sub_p: Path | None = Path(subtitle_path).expanduser().resolve()
+        if not sub_p.exists() or not sub_p.is_file():
+            raise FileNotFoundError(f"指定的字幕文件不存在: {sub_p}")
+    else:
+        sub_p = _find_best_subtitle(vpath, folder)
+        if (sub_p is None or not sub_p.exists()) and not allow_missing_subtitle:
+            raise FileNotFoundError(
+                f"未找到字幕文件（目录: {folder}）。请先提供 .srt/.vtt 字幕文件路径，或先完成字幕转写。"
+            )
 
-    utterances = parse_subtitle_file(sub_p)
-    if not utterances:
-        raise ValueError(f"字幕文件为空或解析失败: {sub_p}")
+    if sub_p is not None and sub_p.exists():
+        utterances = parse_subtitle_file(sub_p)
+        if not utterances:
+            raise ValueError(f"字幕文件为空或解析失败: {sub_p}")
+        sub_path_str: str | None = str(sub_p)
+        sub_format = sub_p.suffix.lower().lstrip(".")
+        sub_sha = sha256_file(sub_p)
+    else:
+        utterances = []
+        sub_path_str = None
+        sub_format = ""
+        sub_sha = ""
 
     # Metadata loading cascade: info_json -> yt-dlp -> manual -> filename fallback
     info_p = Path(info_json_path).expanduser().resolve() if info_json_path else _find_best_info_json(vpath, folder)
@@ -489,9 +504,9 @@ def ingest_source(
     source = MediaSource(
         render_video=str(vpath),
         analysis_video=str(analysis_video),
-        subtitle_path=str(sub_p),
-        subtitle_format=sub_p.suffix.lower().lstrip("."),
-        subtitle_sha256=sha256_file(sub_p),
+        subtitle_path=sub_path_str,
+        subtitle_format=sub_format,
+        subtitle_sha256=sub_sha,
         work_dir=str(work_dir),
         output_dir=str(output_dir),
         duration_s=probe["duration_s"],
@@ -529,16 +544,17 @@ def ingest_source(
             pass
 
     store.save(manifest)
+    sub_note = f"字幕 {len(utterances)} 句" if utterances else "无字幕文件（支持画面裁剪与全片导出）"
     store.append_receipt(
         run_id=run_id,
         stage="ingest",
         actor="system",
         action="ingest_media",
-        summary=f"载入视频 {vpath.name}（{probe['duration_s']:.1f}s, {probe['width']}x{probe['height']}），字幕 {len(utterances)} 句，章节 {len(chapters)} 个（来源: {meta_source}）",
+        summary=f"载入视频 {vpath.name}（{probe['duration_s']:.1f}s, {probe['width']}x{probe['height']}），{sub_note}，章节 {len(chapters)} 个（来源: {meta_source}）",
         details={
             "render_video": str(vpath),
             "analysis_video": str(analysis_video),
-            "subtitle_path": str(sub_p),
+            "subtitle_path": sub_path_str,
             "metadata_source": meta_source,
             "original_title": orig_title,
             "chapter_count": len(chapters),
